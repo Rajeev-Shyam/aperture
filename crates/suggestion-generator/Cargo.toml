@@ -1,0 +1,11 @@
+[package]
+name = "aperture-suggestion-generator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Renders a pattern-engine SuggestionCandidate + ConnectorState into a UI BubbleSpec (doc 08 §6 -> doc 11 §3)."
+
+[dependencies]
+aperture-contracts = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }

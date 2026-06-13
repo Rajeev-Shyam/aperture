@@ -1,0 +1,15 @@
+{
+  "$comment": "Default capability for the overlay window (doc 11 §2, doc 13 §2). Grants ONLY core permissions — window, event (the core->WebView channels in events.rs), app lifecycle. It deliberately grants NO http/shell/fs-network permission: the transparency gate (the two-emitter rule) keeps all sockets + Claude-CLI spawning inside the reasoning-gateway crate, never the WebView. [VERIFY] permission ids against the pinned Tauri 2.x acl schema at build time.",
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core permissions for the Aperture overlay window: window control, event channels, app lifecycle. No network/shell/fs surface (two-emitter gate, doc 13 §2).",
+  "windows": ["overlay"],
+  "permissions": [
+    "core:default",
+    "core:app:default",
+    "core:window:default",
+    "core:webview:default",
+    "core:event:default",
+    "core:path:default"
+  ]
+}

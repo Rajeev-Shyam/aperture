@@ -1,0 +1,61 @@
+[package]
+name = "aperture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Aperture Tauri v2 shell: the overlay window host, the IPC command surface, and the core <-> WebView event bridge (doc 11, doc 02 §2). Owns no GPU and no network — those live behind the orchestration crate and the reasoning gateway respectively."
+
+# The desktop binary. Package name = "aperture", bin name = "aperture".
+[[bin]]
+name = "aperture"
+path = "src/main.rs"
+
+[dependencies]
+# --- shared contract crate (the only cross-subsystem type source, doc 15) ---
+aperture-contracts = { workspace = true }
+
+# --- every internal subsystem the shell wires together at startup (doc 16 M0) ---
+# The shell composes these; it does not reimplement them. Capture/pattern/voice
+# subscribe to the bus; orchestration owns the toggle + GPU mutex; the gateway is
+# the ONLY crate permitted to open sockets / spawn the Claude CLI (doc 13 §2).
+aperture-db = { workspace = true }
+aperture-event-bus = { workspace = true }
+aperture-capture = { workspace = true }
+aperture-vision-ocr = { workspace = true }
+aperture-embedding = { workspace = true }
+aperture-pattern-engine = { workspace = true }
+aperture-suggestion-generator = { workspace = true }
+aperture-connectors = { workspace = true }
+aperture-orchestration = { workspace = true }
+aperture-reasoning-gateway = { workspace = true }
+aperture-privacy = { workspace = true }
+aperture-voice = { workspace = true }
+
+# --- shared third-party (versions resolved at the workspace root) ---
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+# Required: overlay.rs derives `#[derive(thiserror::Error)]` on OverlayError.
+thiserror = { workspace = true }
+
+# Tauri v2 runtime. Feature set is [VERIFY] at build time against the chosen
+# Tauri 2.x line (e.g. `tray-icon` for the toggle tray, `devtools` in dev).
+tauri = { version = "2", features = [] }  # [VERIFY] at build time
+
+# Win32 for the overlay: layered + transparent (click-through) window styles and
+# SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) so our own bubbles never enter
+# capture (doc 11 §2, doc 05 §2). [VERIFY] feature set + exact version.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",   # WS_EX_LAYERED | WS_EX_TRANSPARENT, GetWindowLongPtr/SetWindowLongPtr
+    "Win32_Graphics_Gdi",             # monitor enumeration for per-monitor overlays
+    "Win32_UI_HiDpi",                 # WM_DPICHANGED re-anchoring (doc 11 §7)
+] }  # [VERIFY] at build time
+
+# Tauri build script dependency (generates context, embeds the config + icons).
+[build-dependencies]
+tauri-build = { version = "2", features = [] }  # [VERIFY] at build time

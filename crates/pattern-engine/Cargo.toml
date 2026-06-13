@@ -1,0 +1,17 @@
+[package]
+name = "aperture-pattern-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CPU-only, zero-cloud behavior & pattern engine: event→token normalization, sessionization, n-gram/temporal mining, recency-weighted scoring, trigger gating, and the feedback loop (doc 08)."
+
+[dependencies]
+aperture-contracts = { workspace = true }
+# Reads the event/connector_state backbone and writes pattern stats back (doc 08 §4, §7).
+aperture-db = { workspace = true }
+# Semantic-assist substitution: cosine similarity of context embedding to a
+# pattern's stored centroid ≥ 0.75 may substitute for one token (doc 08 §5).
+aperture-embedding = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }

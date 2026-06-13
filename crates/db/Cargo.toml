@@ -1,0 +1,17 @@
+[package]
+name = "aperture-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SQLite (WAL) + sqlite-vec storage, migrations, and the single-writer Tier-0 pipeline (doc 03). At-rest encryption is applied at connect time (doc 13)."
+
+[dependencies]
+aperture-contracts = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# rusqlite `bundled` ships SQLite; sqlite-vec + SQLCipher-style encryption are
+# loaded as an extension / via a feature at build time — [VERIFY] exact crates
+# (e.g. `sqlite-vec`, `libsqlite3-sys` with sqlcipher) in doc 13 / M9.
+rusqlite = { workspace = true }

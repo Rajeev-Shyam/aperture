@@ -1,0 +1,27 @@
+<!doctype html>
+<!--
+  Aperture overlay document (doc 11 §2, doc 14).
+  The window itself is transparent, always-on-top, taskbar-skipped and
+  click-through by default — those are Win32 window flags set by the Rust shell
+  (src-tauri), NOT CSS. This document only paints the bubbles/surfaces; the body
+  background MUST stay transparent so the desktop shows through between surfaces.
+-->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <!-- No external origins: the overlay never makes network requests (two-emitter
+         rule, doc 13 §2). Only the reasoning-gateway crate may touch the network. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src ipc: http://ipc.localhost"
+    />
+    <title>Aperture Overlay</title>
+  </head>
+  <body>
+    <!-- gpuBusy.ts toggles `gpu-busy` on <body>; design-tokens.css keys the
+         glass->fallback degrade off that class (doc 11 §6, doc 14 §5). -->
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

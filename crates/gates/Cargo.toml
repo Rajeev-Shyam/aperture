@@ -1,0 +1,26 @@
+[package]
+name = "aperture-gates"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Milestone validation-gate test harnesses (doc 16): the M0 schema round-trip plus the two permanent regression gates SC5 (zero silent egress) and SC6 (toggle releases VRAM). A lib crate whose real surface is the integration tests under tests/."
+
+[dependencies]
+# The fakes feature gives the gate tests the ScriptedEventPlayer, golden payloads,
+# FakeConnector/FakeScheduler/FakeTransport used to drive a deterministic, offline
+# proactive-path run (doc 15 §7). The M0 gate also asserts these compile + instantiate.
+aperture-contracts = { workspace = true, features = ["fakes"] }
+# aperture-db gives us the authoritative embedded DDL (migrations::MIGRATIONS) and,
+# as a transitive dep, the `bundled` rusqlite used to materialize a scratch DB.
+aperture-db = { workspace = true }
+
+# rusqlite (re-declared so the test files can name its types directly) and serde_json
+# (to (de)serialize the Event payload / round-trip each EventType through the schema).
+rusqlite = { workspace = true }
+serde_json = { workspace = true }
+
+# NOTE (doc 16 M0): no extra dev-dependencies. The gate tests deliberately avoid a
+# network/HTTP/process-spawn crate — pulling one in here would itself violate the
+# two-emitter rule (doc 13 §2) that these very gates exist to protect. The SC5/SC6
+# monitor backends are external tools (ETW / mitmproxy / nvidia-smi), invoked out of
+# process and marked `#[ignore]` until M7 / the RTX-target gate wires them up.

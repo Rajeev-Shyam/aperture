@@ -1,0 +1,38 @@
+# --- Rust ---
+/target
+**/target
+Cargo.lock          # this is a workspace of libs + one app; lock is committed by the app only if desired
+*.pdb
+
+# --- Tauri ---
+/src-tauri/target
+/src-tauri/gen
+
+# --- GPU sidecar binaries (large; fetched/built out-of-band, see crates/vlm-host & crates/stt-host) ---
+/src-tauri/binaries/*
+!/src-tauri/binaries/.gitkeep
+/models/*
+!/models/.gitkeep
+
+# --- Node / Vite UI ---
+/ui/node_modules
+/ui/dist
+/ui/.vite
+node_modules
+
+# --- local runtime data (NEVER commit user history; doc 13) ---
+*.db
+*.db-wal
+*.db-shm
+/.aperture-local
+
+# --- editor / OS ---
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+Thumbs.db
+*.log
+
+# --- Claude Code local settings (keep shared .claude/settings.json if you add one) ---
+.claude/settings.local.json

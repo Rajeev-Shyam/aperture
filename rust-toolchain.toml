@@ -1,0 +1,6 @@
+# Pin the toolchain so the 8 GB-VRAM target and the Windows capture APIs build
+# identically on every machine. Bump deliberately; record in the milestone notes.
+[toolchain]
+channel = "1.80.0"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-pc-windows-msvc"]

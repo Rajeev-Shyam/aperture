@@ -1,0 +1,25 @@
+[package]
+name = "aperture-orchestration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Orchestration & resource manager (doc 12) — \"the brain\": owns the capture toggle (single writer, doc 02 §7), the single-permit GPU mutex + priority queue, sidecar lifecycles, the R1 VRAM projection check, and tier routing. Implements aperture_contracts::GpuScheduler; the ONLY crate besides the gateway permitted to spawn a process (sidecars, doc 12 §5)."
+
+[dependencies]
+aperture-contracts = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+# Required: `impl aperture_contracts::GpuScheduler` is `#[async_trait::async_trait]` (lib.rs).
+async-trait = { workspace = true }
+
+# --- platform / third-party (pinned; [VERIFY] at build time, doc 00 conventions) ---
+# Win32 TerminateProcess escalation when a sidecar kill fails (zombie escalation,
+# doc 12 §7). Process death is the guaranteed VRAM-release primitive (doc 02 §2,
+# doc 12 §5). NOTE: ModelLifecycle's std::process::Command sidecar spawn is the
+# ONLY sanctioned Command use outside the reasoning gateway (two-emitter rule).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_System_Threading",        # OpenProcess / TerminateProcess
+    "Win32_Foundation",              # HANDLE / CloseHandle
+] }  # [VERIFY] at build time

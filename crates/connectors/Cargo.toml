@@ -1,0 +1,27 @@
+[package]
+name = "aperture-connectors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Deep-link / state-resumption connectors (doc 10): the expansion seam (G3). Browser, YouTube, document, and VS Code connectors that capture a resumable handle and reconstruct it into a ShellExecuteW / protocol-URI dispatch. CPU-trivial; no GPU, no network."
+
+[dependencies]
+aperture-contracts = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# URL parsing for the YouTube `v=`/`t=` and browser-URL connectors (doc 10 §2-3).
+url = "2"  # [VERIFY] at build time
+
+# Win32 Shell dispatch (ShellExecuteW) for Path B resumption, plus UIA for the
+# browser/IDE capture heuristics (doc 10 §2, §5; doc 02 §5). [VERIFY] feature set
+# + exact version at build time.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Accessibility",
+] }  # [VERIFY] at build time

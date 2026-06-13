@@ -1,0 +1,551 @@
+/*
+ * The Bubble recipe (doc 14 §3) + lifecycle state treatments (doc 14 §4) +
+ * the bottom-right stack (doc 11 §3). Only `opacity`/`transform` animate;
+ * `backdrop-filter` is never animated (doc 14 §4).
+ */
+
+/* ---- Bottom-right vertical stack, 16px gutter, newest on top (doc 11 §3) --- */
+.bubble-stack {
+  position: fixed;
+  right: var(--edge-inset);
+  bottom: var(--edge-inset);
+  display: flex;
+  flex-direction: column-reverse; /* newest (last child) renders on top */
+  gap: var(--stack-gutter);
+  align-items: flex-end;
+  /* the stack container itself is transparent + click-through; bubbles opt in */
+  pointer-events: none;
+}
+
+/* ---- The core glass component (doc 14 §3) -------------------------------- */
+.bubble {
+  position: relative;
+  width: 320px;
+  box-sizing: border-box;
+  padding: 12px 14px;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  grid-template-areas:
+    "glyph title    actions"
+    "glyph sublabel actions";
+  column-gap: 12px;
+  align-items: center;
+
+  background: var(--glass-2); /* rgba(255,255,255,0.10) */
+  -webkit-backdrop-filter: blur(var(--blur-12)) saturate(var(--saturate));
+  backdrop-filter: blur(var(--blur-12)) saturate(var(--saturate));
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-16);
+  box-shadow: var(--shadow-elev), var(--lens-lip);
+  contain: strict; /* bound rasterization to this box */
+  overflow: hidden;
+
+  color: var(--ink-primary);
+  pointer-events: auto; /* live bubble rect re-enables hit-testing (doc 11 §2) */
+
+  /* enter default; lifecycle classes below override transform/opacity. */
+  transition:
+    transform var(--dur-180) var(--ease-chrome),
+    opacity var(--dur-180) var(--ease-chrome),
+    background-color var(--dur-120) var(--ease-chrome),
+    border-color var(--dur-120) var(--ease-chrome);
+}
+
+/* Specular sweep — the chrome lit edge (doc 14 §3). Paint-only, no blur. */
+.bubble::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: linear-gradient(115deg, rgba(255, 255, 255, 0.18) 0%, transparent 35%);
+}
+
+/* Opaque fallback when the engine can't blur (doc 14 §3). */
+@supports not (backdrop-filter: blur(1px)) {
+  .bubble {
+    background: var(--fallback-opaque);
+  }
+}
+
+/* ---- Anatomy slots (doc 11 §3) ------------------------------------------- */
+.bubble__glyph {
+  grid-area: glyph;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  font-size: 18px;
+  border-radius: var(--radius-12);
+  background: var(--glass-1);
+}
+.bubble__title {
+  grid-area: title;
+  font-weight: 600;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.bubble__sublabel {
+  grid-area: sublabel;
+  color: var(--ink-secondary);
+  font-size: 11px;
+  line-height: 1.3;
+}
+.bubble__actions {
+  grid-area: actions;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* The "via Claude" source tag — the only source-specific affordance (doc 09). */
+.bubble__source-tag {
+  font-size: 10px;
+  color: var(--accent);
+  border: 1px solid var(--border-hairline);
+  border-radius: 999px;
+  padding: 1px 6px;
+}
+
+/* ---- Buttons (paint-only hover; cheap) ----------------------------------- */
+.btn {
+  appearance: none;
+  border: 1px solid var(--border-hairline);
+  background: var(--glass-1);
+  color: var(--ink-primary);
+  border-radius: var(--radius-12);
+  padding: 5px 10px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  pointer-events: auto;
+  transition:
+    background-color var(--dur-120) var(--ease-chrome),
+    border-color var(--dur-120) var(--ease-chrome),
+    transform var(--dur-120) var(--ease-chrome);
+}
+.btn:hover {
+  background: var(--glass-3);
+  border-color: var(--border-hairline-hover);
+}
+.btn:active {
+  transform: scale(0.98);
+}
+.btn--primary {
+  background: color-mix(in oklch, var(--accent) 22%, transparent);
+  border-color: color-mix(in oklch, var(--accent) 40%, transparent);
+}
+.btn--icon {
+  padding: 4px 7px;
+  line-height: 1;
+}
+.btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Overflow menu (⋯) — itself a small glass surface; counts toward the cap. */
+.bubble__overflow {
+  position: absolute;
+  top: 100%;
+  right: 8px;
+  margin-top: 6px;
+  min-width: 200px;
+  z-index: 2;
+  background: var(--glass-2);
+  -webkit-backdrop-filter: blur(var(--blur-12)) saturate(var(--saturate));
+  backdrop-filter: blur(var(--blur-12)) saturate(var(--saturate));
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-12);
+  box-shadow: var(--shadow-elev), var(--lens-lip);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+}
+.bubble__overflow button {
+  text-align: left;
+  background: transparent;
+  border: 0;
+  color: var(--ink-primary);
+  padding: 8px 10px;
+  border-radius: 8px;
+  font: inherit;
+  cursor: pointer;
+}
+.bubble__overflow button:hover {
+  background: var(--glass-3);
+}
+
+/* ---- Lifecycle state treatments (doc 14 §4) — opacity/transform only ----- */
+/* enter: scale .96 -> 1 + fade, 180ms */
+.bubble--entering {
+  opacity: 0;
+  transform: scale(0.96);
+}
+.bubble--idle {
+  opacity: 1;
+  transform: scale(1);
+}
+/* hover lift = fill glass/2 -> glass/3 + border to 0.20 (paint-only). */
+.bubble--idle:hover {
+  background: var(--glass-3);
+  border-color: var(--border-hairline-hover);
+}
+/* active: scale .98, 120ms */
+.bubble--clicked {
+  transform: scale(0.98);
+  transition-duration: var(--dur-120);
+}
+/* exit: fade + 4px translate-down, 180ms */
+.bubble--exit {
+  opacity: 0;
+  transform: translateY(4px);
+}
+
+/*
+ * Under load (doc 14 §5): the body.gpu-busy rule in design-tokens.css already
+ * strips blur + swaps the fill on `.surface-glass`. Here we also collapse the
+ * enter/exit motion to a pure fade (no scale/translate) so frame pacing on the
+ * shared 5060 stays honest while a VLM/STT job holds the mutex.
+ */
+body.gpu-busy .bubble--entering {
+  transform: none;
+}
+body.gpu-busy .bubble--exit {
+  transform: none;
+}
+
+/* ==========================================================================
+ * Context-Preview panel (doc 11 §4) — the trust surface. A glass surface using
+ * the same recipe; radius 24 (panel). Counts toward the ≤3 glass cap (doc 14 §5).
+ * ======================================================================== */
+.preview {
+  position: fixed;
+  right: var(--edge-inset);
+  bottom: 64px; /* clear of the capture indicator */
+  width: 420px;
+  max-height: 80vh;
+  overflow-y: auto;
+  box-sizing: border-box;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+
+  background: var(--glass-2);
+  -webkit-backdrop-filter: blur(var(--blur-16)) saturate(var(--saturate));
+  backdrop-filter: blur(var(--blur-16)) saturate(var(--saturate));
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-24);
+  box-shadow: var(--shadow-elev), var(--lens-lip);
+  color: var(--ink-primary);
+}
+@supports not (backdrop-filter: blur(1px)) {
+  .preview {
+    background: var(--fallback-opaque);
+  }
+}
+.preview h4 {
+  margin: 0 0 6px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-secondary);
+}
+.preview__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.preview__intent {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.preview__intent select {
+  background: var(--glass-1);
+  color: var(--ink-primary);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-12);
+  padding: 4px 8px;
+  font: inherit;
+}
+.preview__id {
+  font-size: 10px;
+  color: var(--ink-faint);
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.preview__items {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.preview__empty {
+  color: var(--ink-secondary);
+  font-style: italic;
+  margin: 0;
+}
+.preview__item {
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-12);
+  background: var(--glass-1);
+  padding: 6px 8px;
+}
+.preview__item summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
+}
+.preview__item-kind {
+  flex: 1;
+  font-weight: 600;
+}
+.preview__item-remove {
+  margin-left: auto;
+}
+.preview__item-body {
+  margin: 8px 0 0;
+  padding: 8px;
+  background: var(--canvas-0);
+  border-radius: 8px;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 180px;
+  overflow: auto;
+}
+.preview__redactions ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.preview__redactions li {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  background: var(--glass-1);
+  border: 1px solid var(--border-hairline);
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 11px;
+}
+.preview__redaction-count {
+  color: var(--ink-secondary);
+}
+.preview__enrich-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.preview__history {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+.preview__history input[type="range"] {
+  accent-color: var(--accent);
+}
+.preview__freetext {
+  display: flex;
+  gap: 6px;
+  align-items: flex-end;
+}
+.preview__freetext textarea {
+  flex: 1;
+  min-height: 44px;
+  resize: vertical;
+  background: var(--glass-1);
+  color: var(--ink-primary);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-12);
+  padding: 8px;
+  font: inherit;
+}
+.preview__foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-hairline);
+}
+.preview__transport {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+.preview__health-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.preview__estimate {
+  font-size: 11px;
+  color: var(--ink-secondary);
+}
+.preview__estimate--warn {
+  color: var(--health-down);
+}
+.preview__foot-actions {
+  display: flex;
+  gap: 6px;
+}
+
+/* ==========================================================================
+ * Voice surfaces (doc 11 §5) — pill / chip / answer bubble. All glass surfaces.
+ * Positioned bottom-center so they don't collide with the bottom-right stack.
+ * ======================================================================== */
+.voice {
+  position: fixed;
+  left: 50%;
+  bottom: var(--edge-inset);
+  transform: translateX(-50%);
+  box-sizing: border-box;
+  padding: 10px 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+
+  background: var(--glass-2);
+  -webkit-backdrop-filter: blur(var(--blur-12)) saturate(var(--saturate));
+  backdrop-filter: blur(var(--blur-12)) saturate(var(--saturate));
+  border: 1px solid var(--border-hairline);
+  box-shadow: var(--shadow-elev), var(--lens-lip);
+  color: var(--ink-primary);
+}
+@supports not (backdrop-filter: blur(1px)) {
+  .voice {
+    background: var(--fallback-opaque);
+  }
+}
+.voice--pill {
+  border-radius: 999px;
+}
+.voice--chip {
+  border-radius: var(--radius-16);
+  flex-wrap: wrap;
+  max-width: 360px;
+}
+.voice--answer {
+  border-radius: var(--radius-16);
+  flex-direction: column;
+  align-items: flex-start;
+  width: 360px;
+}
+.voice__answer-title {
+  font-weight: 600;
+}
+.voice__answer-source {
+  font-size: 11px;
+  color: var(--ink-secondary);
+}
+.voice__answer-actions,
+.voice__chip-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+.voice__chip-text {
+  font-style: italic;
+}
+.voice__empty {
+  color: var(--ink-secondary);
+}
+.voice__wave {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 18px;
+}
+.voice__wave-bar {
+  width: 3px;
+  height: 18px;
+  border-radius: 2px;
+  background: var(--accent);
+  transform-origin: center;
+  transition: transform var(--dur-120) var(--ease-chrome);
+}
+.voice__spinner {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--border-hairline);
+  border-top-color: var(--accent);
+  animation: voice-spin 800ms linear infinite;
+}
+@keyframes voice-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ==========================================================================
+ * Capture indicator (doc 12 §6) — master toggle + activity pulse. Bottom-right,
+ * above the bubble stack so it is always visible.
+ * ======================================================================== */
+.capture {
+  position: fixed;
+  right: var(--edge-inset);
+  top: var(--edge-inset);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+
+  background: var(--glass-2);
+  -webkit-backdrop-filter: blur(var(--blur-8)) saturate(var(--saturate));
+  backdrop-filter: blur(var(--blur-8)) saturate(var(--saturate));
+  border: 1px solid var(--border-hairline);
+  border-radius: 999px;
+  box-shadow: var(--shadow-elev), var(--lens-lip);
+}
+@supports not (backdrop-filter: blur(1px)) {
+  .capture {
+    background: var(--fallback-opaque);
+  }
+}
+.capture__toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: transparent;
+  border: 0;
+  color: var(--ink-primary);
+  font: inherit;
+  cursor: pointer;
+}
+.capture__dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--ink-faint);
+  transition: transform var(--dur-120) var(--ease-chrome);
+}
+.capture__dot--on {
+  background: var(--accent);
+}
+.capture__dot--off {
+  background: var(--ink-faint);
+}
+.capture__dot--pulse {
+  transform: scale(1.6);
+}
+.capture__detail {
+  font-size: 11px;
+  color: var(--ink-secondary);
+}

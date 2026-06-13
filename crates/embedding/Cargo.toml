@@ -1,0 +1,16 @@
+[package]
+name = "aperture-embedding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CPU text embedding (nomic-embed-text-v1.5, 768-d pinned) for ctx_vec KNN and pattern centroids (doc 03 §5, doc 06 §2, doc 04 §7-8)."
+
+[dependencies]
+aperture-contracts = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# nomic-embed-text-v1.5 (137M) runs on CPU. The runtime backend (candle / ort /
+# llama.cpp gguf) is an M2 decision — load the model+tokenizer behind the
+# `Embedder` trait so it can be swapped without touching callers. [VERIFY]
+# candle-core = { version = "0.6", default-features = false }       # [VERIFY]
+# tokenizers  = { version = "0.20", default-features = false, features = ["onig"] }  # [VERIFY]

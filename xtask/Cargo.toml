@@ -1,0 +1,12 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The Aperture workspace task runner (cargo-xtask pattern): the two-emitter CI lint, milestone gate runners, the SC5/SC6 monitor launchers, and a scratch-DB seeder. Pure std + anyhow; it shells out to `cargo`, it is not part of the product."
+
+[dependencies]
+# Deliberately std-only + anyhow. xtask drives `cargo` via std::process::Command;
+# it ships nothing into the product and is excluded from the two-emitter scope it
+# itself enforces (doc 13 §2). Adding a network/HTTP crate here would be ironic.
+anyhow = { workspace = true }

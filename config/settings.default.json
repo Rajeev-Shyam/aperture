@@ -1,0 +1,72 @@
+{
+  "$comment": "Default settings seed for Aperture. At runtime these live INSIDE the encrypted DB (doc 13 §6); this file is the first-run seed. [VERIFY] all model names / hotkeys / thresholds against the real target and current vendor docs (doc 00 conventions).",
+
+  "capture": {
+    "default_state": "off",
+    "$comment_default_state": "Capture is OFF until the user opts in at first run (doc 13 §8).",
+    "heartbeat_ms": 10000,
+    "debounce_ms": 300,
+    "inactivity_idle_ms": 60000,
+    "toggle_off_sla_ms": 3000
+  },
+
+  "loadout": {
+    "active": "L1",
+    "$comment": "L1 = Qwen2.5-VL-3B + Whisper small (co-resident, mutex serializes execution). L2 = Qwen2.5-VL-7B exclusive (opt-in, doc 04 §3).",
+    "vlm_model": "qwen2.5-vl-3b",
+    "stt_model": "whisper-small",
+    "vram_ceiling_gb": 7.2,
+    "idle_unload_sec": 90,
+    "vlm_deadline_s": 10,
+    "stt_deadline_s": 15,
+    "min_residency_sec": 20
+  },
+
+  "voice": {
+    "ptt_hotkey": "Ctrl+Win+Space",
+    "vad_speech_floor_ms": 300,
+    "max_utterance_sec": 30,
+    "intent_confidence_floor": 0.6
+  },
+
+  "pattern_engine": {
+    "tau_conf": 0.6,
+    "cold_start_support_floor": 3,
+    "semantic_similarity_threshold": 0.75,
+    "cooldown_min": 30,
+    "suggestion_cap_per_hour": 4,
+    "session_gap_min": 15,
+    "recency_half_life_days": 7
+  },
+
+  "ui": {
+    "max_concurrent_bubbles": 3,
+    "bubble_dwell_sec": 12,
+    "max_glass_surfaces": 3
+  },
+
+  "reasoning": {
+    "transport_order": ["claude-cli", "claude-desktop-mcp", "messages-api"],
+    "payload_size_warn_kb": 50,
+    "per_send_approval": true,
+    "$comment_model": "Claude model id + any beta headers are settings, never code (locked NG8). [VERIFY at build time].",
+    "messages_api_model": "",
+    "messages_api_beta_headers": []
+  },
+
+  "privacy": {
+    "exclusion_defaults": [
+      { "match_kind": "process", "pattern": "1Password" },
+      { "match_kind": "process", "pattern": "KeePass" },
+      { "match_kind": "title_regex", "pattern": "(?i)(bank|chase|wells fargo|barclays)" }
+    ],
+    "redaction_user_terms": [],
+    "retention_days": {
+      "events": 90,
+      "ocr_text": 30,
+      "voice": 30,
+      "suggestions": 180,
+      "audit": 30
+    }
+  }
+}

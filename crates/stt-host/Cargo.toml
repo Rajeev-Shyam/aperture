@@ -1,0 +1,32 @@
+[package]
+name = "aperture-stt-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "STT sidecar BINARY (doc 07 §3, doc 02 §2): a standalone HTTP server that launches/manages a whisper.cpp / faster-whisper server child (Whisper small default ~1GB / distil-large-v3 int8 opt-in) and exposes POST /transcribe + GET /health. Separate process so a kill guarantees VRAM release (SC6)."
+
+# A separate OS process is the whole point: process death is the only GUARANTEED
+# way to return VRAM to the driver (doc 02 §2, doc 12 §5). In-process bindings
+# would make unload best-effort and break the 8 GB ceiling + SC6 (< 3 s release).
+[[bin]]
+name = "aperture-stt-host"
+path = "src/main.rs"
+
+[dependencies]
+aperture-contracts = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# --- third-party (pinned; [VERIFY] at build time, doc 00 conventions) ---
+# HTTP surface for /transcribe + /health, and the reverse-proxy client to the
+# whisper server child. [VERIFY] axum vs hyper choice + exact versions at M6.
+axum = "0.7"                                                                   # [VERIFY]
+# CLI arg parsing: --port, --model, --backend, --whisper-bin, --device (doc 07 §3).
+clap = { version = "4", features = ["derive"] }                                # [VERIFY]
+# Client used to forward decoded WAV jobs to the whisper server child over loopback.
+reqwest = { version = "0.12", features = ["json", "multipart"] }               # [VERIFY]

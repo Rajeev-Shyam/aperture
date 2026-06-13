@@ -1,0 +1,51 @@
+{
+  "$comment": "Aperture Tauri v2 shell config (doc 11 §2, doc 02 §2). [VERIFY] every field against the pinned Tauri 2.x schema at build time — schema URL below drives IDE validation.",
+  "$schema": "https://schema.tauri.app/config/v2/schema.json",
+  "productName": "Aperture",
+  "version": "0.1.0",
+  "identifier": "dev.aperture",
+  "build": {
+    "$comment": "The UI agent owns ../ui (Vite + the BubbleSpec/event-channel client). The shell only hosts it.",
+    "frontendDist": "../ui/dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm --prefix ../ui run dev",
+    "beforeBuildCommand": "npm --prefix ../ui run build"
+  },
+  "app": {
+    "$comment": "ONE overlay window in v1 (primary monitor); main.rs clones it per-monitor at setup (doc 11 §2, multi-monitor at M8). Transparent + undecorated + always-on-top + taskbar-skipped + no shadow = a glass overlay, never a chrome window.",
+    "windows": [
+      {
+        "label": "overlay",
+        "title": "Aperture",
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": false,
+        "resizable": false,
+        "focus": false,
+        "visible": true,
+        "width": 1920,
+        "height": 1080
+      }
+    ],
+    "security": {
+      "$comment": "csp null in dev; tightened at M9. capabilities default scopes the overlay window to core permissions only — no network/shell plugin permissions ever land here (the two-emitter gate lives in the gateway crate, doc 13 §2).",
+      "csp": null,
+      "capabilities": ["default"]
+    },
+    "withGlobalTauri": false
+  },
+  "bundle": {
+    "$comment": "externalBin embeds the two GPU sidecars; orchestration spawns/kills them (doc 02 §2, doc 12 §5). Tauri appends the target triple to each path at build time. active/icon are placeholders for M0.",
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.ico"
+    ],
+    "externalBin": [
+      "binaries/vlm-host",
+      "binaries/stt-host"
+    ]
+  }
+}

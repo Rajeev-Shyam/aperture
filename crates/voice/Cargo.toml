@@ -1,0 +1,22 @@
+[package]
+name = "aperture-voice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Push-to-talk voice subsystem (doc 07): WASAPI capture -> Silero VAD -> STT GpuJob (priority 100) -> voice_utterance store + embed -> deterministic intent -> KNN retrieval -> answer bubble."
+
+[dependencies]
+aperture-contracts = { workspace = true }
+aperture-embedding = { workspace = true }
+aperture-db = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+# Required: utterance_logger builds the voice_utterance payload with `serde_json::json!`.
+serde_json = { workspace = true }
+
+# --- platform / third-party (pinned; [VERIFY] at build time, doc 00 conventions) ---
+# Global PTT hotkey via Win32 RegisterHotKey with press-and-hold semantics (doc 07 §2).
+global-hotkey = "0.6"                                                          # [VERIFY]
+# WASAPI shared-mode default-mic capture; resampled to 16 kHz mono PCM (doc 07 §2).
+cpal = "0.15"                                                                  # [VERIFY]

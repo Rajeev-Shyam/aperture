@@ -1,0 +1,343 @@
+//! Aperture workspace task runner (the `cargo-xtask` pattern; doc 16 tooling).
+//!
+//! Run as `cargo xtask <subcommand>` (via the `xtask` alias) or
+//! `cargo run -p xtask -- <subcommand>`. Subcommands:
+//!
+//! | Subcommand        | What it does | Doc |
+//! |-------------------|--------------|-----|
+//! | `lint-emitters`   | Scan the crate graph; fail if a network-socket / Claude-CLI / process-spawn API appears OUTSIDE the two sanctioned sites (the two-emitter rule). | 13 §2 |
+//! | `gate <m0..m9>`   | Run the tagged validation-gate tests for one milestone. | 16 |
+//! | `sc5`             | Run the SC5 network-monitor gate (zero silent egress). | 13 / 16 |
+//! | `sc6`             | Run the SC6 VRAM-release gate (toggle OFF → VRAM ~0 < 3 s). | 04 / 05 / 16 |
+//! | `seed-db`         | Apply migrations to a scratch DB + round-trip every EventType. | 03 / 16 M0 |
+//!
+//! Honest-stub policy: where the underlying mechanism is not built yet (the
+//! monitor backends, the typed DB insert path), the subcommand prints what it
+//! *will* do and exits with a clear "not yet wired (M<n>)" status rather than
+//! pretending to pass. `lint-emitters` is the exception — it works today, because
+//! the trust foundation it guards (doc 13 §2) must be enforced from M0 on.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use anyhow::{bail, Context, Result};
+
+fn main() -> Result<()> {
+    let mut args = std::env::args().skip(1);
+    let cmd = args.next();
+    match cmd.as_deref() {
+        Some("lint-emitters") => lint_emitters(),
+        Some("gate") => {
+            let m = args.next().context("usage: xtask gate <m0..m9>")?;
+            run_gate(&m)
+        }
+        Some("sc5") => run_sc5(),
+        Some("sc6") => run_sc6(),
+        Some("seed-db") => seed_db(),
+        Some(other) => {
+            print_usage();
+            bail!("unknown subcommand: {other}");
+        }
+        None => {
+            print_usage();
+            bail!("no subcommand given");
+        }
+    }
+}
+
+fn print_usage() {
+    eprintln!(
+        "xtask — Aperture workspace task runner\n\
+         \n\
+         USAGE: cargo xtask <subcommand>\n\
+         \n\
+         SUBCOMMANDS:\n\
+         \x20 lint-emitters     enforce the two-emitter rule (doc 13 §2)\n\
+         \x20 gate <m0..m9>     run a milestone's validation-gate tests (doc 16)\n\
+         \x20 sc5               SC5 network-monitor gate — zero silent egress\n\
+         \x20 sc6               SC6 VRAM-release gate — toggle OFF releases the GPU\n\
+         \x20 seed-db           apply migrations to a scratch DB + round-trip events (M0)\n"
+    );
+}
+
+/// Workspace root = the parent of `xtask/` (this crate lives at `<root>/xtask`).
+fn workspace_root() -> PathBuf {
+    // CARGO_MANIFEST_DIR is `<root>/xtask`; its parent is the workspace root.
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask has a parent dir")
+        .to_path_buf()
+}
+
+// ---------------------------------------------------------------------------
+// lint-emitters — the two-emitter rule (doc 13 §2), CI-enforced from M0 on.
+// ---------------------------------------------------------------------------
+
+/// Source-level signatures of the forbidden capabilities. A crate that is NOT a
+/// sanctioned emitter must contain none of these (outside comments/strings — see
+/// the line filter below). The list is conservative-by-construction: the goal is
+/// "egress-free by construction", so we deny the *capability surface*, not just
+/// known-bad calls (doc 13 §2).
+const FORBIDDEN_API_NEEDLES: &[&str] = &[
+    // raw sockets
+    "TcpStream",
+    "TcpListener",
+    "UdpSocket",
+    "std::net::",
+    "tokio::net::",
+    // HTTP / network client crates
+    "reqwest",
+    "hyper::",
+    "ureq",
+    // arbitrary process spawning (the Claude CLI is spawned this way)
+    "std::process::Command",
+    "process::Command",
+    "tokio::process::",
+];
+
+/// The only two crates allowed to carry the forbidden surface (doc 13 §2):
+///   1. `reasoning-gateway` — the sole network/Claude-CLI emitter.
+///   2. `orchestration`     — ModelLifecycle's sanctioned sidecar spawn
+///      (`vlm-host`/`stt-host` via `std::process::Command`); doc 12 §3, doc 16 M5.
+/// Sidecar *host* crates run the model in-process and never emit, so they are NOT
+/// exempt. `xtask` and `gates` are tooling, not product, and are skipped entirely.
+const SANCTIONED_CRATES: &[&str] = &["reasoning-gateway", "orchestration"];
+
+/// Crates skipped entirely (tooling / not part of the product egress surface).
+const SKIPPED_CRATES: &[&str] = &["gates", "xtask"];
+
+fn lint_emitters() -> Result<()> {
+    let crates_dir = workspace_root().join("crates");
+    println!("lint-emitters: scanning {} (doc 13 §2)", crates_dir.display());
+
+    let mut violations: Vec<String> = Vec::new();
+    let mut scanned_files = 0usize;
+
+    for entry in std::fs::read_dir(&crates_dir)
+        .with_context(|| format!("read {}", crates_dir.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let crate_name = entry.file_name().to_string_lossy().to_string();
+        if SKIPPED_CRATES.contains(&crate_name.as_str()) {
+            continue;
+        }
+        let sanctioned = SANCTIONED_CRATES.contains(&crate_name.as_str());
+        let src = entry.path().join("src");
+        if !src.is_dir() {
+            continue;
+        }
+        scan_rs_files(&src, &mut scanned_files, |file, line_no, line| {
+            if let Some(needle) = forbidden_needle_in(line) {
+                if sanctioned {
+                    // Allowed here, but make the audit trail visible: a reviewer
+                    // (and SC5) can confirm each sanctioned use.
+                    println!(
+                        "  [sanctioned] {}:{} uses `{}` (crate `{}`)",
+                        rel(file),
+                        line_no,
+                        needle,
+                        crate_name
+                    );
+                } else {
+                    violations.push(format!(
+                        "{}:{}: `{}` in non-emitter crate `{}` — two-emitter rule (doc 13 §2)",
+                        rel(file),
+                        line_no,
+                        needle,
+                        crate_name
+                    ));
+                }
+            }
+        })?;
+    }
+
+    println!("lint-emitters: scanned {scanned_files} source files");
+    if violations.is_empty() {
+        println!("lint-emitters: OK — no forbidden egress surface outside the two emitters");
+        Ok(())
+    } else {
+        eprintln!("\nlint-emitters: {} VIOLATION(S):", violations.len());
+        for v in &violations {
+            eprintln!("  {v}");
+        }
+        bail!("two-emitter rule violated (doc 13 §2)")
+    }
+}
+
+/// First forbidden needle present in a *code* line, or `None`.
+///
+/// Best-effort comment/string filtering: skip `//`-comment lines and lines whose
+/// only hit is inside a string/doc. Cheap and good enough for a CI gate; a false
+/// positive is a one-line `#[allow]`-style annotation away (TODO below).
+fn forbidden_needle_in(line: &str) -> Option<&'static str> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("//") || trimmed.starts_with("//!") || trimmed.starts_with("*") {
+        return None;
+    }
+    // TODO(M0:): tighten this. Strip line/block comments and string literals
+    // properly (or switch to a `syn`-based AST scan) so a forbidden token quoted
+    // in a string isn't flagged. For a CI gate the line heuristic is acceptable;
+    // an intentional sanctioned use sits in one of the two SANCTIONED_CRATES.
+    FORBIDDEN_API_NEEDLES
+        .iter()
+        .copied()
+        .find(|needle| line.contains(needle))
+}
+
+/// Recursively visit every `.rs` file under `dir`, calling `f(path, line_no, line)`.
+fn scan_rs_files(
+    dir: &Path,
+    counter: &mut usize,
+    mut f: impl FnMut(&Path, usize, &str),
+) -> Result<()> {
+    // Iterative DFS to keep the closure non-recursive (FnMut can't recurse here).
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).with_context(|| format!("read {}", d.display()))? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                stack.push(path);
+            } else if path.extension().map(|e| e == "rs").unwrap_or(false) {
+                *counter += 1;
+                let text = std::fs::read_to_string(&path)
+                    .with_context(|| format!("read {}", path.display()))?;
+                for (i, line) in text.lines().enumerate() {
+                    f(&path, i + 1, line);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Path relative to the workspace root, for tidy output.
+fn rel(p: &Path) -> String {
+    p.strip_prefix(workspace_root())
+        .unwrap_or(p)
+        .display()
+        .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// gate <m0..m9> — run a milestone's tagged validation-gate tests (doc 16).
+// ---------------------------------------------------------------------------
+
+fn run_gate(milestone: &str) -> Result<()> {
+    let m = milestone.to_ascii_lowercase();
+    match m.as_str() {
+        "m0" => {
+            // M0 gate runs in plain CI: schema round-trip + fakes compile.
+            println!("gate M0: schema round-trips every EventType; fakes compile (doc 16 M0)");
+            cargo_test(&["-p", "aperture-gates", "--test", "m0_schema_roundtrip"])
+        }
+        "m1" => {
+            println!("gate M1: capture toggle + exclusion list; SC6 is the headline (doc 16 M1)");
+            // SC6 is the M1 gate; it is #[ignore] off-target, so route through `sc6`.
+            run_sc6()
+        }
+        "m3" => {
+            println!("gate M3: pattern engine bubble < 2 s (SC2) AND SC5 holds (doc 16 M3)");
+            // SC5 must keep holding from M3 on; SC2 timing is a pattern-engine test.
+            // TODO(M3:): add the SC2 scripted-workflow timing test target here.
+            run_sc5()
+        }
+        "m7" => {
+            println!("gate M7: SC5 strict — zero bytes until Send, preview == wire (doc 16 M7)");
+            run_sc5()
+        }
+        "m2" | "m4" | "m5" | "m6" | "m8" | "m9" => {
+            // Honest stub: these gates' tests don't exist yet (the subsystems are
+            // later milestones). Don't fake a pass.
+            println!("gate {m}: no gate tests wired yet (doc 16 {})", m.to_uppercase());
+            todo!(
+                "{}: add this milestone's validation-gate test target and invoke it here",
+                m.to_uppercase()
+            )
+        }
+        other => bail!("unknown milestone `{other}` (expected m0..m9)"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sc5 / sc6 — launch the two permanent regression monitors (doc 16 rec 3).
+// ---------------------------------------------------------------------------
+
+fn run_sc5() -> Result<()> {
+    println!("sc5: zero silent egress; bytes only after approved Send (doc 13 §2)");
+    // The strict gate is #[ignore]; `--include-ignored` runs it once the backend
+    // exists. Until then this surfaces the ignored test rather than silently
+    // skipping it.
+    // TODO(M7:): choose the monitor backend (ETW vs mitmproxy) — see
+    // crates/gates/tests/sc5_network_monitor.rs. `lint-emitters` is the static
+    // half of SC5 and runs today; this is the dynamic half.
+    cargo_test(&[
+        "-p",
+        "aperture-gates",
+        "--test",
+        "sc5_network_monitor",
+        "--",
+        "--include-ignored",
+    ])
+}
+
+fn run_sc6() -> Result<()> {
+    println!("sc6: toggle OFF → VRAM ~0 in < 3 s, sidecars dead, idle CPU < 2 % (doc 04/05)");
+    // On-target only (needs nvidia-smi + RTX 5060); #[ignore] elsewhere.
+    // TODO(M1/M5:): this passes only on the hardware gate; CI without a GPU will
+    // run the (ignored) test, which `todo!()`s in its setup until orchestration +
+    // sidecars exist. Gate the `--include-ignored` on an env flag in CI.
+    cargo_test(&[
+        "-p",
+        "aperture-gates",
+        "--test",
+        "sc6_vram_release",
+        "--",
+        "--include-ignored",
+    ])
+}
+
+// ---------------------------------------------------------------------------
+// seed-db — apply migrations to a scratch DB + round-trip every EventType (M0).
+// ---------------------------------------------------------------------------
+
+fn seed_db() -> Result<()> {
+    println!("seed-db: apply migrations to a scratch DB + round-trip every EventType (doc 16 M0)");
+    // This is the same proof as the M0 gate test, but as a runnable dev command:
+    // build a throwaway DB, apply aperture_db::migrations::MIGRATIONS, insert one
+    // Event per aperture_contracts::EventType::ALL, read each back.
+    //
+    // It is not implemented inline because xtask intentionally depends only on
+    // std + anyhow (it must not pull rusqlite into the workspace's tooling crate).
+    // The authoritative round-trip lives in the gate test; this command just runs
+    // it so a developer can `cargo xtask seed-db` and watch it.
+    // TODO(M0:): decide — either (a) shell out to the gate test (preferred, keeps
+    // xtask dep-free):
+    //     cargo_test(&["-p", "aperture-gates", "--test", "m0_schema_roundtrip"])
+    // or (b) add a tiny `aperture-db` helper `seed_scratch(path)` and call it.
+    todo!("M0: run the M0 round-trip against a scratch DB (delegate to the gate test or a db helper)")
+}
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+/// Run `cargo test <args>` from the workspace root, inheriting stdio, and fail if
+/// the test process returns non-zero.
+fn cargo_test(args: &[&str]) -> Result<()> {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let status = Command::new(cargo)
+        .arg("test")
+        .args(args)
+        .current_dir(workspace_root())
+        .status()
+        .context("spawn `cargo test`")?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("`cargo test {}` failed ({status})", args.join(" "))
+    }
+}

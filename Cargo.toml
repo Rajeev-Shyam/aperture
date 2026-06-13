@@ -1,0 +1,74 @@
+# Aperture — Cargo workspace
+#
+# A local-first, multimodal, proactive desktop assistant for Windows 11.
+# See docs/00-README.md for the full architecture document set and the three
+# invariants every crate must honor (8 GB VRAM ceiling, the transparency gate,
+# the capture toggle).
+#
+# Layout: one crate per subsystem (docs 05-13), a shared `contracts` crate that
+# holds the five interface contracts (doc 15), the Tauri shell in `src-tauri`,
+# and the two GPU sidecars (`vlm-host`, `stt-host`) as separate processes so a
+# process kill is the guaranteed VRAM-release primitive (doc 02 §2, doc 12 §5).
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/contracts",
+    "crates/db",
+    "crates/event-bus",
+    "crates/capture",
+    "crates/vision-ocr",
+    "crates/embedding",
+    "crates/pattern-engine",
+    "crates/suggestion-generator",
+    "crates/connectors",
+    "crates/orchestration",
+    "crates/reasoning-gateway",
+    "crates/privacy",
+    "crates/voice",
+    "crates/vlm-host",
+    "crates/stt-host",
+    "crates/gates",
+    "src-tauri",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Proprietary"
+rust-version = "1.80"
+
+[workspace.dependencies]
+# --- shared internal crates ---
+aperture-contracts = { path = "crates/contracts" }
+aperture-db = { path = "crates/db" }
+aperture-event-bus = { path = "crates/event-bus" }
+aperture-capture = { path = "crates/capture" }
+aperture-vision-ocr = { path = "crates/vision-ocr" }
+aperture-embedding = { path = "crates/embedding" }
+aperture-pattern-engine = { path = "crates/pattern-engine" }
+aperture-suggestion-generator = { path = "crates/suggestion-generator" }
+aperture-connectors = { path = "crates/connectors" }
+aperture-orchestration = { path = "crates/orchestration" }
+aperture-reasoning-gateway = { path = "crates/reasoning-gateway" }
+aperture-privacy = { path = "crates/privacy" }
+aperture-voice = { path = "crates/voice" }
+
+# --- third-party (versions are [VERIFY] at build time, doc 00 conventions) ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+thiserror = "1"
+anyhow = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+async-trait = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

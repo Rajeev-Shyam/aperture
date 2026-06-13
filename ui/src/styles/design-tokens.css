@@ -1,0 +1,133 @@
+/*
+ * Chromemorphism design tokens (doc 14 §2). The single source of truth for
+ * every color/geometry/blur/motion value in the overlay. Components reference
+ * these vars only — never hard-coded values — so the system stays "documented,
+ * not vibes" (doc 14 §1).
+ *
+ * INVARIANT NOTES:
+ *  - Surface fills use rgba ALPHA, never `opacity` (doc 14 §2): keeps text crisp.
+ *  - Blur ceiling is 16px (doc 14 §2): beyond ~20px the backdrop smears and the
+ *    GPU copy->blur->paste cost climbs for no legibility gain.
+ *  - Animatable properties are `opacity` and `transform` ONLY (doc 14 §2);
+ *    `backdrop-filter` is NEVER animated (doc 14 §4).
+ *  - ≤3 concurrent glass surfaces (doc 14 §5) — a hard cap enforced in JS
+ *    (BubbleContainer), tokens just make the fallback cheap to swap to.
+ *
+ * TODO(M8:) APCA-check `--ink-primary` over worst-case backdrops; verify the
+ *           OKLCH accent ramp with real tooling; PresentMon frame-drop gate.
+ */
+
+:root {
+  /* ---- Color (doc 14 §2) ---------------------------------------------- */
+  --canvas-0: #0b0c0e; /* conceptual base behind glass */
+
+  /* Surface fills — rgba alpha, NEVER `opacity`. */
+  --glass-1: rgba(255, 255, 255, 0.06);
+  --glass-2: rgba(255, 255, 255, 0.1); /* the bubble default fill */
+  --glass-3: rgba(255, 255, 255, 0.15); /* hover lift target */
+
+  --border-hairline: rgba(255, 255, 255, 0.08);
+  --border-hairline-hover: rgba(255, 255, 255, 0.2);
+
+  --ink-primary: rgba(255, 255, 255, 0.92);
+  --ink-secondary: rgba(255, 255, 255, 0.6);
+  --ink-faint: rgba(255, 255, 255, 0.38);
+
+  /* Chrome-cyan OKLCH accent. [VERIFY] ramp with real tooling (doc 14 §2). */
+  --accent: oklch(0.82 0.1 220);
+  --accent-ink: #0b0c0e; /* text on a filled accent chip */
+
+  /* Opaque fallback for the degrade-under-load contract (doc 14 §5). */
+  --fallback-opaque: rgba(22, 24, 28, 0.95);
+
+  /* Health dot states (preview footer, doc 11 §4). */
+  --health-ready: var(--accent);
+  --health-setup: oklch(0.82 0.12 90);
+  --health-down: oklch(0.65 0.16 25);
+
+  /* ---- Geometry & elevation (doc 14 §2) ------------------------------- */
+  --radius-12: 12px;
+  --radius-16: 16px; /* bubble */
+  --radius-24: 24px; /* panel */
+  --shadow-elev: 0 8px 24px rgba(0, 0, 0, 0.35);
+  --lens-lip: inset 0 1px 0 rgba(255, 255, 255, 0.12); /* inner top highlight */
+
+  /* ---- Blur scale — 16 is the CEILING (doc 14 §2) --------------------- */
+  --blur-8: 8px;
+  --blur-12: 12px; /* bubble backdrop blur */
+  --blur-16: 16px; /* ceiling */
+  --saturate: 160%;
+
+  /* ---- Motion (doc 14 §2) — durations + the single easing curve ------- */
+  --dur-120: 120ms;
+  --dur-180: 180ms;
+  --dur-240: 240ms;
+  --ease-chrome: cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  /* ---- Layout ---------------------------------------------------------- */
+  --stack-gutter: 16px; /* bottom-right bubble stack gutter (doc 11 §3) */
+  --edge-inset: 16px;
+}
+
+/*
+ * Backdrop-filter fallback (doc 14 §3): if the browser can't blur, use the
+ * opaque fill everywhere. WebView2 supports backdrop-filter, but this keeps the
+ * contract honest and matches the .bubble @supports rule.
+ */
+@supports not (backdrop-filter: blur(1px)) {
+  :root {
+    --glass-1: var(--fallback-opaque);
+    --glass-2: var(--fallback-opaque);
+    --glass-3: var(--fallback-opaque);
+  }
+}
+
+/*
+ * Degrade-under-load (doc 11 §6 + doc 14 §5). gpuBusy.ts toggles `gpu-busy` on
+ * <body> when the GPU mutex is held. While set: glass -> opaque, no blur, and
+ * motion is reduced to fades. `.surface-glass` is the marker class every glass
+ * component wears; here we neutralize its blur and swap the fill.
+ */
+body.gpu-busy .surface-glass {
+  background: var(--fallback-opaque) !important;
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+}
+
+/* prefers-reduced-motion => same fallback class + minimal motion (doc 14 §5). */
+@media (prefers-reduced-motion: reduce) {
+  .surface-glass {
+    background: var(--fallback-opaque);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: var(--dur-120) !important; /* fades only */
+  }
+}
+
+/* ---- Document base: the overlay body MUST stay transparent (doc 11 §2) ---- */
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  background: transparent; /* desktop shows through between surfaces */
+  color: var(--ink-primary);
+  font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  font-size: 13px;
+  /* The overlay window is click-through by default (Win32 flags, doc 11 §2);
+     only live surface rects re-enable hit-testing. */
+  pointer-events: none;
+  -webkit-user-select: none;
+  user-select: none;
+  overflow: hidden;
+}
+
+/* Any interactive surface opts back into pointer events. */
+.surface-interactive {
+  pointer-events: auto;
+}

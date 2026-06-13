@@ -1,0 +1,45 @@
+[package]
+name = "aperture-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tier-0 capture subsystem (doc 05): WGC frame sampling, WinEvent/UIA hooks, event-driven sampling, normalization, exclusion, and the <3 s capture toggle. CPU-only, ~0 VRAM."
+
+[dependencies]
+aperture-contracts = { workspace = true }
+aperture-event-bus = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+# Toggle state is OWNED by the Orchestration Manager (single writer, doc 05 §5,
+# doc 12). This subsystem only obeys it via `orchestration::ToggleOwner`.
+aperture-orchestration = { workspace = true }
+
+# --- Windows platform surface (NOT a workspace dep; pinned + [VERIFY]) ---
+# Features cover: Windows.Graphics.Capture (WGC) + the D3D11 interop the frame
+# pool needs (doc 05 §2); Win32 UI Automation for the address-bar read (§3);
+# Win32 WinEvent hooks + foreground-window queries (§3); SetWindowDisplayAffinity
+# for WDA_EXCLUDEFROMCAPTURE self-exclusion (§2).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Accessibility",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Threading",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_Foundation",
+] }  # [VERIFY] at build time — feature paths/version may shift across `windows` releases.
+
+[lints.clippy]
+# Invariant (2): the transparency gate. Only `reasoning-gateway` may open network
+# sockets or spawn the Claude CLI. Capture is egress-free by construction; a CI
+# lint denies socket/process-spawn APIs here (doc 13 §2).
+# TODO(M9): wire the workspace-level egress lint allow-list (doc 13 §2 enforcement (a)).

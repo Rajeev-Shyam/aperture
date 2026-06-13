@@ -1,0 +1,30 @@
+[package]
+name = "aperture-privacy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Privacy, security & consent (doc 13): the redaction pipeline, exclusion lists, the local cloud_send/capture_toggle audit log, DPAPI-wrapped at-rest key management, and first-run/per-send consent state."
+
+[dependencies]
+aperture-contracts = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# Required: audit_log's CloudSendRecord carries a `uuid::Uuid` payload_id.
+uuid = { workspace = true }
+
+# --- third-party (pinned; verify at build time, doc 00 conventions) ---
+# Deterministic ordered redaction rules (doc 13 §5).
+regex = "1"  # [VERIFY] at build time
+# SHA-256 of wire bytes for the cloud_send audit row (doc 13 §3, §7).
+sha2 = "0.10"  # [VERIFY] at build time
+# DPAPI (Security.Cryptography) + Credential Manager for at-rest key wrapping
+# (doc 13 §6). The DB key is generated per-install, wrapped by DPAPI (current
+# user), and stored in Windows Credential Manager; loss => DB unreadable.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Security_Cryptography",   # CryptProtectData / CryptUnprotectData (DPAPI)
+    "Win32_Security_Credentials",    # CredWrite / CredRead (Credential Manager)
+    "Win32_Foundation",
+] }  # [VERIFY] at build time

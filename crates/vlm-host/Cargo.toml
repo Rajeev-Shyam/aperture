@@ -1,0 +1,32 @@
+[package]
+name = "aperture-vlm-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "VLM sidecar BINARY (doc 06 §3, doc 02 §2): a standalone HTTP server that launches/manages a llama.cpp server child (Qwen2.5-VL 3B default / 7B opt-in L2 + mmproj) and exposes POST /infer + GET /health. Separate process so a kill guarantees VRAM release (SC6)."
+
+# A separate OS process is the whole point: process death is the only GUARANTEED
+# way to return VRAM to the driver (doc 02 §2, doc 12 §5). In-process bindings
+# would make unload best-effort and break the 8 GB ceiling + SC6 (< 3 s release).
+[[bin]]
+name = "aperture-vlm-host"
+path = "src/main.rs"
+
+[dependencies]
+aperture-contracts = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# --- third-party (pinned; [VERIFY] at build time, doc 00 conventions) ---
+# HTTP surface for /infer + /health, and the reverse-proxy client to the
+# llama.cpp server child. [VERIFY] axum vs hyper choice + exact versions at M5.
+axum = "0.7"                                                                   # [VERIFY]
+# CLI arg parsing: --port, --model, --loadout, --llama-bin, --model-dir (doc 04 §3).
+clap = { version = "4", features = ["derive"] }                                # [VERIFY]
+# Client used to forward decoded jobs to the llama.cpp server child over loopback.
+reqwest = { version = "0.12", features = ["json"] }                            # [VERIFY]

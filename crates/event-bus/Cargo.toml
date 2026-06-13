@@ -1,0 +1,10 @@
+[package]
+name = "aperture-event-bus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "In-process event bus: a tokio broadcast of aperture_contracts::Event. At-most-once; SQLite is the durable form (doc 15 §1, doc 02 §8)."
+
+[dependencies]
+aperture-contracts = { workspace = true }
+tokio = { workspace = true }

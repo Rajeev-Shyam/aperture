@@ -1,0 +1,20 @@
+[package]
+name = "aperture-contracts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The five cross-subsystem interface contracts + test fakes (doc 15). Every boundary type lives here so drift is a compile error."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+
+[features]
+# The fakes (scripted event player, golden payloads, FakeConnector, FakeScheduler,
+# FakeTransport — doc 15 §7) ship with the contracts crate but behind a feature so
+# production builds don't carry them.
+default = []
+fakes = []

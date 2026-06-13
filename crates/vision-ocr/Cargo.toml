@@ -1,0 +1,27 @@
+[package]
+name = "aperture-vision-ocr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Vision & OCR pipeline (doc 06): cheap always-on CPU OCR (Layer A, M2) into screen_context + on-demand VLM scene understanding (Layer B, M5) via the GPU mutex. Raw frames never persist."
+
+[dependencies]
+aperture-contracts = { workspace = true }
+aperture-embedding = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Platform / non-workspace deps — pinned, verified at build time.
+# Layer A default engine: in-box Windows.Media.Ocr via the windows crate (doc 06 §2).
+windows = { version = "0.58", features = [
+    "Media_Ocr",
+    "Globalization",
+    "Graphics_Imaging",
+    "Storage_Streams",
+    "Foundation_Collections",
+] } # [VERIFY] feature set for Windows.Media.Ocr at build time
+# Frame downscale + grayscale pre-processing (doc 06 §2/§3).
+image = "0.25" # [VERIFY]
