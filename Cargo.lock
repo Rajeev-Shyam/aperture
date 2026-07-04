@@ -185,6 +185,7 @@ dependencies = [
  "aperture-contracts",
  "aperture-event-bus",
  "aperture-orchestration",
+ "regex",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
