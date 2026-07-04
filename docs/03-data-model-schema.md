@@ -46,7 +46,10 @@ CREATE TABLE screen_context (
   ocr_text TEXT,                       -- cheap always-on OCR output (post-exclusion)
   ocr_confidence REAL,
   vlm_summary TEXT,                    -- only if the VLM was invoked (Doc 06)
-  thumb_phash TEXT                     -- perceptual hash; RAW FRAMES ARE NOT STORED
+  thumb_phash TEXT                     -- perceptual hash; RAW FRAMES ARE NOT STORED.
+                                       -- Active consumer (ADR-032/Q72): a near-duplicate-frame gate
+                                       -- (Doc 05 §4) skips OCR/embed when a new frame's pHash is within
+                                       -- a Hamming threshold of the last. Threshold [ASSUMPTION], tuned at M2.
 );
 CREATE INDEX idx_ctx_event ON screen_context(event_id);
 
@@ -84,12 +87,13 @@ CREATE TABLE suggestions (
   source TEXT NOT NULL,                -- 'local' | 'claude'
   title TEXT, glyph TEXT, confidence REAL,
   state TEXT,                          -- queued|shown|clicked|dismissed|expired
-  shown_ts INTEGER, resolved_ts INTEGER, outcome TEXT
+  shown_ts INTEGER, resolved_ts INTEGER, outcome TEXT,
+  useful_rating TEXT                   -- 'up'|'down'|NULL: explicit "useful?" thumbs (Doc 08 §7, ADR-040/Q81)
 );
 
 CREATE TABLE exclusion_list (
   id INTEGER PRIMARY KEY,
-  match_kind TEXT,                     -- 'process'|'window_class'|'title_regex'
+  match_kind TEXT,                     -- 'process'|'window_class'|'title_regex'|'url_pattern' (ADR-040)
   pattern TEXT, enabled INTEGER DEFAULT 1
 );
 
@@ -120,9 +124,11 @@ The payload builder serializes **one** object; the preview panel renders it and 
   }
 }
 ```
-Notes: `screenshot` items are **opt-in only** (user adds via enrichment; Doc 09 explains the token/caching cost of images). `event_trail` is capped at 50 events. The serialized payload's SHA-256 is logged in the `cloud_send` audit event.
+Notes: `screenshot` items are **opt-in only** (user adds via enrichment; Doc 09 explains the token/caching cost of images). `event_trail` is capped at 50 events — **user-adjustable in the enrichment panel within that 50 cap** (ADR-040/Q71). The serialized payload's SHA-256 is logged in the `cloud_send` audit event.
 
 ## 5. Voice-query retrieval path over history
+This same KNN+filter retrieval is **also invoked by the gated `aperture_search_history` MCP tool** (ADR-037, Doc 09 §3): Claude proposes a query, the tool handler runs the retrieval below, then **redacts + exclusion-filters + previews the matched results to the user before anything returns**, and audit-logs the return. Nothing leaves unseen.
+
 1. Embed the transcript with the same nomic-embed model (768-d).
 2. KNN + join + filter:
 ```sql
@@ -149,4 +155,7 @@ ORDER BY knn.distance ASC;
 | `connector_state` | per-connector TTL (Doc 10) | stale rows pruned |
 | `suggestions`, `patterns` | 180 days | delete |
 | Raw frames | **never persisted** | n/a |
-One-click **Purge All** truncates every table and VACUUMs. `capture_toggle` and `cloud_send` audit rows survive purge for 30 days [ASSUMPTION: user accountability], then expire.
+One-click **Purge All** truncates every table and VACUUMs. `capture_toggle` and `cloud_send` audit rows survive purge for 30 days [ASSUMPTION: user accountability], then expire. Opt-in **diagnostics sends** are audited on the same footing (ADR-036) and surfaced in the Activity & Privacy view.
+
+---
+> **R2 amendments applied** (see docs/19–21): ADR-040/Q81 (`suggestions.useful_rating`), ADR-040 (`exclusion_list` `url_pattern`), ADR-032/Q72 (`thumb_phash` near-duplicate-frame gate), ADR-037 (retrieval SQL reused by gated `aperture_search_history`), ADR-040/Q71 (`event_trail` user-adjustable within the 50 cap), ADR-036 (diagnostics audited). Retention TTLs and 768-dim `ctx_vec` confirmed unchanged (Q73, Q2). Mirrored in `crates/db/migrations/0001_init.sql`.

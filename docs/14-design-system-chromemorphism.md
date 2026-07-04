@@ -11,9 +11,9 @@ Chrome and liquid glass as a **documented system**: a dark canvas world where su
 | `glass/1..3` | `rgba(255,255,255,0.06 / 0.10 / 0.15)` | surface fills — **rgba alpha, never `opacity`** (text stays crisp) |
 | `border/hairline` | `rgba(255,255,255,0.08)` → `0.20` on hover | the chrome edge |
 | `ink/primary` | `rgba(255,255,255,0.92)` | text (APCA-checked over worst-case backdrops) |
-| `accent` | OKLCH ramp around a chrome-cyan hue [VERIFY tooling; e.g. `oklch(0.82 0.10 220)`] | actions, focus |
+| `accent` | OKLCH ramp around a cooler **steel / silver-blue** hue [VERIFY tooling — exact OKLCH values pending; a cooler, lower-chroma tone than the former chrome-cyan] | actions, focus |
 **Geometry & elevation:** radii 12/16/24 px (bubble = 16); shadow `0 8px 24px rgba(0,0,0,0.35)`; inner top highlight `inset 0 1px 0 rgba(255,255,255,0.12)` (the "lens" lip).
-**Blur scale:** 8 / 12 / 16 px — **16 is the ceiling**; beyond ~20 px the backdrop smears and the GPU copy-blur-paste cost climbs for no legibility gain.
+**Blur scale:** 8 / 12 px — **12 is the ceiling** (ADR-039); beyond ~12–16 px the backdrop smears and the GPU copy-blur-paste cost climbs for no legibility gain on a card shared with inference.
 **Motion:** durations 120/180/240 ms; easing `cubic-bezier(0.2, 0.8, 0.2, 1)`; **animatable properties: `opacity` and `transform` only.**
 
 ## 3. Effect recipes
@@ -34,7 +34,7 @@ Chrome and liquid glass as a **documented system**: a dark canvas world where su
   .bubble { background: rgba(22,24,28,0.95); }      /* opaque fallback */
 }
 ```
-**Liquid refraction (optional, flag-gated):** SVG `feDisplacementMap` warp + `feSpecularLighting` with the single global light direction (top-left ~115°) — compositor-thread only, applied to at most one "hero" surface, auto-disabled under `gpu_busy` and on `prefers-reduced-motion`.
+**Liquid refraction (deferred post-v1 — ADR-039):** **v1 ships static glass only** (specular sweep + lens-lip highlight + blur carry "Liquid Meta"); this refraction recipe is **retained as a documented future enhancement**, not shipped in v1. Recipe (for post-v1): SVG `feDisplacementMap` warp + `feSpecularLighting` with the single global light direction (top-left ~115°) — compositor-thread only, applied to at most one "hero" surface, auto-disabled under `gpu_busy` and on `prefers-reduced-motion`.
 
 ## 4. Bubble component states
 | State | Treatment (animating only opacity/transform) |
@@ -46,7 +46,10 @@ Chrome and liquid glass as a **documented system**: a dark canvas world where su
 | exit | fade + 4 px translate-down, 180 ms |
 
 ## 5. Performance budget & fallbacks (the contract with Doc 12)
-- **Hard cap: ≤ 3 concurrent glass (backdrop-filter) surfaces** — every one forces a copy→blur→composite of the backdrop region; this cap is simultaneously the UX cap (Doc 11 §3).
+- **Hard cap (interim, ADR-039): ≤ 2 concurrent glass (backdrop-filter) surfaces + an opaque 3rd bubble** — every glass surface forces a copy→blur→composite of the backdrop region. With 3 bubbles visible (the UX cap, Doc 11 §3) the 3rd renders in the `--fallback-opaque` class (2 glass + 1 opaque = 3 visible). The **final cap is set at the M8 PresentMon test.**
 - **Degrade-under-load contract:** while the GPU mutex is held (`gpu_busy=true`), the overlay swaps glass → `--fallback-opaque` (rgba .95, no blur), disables refraction, and reduces motion to fades; restore on release. *The design system is wired to the resource manager — a design force, not vibes.*
 - `prefers-reduced-motion` ⇒ same fallback class + minimal motion. Low-contrast backdrops ⇒ `ink` gains a 1 px text-shadow (APCA floor).
-- **Verification (M8 gate):** PresentMon shows no overlay frame drops while a VLM job runs; glass↔fallback swap is visually clean. [VERIFY]
+- **Verification (M8 gate):** PresentMon shows no overlay frame drops while a VLM job runs; glass↔fallback swap is visually clean; the M8 test also **sets the final glass-surface cap.** [VERIFY]
+
+---
+> **R2 amendments applied** (see docs/19–21): ADR-039 · Q68, Q80.

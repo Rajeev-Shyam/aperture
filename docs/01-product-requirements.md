@@ -19,7 +19,7 @@ Aperture watches how you work (only while you let it), learns your recurring pat
 
 ## 3. Non-goals (v1) — with rationale
 - **NG1 Arbitrary-app resumption.** Generic UI replay is unbounded and fragile; the bounded connector set covers the high-value cases and the interface (Doc 10) leaves the door open.
-- **NG2 Always-listening voice.** Privacy posture and idle cost; PTT only.
+- **NG2 Always-listening voice.** Privacy posture and idle cost; PTT only. A **click-to-toggle** PTT alternative (Q49) is allowed but stays bounded — 30 s cap + a visible listening pill — so "no always-listening" holds.
 - **NG3 Text-to-speech.** Adds a model + latency on a constrained GPU; answers render as text.
 - **NG4 Cloud-resident history / sync.** The local-DB boundary is a product promise, not a setting.
 - **NG5 Cloud-dependent proactivity.** The proactive loop must work offline; Claude never gates a bubble.
@@ -38,8 +38,8 @@ Aperture watches how you work (only while you let it), learns your recurring pat
 **Accept when:** (a) transcription of a 5–10 s utterance completes < 2 s (SC4); (b) the answer bubble shows title + source + a resume action; (c) if confidence is low, the transcript is shown for confirmation before acting (Doc 07); (d) no cloud call occurs unless the user explicitly escalates ("Ask Claude"); (e) the utterance is stored as a `voice_utterance` event and embedded (telemetry role).
 
 ### US3 — Context enrichment to Claude
-*Narrative:* A bubble offers "Ask Claude to summarize this." The user clicks; a panel shows the **exact** payload (OCR text, event trail, connector item, redactions applied, transport target) with "make context richer" affordances; only on **Send** does anything leave the machine.
-**Accept when:** (a) the previewed serialized object is byte-identical to the wire payload (Doc 13 invariant); (b) every redaction is listed with rule + count; (c) the user can remove any item before sending; (d) Cancel results in zero egress; (e) the structured answer renders in a bubble using the same suggestion schema as local output (Doc 09).
+*Narrative:* A bubble offers "Ask Claude to summarize this." The user clicks; a panel shows the **exact** payload (OCR text, event trail, connector item, redactions applied, transport target) with "make context richer" affordances; only on **Send** does anything leave the machine. On the **MCP-primary** path (ADR-025), "Ask Claude" **stages the approved payload and shows a handoff**; the transparency gate fires **inside the `aperture_get_context` tool handler**, and the answer returns via `aperture_submit_suggestions`, rendering in a bubble on the same schema.
+**Accept when:** (a) the previewed serialized object is byte-identical to the wire payload (Doc 13 invariant); (b) every redaction is listed with rule + count; (c) the user can remove any item before sending; (d) Cancel results in zero egress; (e) the structured answer renders in a bubble using the same suggestion schema as local output (Doc 09). *A user-granted **scoped allow** (ADR-026) may replace the per-call Send — the payload is still displayed, a cancel window still precedes egress, and the send is still audited.*
 
 ### US4 — Capture toggle
 *Narrative:* User clicks the tray indicator OFF. Capture stops, recording stops, GPU models unload, indicator flips to inactive.
@@ -55,14 +55,17 @@ Aperture watches how you work (only while you let it), learns your recurring pat
 | SC1 | Idle footprint (capture ON, no GPU job) | < 1.5 GB system RAM; ~0 model VRAM [VERIFY] | Task Manager / `nvidia-smi` over 30 min idle |
 | SC2 | Pattern trigger → bubble latency (local path) | < 2 s [VERIFY] | Instrumented timestamps event→render |
 | SC3 | VLM cold load + 1-frame understanding | < 6 s cold, < 2 s warm [VERIFY] | Harness on RTX 5060 |
-| SC4 | PTT transcription, 5–10 s utterance | < 2 s [VERIFY] | Harness, Whisper small |
-| SC5 | **Zero egress on the proactive path; cloud only after explicit Send** | 0 bytes | Network monitor (e.g. mitmproxy/ETW) in CI + manual |
-| SC6 | Capture OFF → full GPU release | < 3 s [VERIFY] | `nvidia-smi` delta on toggle |
-| SC7 | Suggestion usefulness (dogfood) | ≥ 50 % rated useful [VERIFY] | click/dismiss telemetry in `suggestions` table |
+| SC4 | PTT transcription, 5–10 s utterance | < 2 s [VERIFY] (GPU path only — **not promised on the whisper.cpp CPU fallback**, ADR-024) | Harness, faster-whisper small |
+| SC5 | **Zero *user-data* egress on the proactive path; cloud egress only via an explicit Send *or* an active scoped allow (payload displayed + cancel window + audit). The app-updater path carries no user data and is excluded from this test; the harness distinguishes it** (ADR-026, ADR-036) | 0 user-data bytes | Network monitor (e.g. mitmproxy/ETW) in CI + manual; loopback whitelisted (ADR-028) |
+| SC6 | Capture OFF → full GPU release (+ extension forwarding halted) | < 3 s [VERIFY] | `nvidia-smi` delta on toggle |
+| SC7 | Suggestion usefulness (dogfood) | ≥ 50 % rated useful [VERIFY] | explicit **"useful?" thumbs** (Q81) + click/dismiss telemetry in `suggestions` table |
 
 ## 6. v1 boundary
 **In:** single user, single Windows 11 machine; the four connectors; fully local proactivity; explicit-only Claude with transparency gate; capture toggle; glass UI; at-rest encryption; exclusion lists; retention/purge.
 **Out:** everything in §3.
 
 ## 7. Traceability
-Every goal maps to components (table in §2); every story maps to flows verified in Doc 18. Orphan check lives in Doc 18 §1.
+Every goal maps to components (table in §2); every story maps to flows verified in Doc 18 (re-run in **Doc 21** for the R2 set). Orphan check lives in Doc 18 §1 / Doc 21 §1.
+
+---
+> **R2 amendments applied** (see docs/19–21): ADR-025 (US3 MCP-primary stage+handoff), ADR-026 (US3 scoped-allow; SC5 reword), ADR-036 (SC5 updater carve-out), ADR-024 (SC4 CPU-fallback caveat), Q49 (NG2 click-to-toggle), Q81 (SC7 "useful?" thumbs).

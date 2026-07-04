@@ -3,15 +3,17 @@
 ## 1. The tiered model
 | Tier | Residency | Contents | Cost profile | Failure isolation |
 |---|---|---|---|---|
-| **Tier 0 — always-on local (CPU/RAM)** | Runs whenever capture is ON | WGC sampler, Win32/UIA event hooks, cheap OCR, embedding writer, SQLite + sqlite-vec, behavior/pattern engine, suggestion generator, connector capture | Idles cheaply; no GPU model resident | A Tier-0 fault degrades suggestions, never the OS |
-| **Tier 1 — on-demand GPU (8 GB, mutex)** | Loaded on trigger, idle-unloaded | VLM (Qwen2.5-VL **3B default / 7B opt-in**), Whisper STT — run as **sidecar processes** | VRAM-bound; one heavyweight model at a time | Sidecar crash ≠ app crash; kill = guaranteed VRAM release |
-| **Tier 2 — cloud (explicit-only)** | Never resident; per-call | Claude via swappable transport (Desktop MCP / Code CLI / Messages API) | Network + tokens, only on explicit Send | Offline ⇒ product still fully works (NG5) |
+| **Tier 0 — always-on local (CPU/RAM)** | Runs whenever capture is ON | WGC sampler, Win32/UIA event hooks, cheap OCR, embedding writer, SQLite + sqlite-vec, behavior/pattern engine, suggestion generator, connector capture, **the browser extension + native-messaging host** (ADR-027: primary browser URL + video-position source) | Idles cheaply; no GPU model resident | A Tier-0 fault degrades suggestions, never the OS |
+| **Tier 1 — on-demand GPU (8 GB, mutex)** | Loaded on trigger, idle-unloaded | VLM (Qwen2.5-VL **3B default / 7B opt-in**), **faster-whisper** STT — run as **sidecar processes** | VRAM-bound; one heavyweight model at a time (conditional co-residency, ADR-030) | Sidecar crash ≠ app crash; kill = guaranteed VRAM release |
+| **Tier 2 — cloud (explicit-only)** | Never resident; per-call | Claude via swappable transport, **MCP-primary** (Desktop MCP → Code CLI → Messages API; ADR-025) | Network + tokens, only on explicit Send / scoped allow | Offline ⇒ product still fully works (NG5) |
 
 ## 2. Process model **[ASSUMPTION, with rationale]**
 - **Main process:** Tauri (Rust core + WebView2 UI). Hosts the Event Bus, SQLite, pattern engine, connectors, orchestration, and the overlay window.
 - **Model-host sidecars:** `vlm-host` (llama.cpp server with the Qwen2.5-VL mmproj) and `stt-host` (whisper.cpp / faster-whisper server), spawned and killed by the Resource Manager (Doc 12).
 - *Why sidecars:* process termination is the only **guaranteed** way to return VRAM to the driver, which is what makes SC6 (full release < 3 s on toggle-OFF) and the OOM degrade ladder enforceable. In-process bindings make unload best-effort. [VERIFY exact server binaries/flags.]
-- **External processes (not ours):** Claude Desktop or the `claude` CLI, when those transports are configured.
+- **Native-messaging host:** a small stdio bridge (no socket) between the browser extension and the Rust core (ADR-028); an authenticated 127.0.0.1 loopback is the fallback only. Its forwarding is gated by the capture toggle (FIX 2.1).
+- **Browser extension (ours, but sandboxed by the browser):** a Manifest V3 extension for Chrome + Opera GX, reading URLs + `video.currentTime` only — never page DOM/content (ADR-029).
+- **External processes (not ours):** Claude Desktop (MCP, primary) or the `claude` CLI, when those transports are configured; and the Tauri app-updater (framework path, no user data — ADR-036).
 
 ## 3. Labeled component map
 ```
@@ -73,4 +75,7 @@
 | Suggestion lifecycle | Bubble UI (11) | pattern engine (feedback) |
 
 ## 8. Master connection rule
-Tier 0 talks over the in-process Event Bus with SQLite as the durable backbone. **Tier 0→1 passes exclusively through the Orchestration Manager** (no component touches the GPU directly). **Anything→2 passes exclusively through the Reasoning Gateway after the transparency gate.** The five contracts that make components independently buildable are specified in Doc 15.
+Tier 0 talks over the in-process Event Bus with SQLite as the durable backbone. **Tier 0→1 passes exclusively through the Orchestration Manager** (no component touches the GPU directly). **Anything→2 passes exclusively through the Reasoning Gateway after the transparency gate** — including the opt-in, aggregate-only diagnostics path (ADR-036); the app-updater is the one framework-level exception, carrying no user data. The five contracts that make components independently buildable are specified in Doc 15.
+
+---
+> **R2 amendments applied** (see docs/19–21): ADR-027 (extension + native-messaging host as a Tier-0 capture source), ADR-028 (native-messaging transport + loopback fallback), ADR-029 (extension URL/position-only), ADR-025 (MCP-primary transport), ADR-030 (conditional co-residency), ADR-036 (diagnostics via gateway; updater carve-out).
