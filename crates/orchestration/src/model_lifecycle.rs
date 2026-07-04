@@ -17,8 +17,9 @@ use std::time::Duration;
 
 use crate::vram_table::ModelId;
 
-/// Idle-unload after 90 s without a job (range 60–120, default 90 — doc 04 §5).
-pub const IDLE_UNLOAD: Duration = Duration::from_secs(90);
+/// Idle-unload after 60 s without a job (ADR-032/Q32; amended from R1's 90 s —
+/// shorter windows also reduce risky co-residency, ADR-030) (doc 04 §5).
+pub const IDLE_UNLOAD: Duration = Duration::from_secs(60);
 /// L2 swap debounce: minimum residency before a model may be swapped out
 /// (anti-thrash, doc 12 §7 [ASSUMPTION]).
 pub const L2_MIN_RESIDENCY: Duration = Duration::from_secs(20);
@@ -146,12 +147,13 @@ impl ModelLifecycle {
     }
 
     /// Idle-unload sweep: kill any sidecar idle > `IDLE_UNLOAD` (doc 04 §5).
-    /// Honors the warm-keep policy (>=3 PTT uses in 10 min pins Whisper, makes
-    /// the VLM the swap victim — doc 04 §5).
+    /// Honors the warm-keep policy (ADR-030/Q36: **>=2 PTT uses in 5 min** pins
+    /// faster-whisper resident and makes the VLM the swap victim; a warm-kept STT
+    /// is protected from pattern-VLM but yields to a user/enrichment image-VLM).
     pub async fn idle_sweep(&mut self) {
         // TODO(M5:) for each loaded sidecar, if now - last_job_at > IDLE_UNLOAD
         //   and not warm-kept -> kill_sidecar (doc 04 §5).
-        todo!("M5: idle-unload after 90 s; honor warm-keep (doc 04 §5)")
+        todo!("M5: idle-unload after 60 s; honor warm-keep >=2 PTT/5 min (doc 04 §5)")
     }
 
     /// L2 only: unload the resident 7B and load Whisper for an STT arrival

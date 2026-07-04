@@ -8,9 +8,13 @@
 //! heuristics and treated as excluded, flagged
 //! [`redaction_flags::PRIVATE_WINDOW`] (doc 13 §4) [VERIFY reliability per browser].
 //!
-//! Shipped defaults: password managers and common banking-domain window titles
-//! [ASSUMPTION — curated list, user-editable] (doc 13 §4). The list itself lives
-//! in the encrypted settings table (doc 13 §6).
+//! **Defaults ship EMPTY** (ADR-029/Q15): sensitive-app protection comes from
+//! onboarding's **detect-and-suggest** (scan installed password managers /
+//! banking apps locally, *suggest* exclusions the user confirms — never
+//! auto-excluded; ADR-040) plus the one-click "exclude this domain/app"
+//! affordances. Match kinds include `url_pattern` (ADR-040) for
+//! extension-sourced URLs — which traverse this same pipeline (FIX 2.2).
+//! The list itself lives in the encrypted settings table (doc 13 §6).
 //!
 //! INVARIANT (2): this gate is purely local; it removes data from collection, it
 //! never transmits anything.
@@ -115,10 +119,9 @@ pub fn is_private_window(_window_title: &str) -> bool {
     todo!("M9: private-window title heuristic (doc 13 §4)")
 }
 
-/// Shipped default exclusion rules: password managers + common banking-domain
-/// window titles (doc 13 §4) [ASSUMPTION — curated, user-editable].
+/// Shipped default exclusion rules: **EMPTY** (ADR-029/Q15). The curated
+/// password-manager/banking list became onboarding *suggestions* the user
+/// confirms (detect-and-suggest, ADR-040/M9) — never silent auto-exclusions.
 pub fn default_rules() -> Vec<ExclusionRule> {
-    // TODO(M9): curate the default list (1Password, Bitwarden, KeePass, …; bank
-    // login title patterns) and ship it; all entries user-editable/removable.
-    todo!("M9: curated default exclusion rules (doc 13 §4)")
+    Vec::new()
 }

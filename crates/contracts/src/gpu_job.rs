@@ -9,10 +9,15 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// Priorities (doc 12 §3): STT(voice)=100 > user-requested VLM=80 > pattern-VLM=50.
+/// Four-tier priorities (doc 12 §3, ADR-031):
+/// STT(voice)=100 > user-VLM(waiting on the answer now)=80
+/// > enrichment-VLM("add screen summary" while composing)=70 > pattern-VLM=50.
 pub mod priority {
     pub const STT_VOICE: u8 = 100;
     pub const VLM_USER: u8 = 80;
+    /// ADR-031: the "Add screen summary" enrichment affordance — useful, but the
+    /// user is composing, not blocked; slightly less latency-critical than user-VLM.
+    pub const VLM_ENRICHMENT: u8 = 70;
     pub const VLM_PATTERN: u8 = 50;
 }
 
@@ -20,7 +25,9 @@ pub mod priority {
 pub struct GpuJob {
     pub kind: GpuJobKind,
     pub priority: u8,
-    /// VLM 10 s, STT 15 s [ASSUMPTION, doc 12 §3]; expiry cancels + logs, never loops.
+    /// Interim VLM 10 s / STT 15 s — real deadlines are set by the M5/M6 measured
+    /// cold-load + inference times (doc 12 §3, ADR-031/Q33); expiry cancels + logs,
+    /// never loops.
     pub deadline: Duration,
 }
 
@@ -48,7 +55,8 @@ pub enum JobOutput {
 /// (doc 04 R3) instead of guessing.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum JobError {
-    #[error("budget refused: projected {projection_gb:.2} GB > 7.2 GB ceiling")]
+    /// The cap is 7.0 GB and the projection counts co-resident weights (doc 04 R1, ADR-030).
+    #[error("budget refused: projected {projection_gb:.2} GB > 7.0 GB ceiling")]
     BudgetRefused { projection_gb: f32 },
     #[error("deadline exceeded")]
     Deadline,

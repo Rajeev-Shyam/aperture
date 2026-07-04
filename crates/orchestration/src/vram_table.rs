@@ -6,8 +6,9 @@
 //! is therefore `[VERIFY all on hardware]`.
 //!
 //! Invariant (1): the 8 GB ceiling — the enforcer's job is to keep
-//! `weights + mmproj + kv_est(ctx) + img_act(n_images) + framework <= 7.2 GB`
-//! (doc 04 R1). This table supplies every term except `kv_est`/`img_act` scaling.
+//! `active(weights + mmproj + kv_est(ctx) + img_act(n)) + framework +
+//! co_resident_weights <= 7.0 GB` (doc 04 R1, ADR-030). This table supplies
+//! every term except `kv_est`/`img_act` scaling and the co-resident sum.
 
 use std::collections::HashMap;
 
@@ -19,9 +20,10 @@ pub enum ModelId {
     Vlm3b,
     /// Qwen2.5-VL 7B Q4_K_M — the L2 opt-in, runs exclusive (doc 04 §3).
     Vlm7b,
-    /// Whisper small — the L1 co-resident STT model (doc 04 §2).
-    WhisperSmall,
-    /// faster-whisper distil-large-v3 int8 — opt-in STT (doc 04 §2).
+    /// faster-whisper small (CTranslate2, GPU `stt-host`) — the L1 conditionally
+    /// co-resident STT model (ADR-024; ~2 GB, the figure that forced ADR-030).
+    FasterWhisperSmall,
+    /// faster-whisper distil-large-v3 int8 — opt-in STT (doc 04 §2, ADR-024).
     WhisperDistilLargeV3Int8,
 }
 
@@ -91,9 +93,11 @@ impl VramTable {
             },
         );
         rows.insert(
-            ModelId::WhisperSmall,
+            ModelId::FasterWhisperSmall,
             VramParams {
-                weights_gb: 1.0, // doc 04 §2: Whisper small ~1.0 GB
+                weights_gb: 2.0, // ADR-024: faster-whisper small ≈ 2 GB (1–2 GB range,
+                //                  seed the conservative high end — this is the figure
+                //                  that makes L1 co-residency conditional, ADR-030)
                 mmproj_gb: 0.0,
                 img_act_per_image_gb: 0.0,
                 kv_ref_gb: 0.0,

@@ -5,9 +5,13 @@
 //!     The indicator is always truthful (doc 05 §5); INVARIANT (3): toggling OFF
 //!     releases capture and kills sidecars (VRAM->~0 in <3 s) — that mechanism
 //!     lives in capture/orchestration; this struct holds the *state* and gates it.
-//!   - **Every cloud send is individually approved — no "always allow" in v1.**
-//!     Approval is per-payload, set only by the preview panel
-//!     (`ContextPayload::user_approved`); this module exposes no "remember me".
+//!   - **Every cloud send is approved — individually, or under a scoped allow
+//!     (ADR-026, supersedes R1's "no always-allow").** A scoped allow is per
+//!     app+intent and only automates the *Send click*: the exact payload is
+//!     still displayed, a cancel window (default 3 s) still precedes egress,
+//!     and the SHA-256 is still audit-logged. `ContextPayload::user_approved`
+//!     is set by the preview panel on explicit Send OR by an active scoped
+//!     allow whose cancel window elapsed. Scoped-allow state lands at M7.
 //!   - **Voice is opt-in at first PTT** (mic permission flow).
 //!
 //! INVARIANT (2): consent is local state. It never reaches across the cloud
@@ -109,7 +113,9 @@ impl ConsentManager {
     }
 }
 
-// NOTE (doc 13 §8): there is deliberately **no** "always allow cloud send" API in
-// v1 — per-send approval is enforced by `ContextPayload::user_approved`, which
-// only the preview panel may set and only the gateway may read. Adding a
-// remember-me here would breach the transparency gate (INVARIANT 2).
+// NOTE (doc 13 §8, ADR-026): a **scoped allow** (per app+intent) IS sanctioned in
+// v1 — but it only automates the Send click. The invariant-preserving parts are
+// non-negotiable: exact payload still rendered, cancel window still precedes
+// egress, SHA-256 still audited. A *silent* always-allow (no preview/cancel)
+// remains forbidden — that would breach the transparency gate (INVARIANT 2).
+// The ScopedAllow state/API lands at M7 alongside the gateway.

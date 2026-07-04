@@ -11,6 +11,7 @@ aperture-event-bus = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+serde_json = { workspace = true }
 
 # Toggle state is OWNED by the Orchestration Manager (single writer, doc 05 §5,
 # doc 12). This subsystem only obeys it via `orchestration::ToggleOwner`.

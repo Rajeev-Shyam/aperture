@@ -79,7 +79,8 @@ pub struct Redaction {
 }
 
 /// The ordered transport list lives in settings; the gateway picks the first
-/// healthy one (doc 09 §3). Default order: CLI -> Desktop-MCP -> API.
+/// healthy one (doc 09 §3). Default order: **MCP -> CLI -> API** (ADR-025:
+/// MCP is primary — the pull/handoff loop is the default cloud UX).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TransportTarget {

@@ -6,15 +6,16 @@
 //! (doc 11 §6, doc 14's degrade contract keys off it).
 //!
 //! Queue semantics (doc 12 §3):
-//! - **Priorities:** STT(voice)=100 > user-VLM=80 > pattern-VLM=50
-//!   (`aperture_contracts::gpu_job::priority`).
+//! - **Priorities (four tiers, ADR-031):** STT(voice)=100 > user-VLM=80 >
+//!   enrichment-VLM=70 > pattern-VLM=50 (`aperture_contracts::gpu_job::priority`).
 //! - **Admission:** the [`crate::budget_enforcer`] R1 check must pass, else the
 //!   R3 degrade ladder (doc 04 §6).
 //! - **Preemption:** a higher-priority arrival cancels a *cancellable* lower job
 //!   at its cancel point — pattern-VLM(50) is always cancellable; **STT(100) is
 //!   never cancellable** (doc 12 §3).
-//! - **Deadlines:** VLM 10 s, STT 15 s [ASSUMPTION]; expiry cancels + logs,
-//!   **never** retries in a loop (doc 12 §3).
+//! - **Deadlines:** interim VLM 10 s / STT 15 s — the real deadlines are set by
+//!   the M5/M6 measured cold-load + inference times (ADR-031/Q33); expiry cancels
+//!   + logs, **never** retries in a loop (doc 12 §3).
 //! - No hold-and-wait cycle exists by construction: single mutex + deadlines +
 //!   cancellable jobs (doc 12 §7).
 

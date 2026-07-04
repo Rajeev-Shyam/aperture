@@ -1,7 +1,7 @@
 # --- Rust ---
 /target
 **/target
-Cargo.lock          # this is a workspace of libs + one app; lock is committed by the app only if desired
+# Cargo.lock is COMMITTED (app workspace => reproducible builds). NB: gitignore has no inline comments; the old line here never matched anyway.
 *.pdb
 
 # --- Tauri ---

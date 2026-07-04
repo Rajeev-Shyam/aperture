@@ -30,8 +30,11 @@ pub mod fakes;
 
 /// Re-export the surface most callers want.
 pub use connector::{Connector, ConnectorState, OpenOutcome, ResumeArtifact};
-pub use context_payload::{ContextPayload, Intent, PayloadItem, Redaction, TransportTarget};
+pub use context_payload::{
+    ContextPayload, Intent, PayloadItem, Redaction, TransportTarget, EVENT_TRAIL_MAX,
+    PAYLOAD_SIZE_WARN_BYTES,
+};
 pub use event::{Event, EventType};
-pub use gpu_job::{GpuJob, GpuJobKind, JobError, JobOutput};
+pub use gpu_job::{GpuJob, GpuJobKind, GpuScheduler, JobError, JobOutput};
 pub use reasoning::{Health, ReasoningTransport, TransportError, TransportId};
 pub use suggestions::{BubbleSpec, StructuredSuggestions, SuggestionCandidate};

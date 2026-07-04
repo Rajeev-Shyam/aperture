@@ -47,7 +47,7 @@ pub async fn list_suggestions(
 ) -> Result<Vec<BubbleSpecEnvelope>, String> {
     // TODO(M3:) read live suggestions from the suggestion generator / DB and wrap
     //   each as { id, spec } so the UI can key lifecycle events back to a bubble.
-    todo!("M3: return live { id, spec } envelopes (UI enforces the 3-visible cap, doc 11 §3)")
+    todo!("M3: return live {{ id, spec }} envelopes (UI enforces the 3-visible cap, doc 11 §3)")
 }
 
 /// Critical Path B (doc 02 §5): resolve `action_ref` -> `connector_id`, load the
@@ -75,8 +75,8 @@ pub async fn bubble_click(
 #[tauri::command]
 pub async fn request_preview(
     _intent: Intent,
-    /// Optional originating bubble/answer `action_ref` so the preview seeds its
-    /// connector item from the same context the user clicked (doc 11 §4-§5).
+    // Optional originating bubble/answer `action_ref` so the preview seeds its
+    // connector item from the same context the user clicked (doc 11 §4-§5).
     _seed_action_ref: Option<String>,
     _state: State<'_, AppState>,
 ) -> Result<ContextPayload, String> {

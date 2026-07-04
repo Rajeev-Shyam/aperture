@@ -5,9 +5,11 @@
 //! only. Nothing here may touch the network; that path belongs solely to the
 //! reasoning gateway (two-emitter rule, doc 13 §2).
 //!
-//! Tracked: VLM **wake rate** (target < 6 wakes/h, doc 06 §4), GPU **queue
-//! waits**, and **VRAM peaks** — the numbers each M-gate asserts on (doc 16
-//! M1/M5/M6).
+//! Tracked: VLM **wake rate** (adaptive ~3–10/h band, ADR-032; hard ceiling
+//! protects voice), GPU **queue waits**, and **VRAM peaks** — the numbers each
+//! M-gate asserts on (doc 16 M1/M5/M6). These counters (rates only, never
+//! content) are also the ONLY thing the opt-in diagnostics path may carry, and
+//! only via the gateway crate (ADR-036) — this crate itself never emits.
 
 use std::time::Duration;
 
@@ -15,7 +17,8 @@ use std::time::Duration;
 /// harnesses (doc 16). Plain data; no I/O.
 #[derive(Debug, Clone, Default)]
 pub struct TelemetrySnapshot {
-    /// VLM wakes in the trailing hour; the M5 gate asserts `< 6` (doc 06 §4).
+    /// VLM wakes in the trailing hour; the M5 gate asserts the adaptive 3–10/h
+    /// band with its hard ceiling (ADR-032).
     pub vlm_wakes_last_hour: u32,
     /// Jobs admitted (passed the R1 projection) since start.
     pub jobs_admitted: u64,
@@ -26,7 +29,7 @@ pub struct TelemetrySnapshot {
     /// Mean time a job waited in the queue before the mutex was granted.
     pub mean_queue_wait: Duration,
     /// Peak observed VRAM use (GB); the M5 gate asserts no admission ever
-    /// exceeded 7.2 GB projected (doc 16 M5).
+    /// exceeded 7.0 GB projected, counting co-resident weights (doc 16 M5, ADR-030).
     pub vram_peak_gb: f32,
     /// Toggle-OFF SLA breaches (release took > 3 s, doc 12 §6); surfaced once.
     pub toggle_sla_breaches: u32,
@@ -49,7 +52,7 @@ impl Telemetry {
     /// Record a VLM wake with its reason (doc 06 §4 logs reasons for tuning).
     pub fn record_vlm_wake(&self, _reason: &'static str) {
         // TODO(M5:) push now() into the wake ring buffer; reason -> a per-reason tally.
-        todo!("M5: record VLM wake for the < 6 wakes/h gate (doc 06 §4)")
+        todo!("M5: record VLM wake for the adaptive 3–10/h gate (doc 06 §4, ADR-032)")
     }
 
     /// Record a job's queue wait once the mutex is granted.

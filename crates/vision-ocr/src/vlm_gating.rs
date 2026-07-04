@@ -1,8 +1,10 @@
 //! VLM wake-up gating — the heuristics that protect the GPU (doc 06 §4, M5).
 //!
 //! The gate decides whether a frame is worth a `prio:50` VLM job. The whole
-//! point is restraint: **target < 6 wakes/hour** in normal use (doc 06 §4,
-//! tuned at the M5 gate). Three things gate every wake:
+//! point is restraint: the wake budget is **adaptive ~3–10/hour, value-driven**
+//! (ADR-032: raised when VLM-enriched suggestions out-click un-enriched ones;
+//! the **hard ceiling is non-negotiable** so a "valuable" VLM never starves
+//! voice; tuned at the M5 gate). Three things gate every wake:
 //! 1. capture must be on **and** the mutex likely free (doc 12);
 //! 2. no per-app debounce active (30 s, anti-thrash);
 //! 3. a real trigger fired: (a) the pattern engine asked to disambiguate (doc
@@ -39,10 +41,12 @@ pub const WEAK_OCR_CONFIDENCE: f32 = 0.55;
 /// "rich" (an empty frame is not worth a VLM wake).
 pub const LOW_TEXT_DENSITY: usize = 8;
 
-/// Target proactive wake budget (doc 06 §4). Not enforced here — the
-/// orchestration telemetry asserts it at the M5 gate — but documented so the
-/// thresholds above have a north star.
-pub const TARGET_WAKES_PER_HOUR: u32 = 6;
+/// Adaptive proactive wake budget — floor (ADR-032: cold-start conservative).
+pub const WAKES_PER_HOUR_FLOOR: u32 = 3;
+/// Adaptive proactive wake budget — **hard ceiling** (ADR-032: non-negotiable so
+/// the VLM never starves voice). Not enforced here — the orchestration telemetry
+/// asserts it at the M5 gate — but documented so the thresholds have a north star.
+pub const WAKES_PER_HOUR_CEILING: u32 = 10;
 
 /// Why a wake fired — logged for tuning (doc 06 §4: "Wake reasons are logged").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -88,7 +92,8 @@ pub struct GateInputs {
 /// a `Some` here can still be refused at enqueue and degrade to OCR-only
 /// (doc 06 §6).
 pub fn should_wake_vlm(_ev: &Event, ocr: &OcrOutput, g: &GateInputs) -> Option<WakeReason> {
-    // TODO(M5): tune thresholds against the < 6 wakes/h target on real usage.
+    // TODO(M5): tune thresholds against the adaptive 3–10 wakes/h band (ADR-032)
+    // on real usage; requires the click-attribution proxy for raising the budget.
     if !g.capture_on || !g.mutex_likely_free {
         return None;
     }

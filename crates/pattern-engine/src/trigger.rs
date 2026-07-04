@@ -1,11 +1,14 @@
 //! Proactive trigger gate — the 7 rules, all of which must hold (doc 08 §6).
 //!
-//! 1. `score ≥ τ_conf = 0.6` ([`config::TAU_CONF`]) `[VERIFY — SC7 at M3]`
+//! 1. `score ≥ τ_conf = 0.7` ([`config::TAU_CONF`], ADR-033) `[VERIFY — SC7 at M3]`
 //! 2. Weighted support ≥ 3 ([`config::COLD_START_SUPPORT_FLOOR`]) `[ASSUMPTION]`
 //! 3. A **fresh, resumable** `connector_state` exists for the consequent (doc 10 TTLs)
-//! 4. Cooldown: same signature not shown in the last 30 min ([`config::COOLDOWN_MIN`])
-//! 5. Global cap: ≤ 4 suggestions/hour ([`config::CAP_PER_HOUR`]); overflow drops lowest score
-//! 6. Novelty: the consequent's resource is not currently foreground
+//! 4. Cooldown: same signature not shown within its current cooldown — base 30 min
+//!    ([`config::COOLDOWN_MIN`]), multiplied by the dismissal ladder (×2 / ×4, ADR-033)
+//! 5. Global cap: **adaptive 2→8/hr, click-through-driven** (ADR-032; cold-start
+//!    default [`config::CAP_PER_HOUR_DEFAULT`]); overflow drops lowest score
+//! 6. Novelty: the consequent's resource is not foreground **and** was not focused
+//!    in the last ~10 min ([`config::NOVELTY_RECENT_FOCUS_MIN`], ADR-033)
 //! 7. **Capture is ON**
 //!
 //! Rule 7 is the capture-toggle invariant (invariant 3): when capture is OFF the
@@ -60,7 +63,8 @@ pub struct TriggerInput<'a> {
 pub struct TriggerGate {
     /// Last-shown `ts` (epoch ms) per signature, for the 30-min cooldown.
     last_shown: std::collections::HashMap<String, i64>,
-    /// `ts` of suggestions emitted in the trailing hour, for the ≤4/hr cap.
+    /// `ts` of suggestions emitted in the trailing hour, for the adaptive
+    /// 2→8/hr cap (ADR-032).
     recent_emissions: Vec<i64>,
 }
 
@@ -77,17 +81,27 @@ impl TriggerGate {
     /// once the candidate is actually shown so cooldown/cap stay accurate.
     pub fn admit(&self, _input: &TriggerInput<'_>, _capture_on: bool) -> Result<(), TriggerReject> {
         // TODO(M3): evaluate in order, cheapest first; return the first failing
-        // rule. Notes on individual rules:
-        //   1. input.score >= config::TAU_CONF
+        // rule. Notes on individual rules (R2 values):
+        //   1. input.score >= config::TAU_CONF (0.7, ADR-033)
         //   2. input.weighted_support >= config::COLD_START_SUPPORT_FLOOR
         //   3. input.connector_state is Some AND fresh (scorer::freshness > 0)
-        //   4. now - last_shown[signature] >= COOLDOWN_MIN * 60_000
-        //   5. emissions in trailing hour < CAP_PER_HOUR (overflow drops lowest
-        //      score — coordinated by the caller's candidate queue, doc 08 §6.5)
-        //   6. !input.consequent_is_foreground
+        //   4. now - last_shown[signature] >= COOLDOWN_MIN * ladder_mult * 60_000
+        //      (ladder_mult from the signature's dismissal count: 1/2/4, ADR-033)
+        //   5. emissions in trailing hour < current adaptive cap in
+        //      [CAP_PER_HOUR_FLOOR, CAP_PER_HOUR_CEILING], cold-start
+        //      CAP_PER_HOUR_DEFAULT (ADR-032; overflow drops lowest score —
+        //      coordinated by the caller's candidate queue, doc 08 §6.5)
+        //   6. !input.consequent_is_foreground AND not focused within
+        //      NOVELTY_RECENT_FOCUS_MIN (ADR-033)
         //   7. capture_on  (invariant 3 — capture toggle)
-        let _ = (config::TAU_CONF, config::COLD_START_SUPPORT_FLOOR, config::COOLDOWN_MIN);
-        todo!("M3: evaluate the 7 trigger rules in order (doc 08 §6)")
+        let _ = (
+            config::TAU_CONF,
+            config::COLD_START_SUPPORT_FLOOR,
+            config::COOLDOWN_MIN,
+            config::CAP_PER_HOUR_DEFAULT,
+            config::NOVELTY_RECENT_FOCUS_MIN,
+        );
+        todo!("M3: evaluate the 7 trigger rules in order (doc 08 §6, R2 values)")
     }
 
     /// Record that `signature` was shown at `now_ms`, updating the cooldown map
