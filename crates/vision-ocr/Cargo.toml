@@ -22,6 +22,8 @@ windows = { version = "0.58", features = [
     "Graphics_Imaging",
     "Storage_Streams",
     "Foundation_Collections",
-] } # [VERIFY] feature set for Windows.Media.Ocr at build time
+    "Win32_Foundation",
+    "Win32_System_WinRT",   # IBufferByteAccess for the SoftwareBitmap copy (M2)
+] } # [VERIFY resolved — M2: feature set compiles + covers the buffer path
 # Frame downscale + grayscale pre-processing (doc 06 §2/§3).
 image = "0.25" # [VERIFY]

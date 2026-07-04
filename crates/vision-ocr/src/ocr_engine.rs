@@ -10,15 +10,16 @@ use crate::VisionError;
 
 /// The result of running one frame through an [`OcrEngine`] (doc 06 §2).
 ///
-/// `text` is the concatenated, post-filtered line text (lines under the
-/// confidence floor are already dropped — see [`windows_media_ocr`](crate::windows_media_ocr)).
-/// `mean_confidence` is the mean *word* confidence over the surviving lines and
-/// is what the gate in doc 06 §4 reads to decide whether to wake the VLM.
+/// `text` is the concatenated, post-filtered line text (low-quality lines are
+/// already dropped — see [`crate::windows_media_ocr`], incl. the note on the
+/// in-box engine's missing confidence API). `mean_confidence` is the mean
+/// per-line quality over the surviving lines and is what the gate in doc 06 §4
+/// reads to decide whether to wake the VLM.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OcrOutput {
-    /// Concatenated line text, post-confidence-filter (doc 06 §2).
+    /// Concatenated line text, post-quality-filter (doc 06 §2).
     pub text: String,
-    /// Mean word confidence in `[0.0, 1.0]` over surviving lines (doc 06 §2).
+    /// Mean per-line quality/confidence in `[0.0, 1.0]` over surviving lines.
     pub mean_confidence: f32,
 }
 
@@ -28,8 +29,6 @@ impl OcrOutput {
     /// engine-agnostic proxy; the actual `LOW` threshold lives in
     /// [`vlm_gating`](crate::vlm_gating).
     pub fn text_density(&self) -> usize {
-        // TODO(M2): consider chars-per-area once frame dims are threaded through;
-        // word count is the M2-stage proxy.
         self.text.split_whitespace().count()
     }
 }
@@ -38,16 +37,14 @@ impl OcrOutput {
 /// honor the Layer-A budget (≤ 400 ms/frame, doc 06 §5) — they never touch the
 /// GPU or the mutex.
 ///
-/// `process_frame` takes a *decoded, pre-processed* frame as raw bytes (the
-/// caller — [`FrameProcessor`](crate::frame_processor) — has already downscaled
-/// to ≤ 1600 px long edge and converted to grayscale) plus a BCP-47 `lang` tag.
-/// On a missing language pack the engine falls back to `en` and the pipeline
-/// notes it (doc 06 §6).
+/// `process_frame` takes a *pre-processed* frame: raw **BGRA8** bytes already
+/// downscaled to ≤ 1600 px long edge by the caller
+/// ([`FrameProcessor`](crate::frame_processor)), with its dimensions. The
+/// engine's language selection happens at construction (doc 06 §6 fallback).
 pub trait OcrEngine: Send + Sync {
-    /// Run OCR on one pre-processed frame. `frame` is the raw decoded image
-    /// buffer (format documented by the impl); `lang` is a BCP-47 tag (e.g.
-    /// `"en-US"`). See doc 06 §2.
-    fn process_frame(&self, frame: &[u8], lang: &str) -> Result<OcrOutput, VisionError>;
+    /// Run OCR on one pre-processed BGRA8 frame (doc 06 §2).
+    fn process_frame(&self, frame: &[u8], width: u32, height: u32)
+        -> Result<OcrOutput, VisionError>;
 
     /// Stable identifier for telemetry / the M2 gate ("which engine produced
     /// this row"), e.g. `"windows-media-ocr"`.

@@ -44,10 +44,15 @@ impl ScreenContextRow {
     ///
     /// Empty OCR text is normalized to `None` so it neither embeds nor counts as
     /// content downstream.
-    pub fn from_processed(_frame: &ProcessedFrame) -> Self {
-        // TODO(M2): map ProcessedFrame -> row; ocr_text=None when empty;
-        // carry ocr_confidence + thumb_phash; vlm_summary stays None.
-        todo!("M2: build screen_context row from ProcessedFrame (no raw frame)")
+    pub fn from_processed(frame: &ProcessedFrame) -> Self {
+        let text = frame.ocr.text.trim();
+        Self {
+            event_id: 0, // stamped by the store step once the event row exists
+            ocr_text: (!text.is_empty()).then(|| frame.ocr.text.clone()),
+            ocr_confidence: (!text.is_empty()).then_some(frame.ocr.mean_confidence),
+            vlm_summary: None, // Layer B lands later via with_vlm_summary (M5)
+            thumb_phash: frame.thumb_phash.clone(),
+        }
     }
 
     /// Attach a VLM scene summary (doc 06 §3) — serialized to the

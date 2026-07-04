@@ -9,8 +9,17 @@ description = "CPU text embedding (nomic-embed-text-v1.5, 768-d pinned) for ctx_
 aperture-contracts = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-# nomic-embed-text-v1.5 (137M) runs on CPU. The runtime backend (candle / ort /
-# llama.cpp gguf) is an M2 decision — load the model+tokenizer behind the
-# `Embedder` trait so it can be swapped without touching callers. [VERIFY]
-# candle-core = { version = "0.6", default-features = false }       # [VERIFY]
-# tokenizers  = { version = "0.20", default-features = false, features = ["onig"] }  # [VERIFY]
+
+# [VERIFY resolved — M2]: backend = fastembed (ONNX Runtime, CPU) behind the
+# `nomic` feature. Chosen over the build prompt's llama-cpp-2 suggestion because
+# llama-cpp-2 needs cmake + libclang on MSVC; the Embedder trait absorbs the
+# swap. Feature is OFF by default: first use downloads the model (~250 MB) —
+# an explicit opt-in setup step, never an implicit build cost (metered data).
+fastembed = { version = "4", optional = true }
+
+[features]
+default = []
+# The real nomic-embed-text-v1.5 backend. Enable with:
+#   cargo build -p aperture-embedding --features nomic
+# First run downloads the ONNX weights into the configured cache dir (models/).
+nomic = ["dep:fastembed"]
