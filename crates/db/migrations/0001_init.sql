@@ -70,22 +70,23 @@ CREATE TABLE connector_state (
 CREATE INDEX idx_conn_type_ts ON connector_state(connector_type, captured_ts);
 
 CREATE TABLE suggestions (
-  id           INTEGER PRIMARY KEY,
-  pattern_id   INTEGER REFERENCES patterns(id),
-  connector_id TEXT REFERENCES connector_state(id),
-  source       TEXT NOT NULL,                  -- 'local' | 'claude'
-  title        TEXT,
-  glyph        TEXT,
-  confidence   REAL,
-  state        TEXT,                           -- queued|shown|clicked|dismissed|expired
-  shown_ts     INTEGER,
-  resolved_ts  INTEGER,
-  outcome      TEXT
+  id            INTEGER PRIMARY KEY,
+  pattern_id    INTEGER REFERENCES patterns(id),
+  connector_id  TEXT REFERENCES connector_state(id),
+  source        TEXT NOT NULL,                 -- 'local' | 'claude'
+  title         TEXT,
+  glyph         TEXT,
+  confidence    REAL,
+  state         TEXT,                          -- queued|shown|clicked|dismissed|expired
+  shown_ts      INTEGER,
+  resolved_ts   INTEGER,
+  outcome       TEXT,
+  useful_rating TEXT                           -- 'up'|'down'|NULL: explicit "useful?" thumbs (doc 08 §7, ADR-040/Q81)
 );
 
 CREATE TABLE exclusion_list (
   id         INTEGER PRIMARY KEY,
-  match_kind TEXT,                             -- 'process'|'window_class'|'title_regex'
+  match_kind TEXT,                             -- 'process'|'window_class'|'title_regex'|'url_pattern' (doc 13 §4, ADR-040)
   pattern    TEXT,
   enabled    INTEGER DEFAULT 1
 );

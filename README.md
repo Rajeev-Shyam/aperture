@@ -12,8 +12,11 @@ optional heavy-reasoning tier, invoked **only when you explicitly ask** — and 
 always see and approve the exact bytes that leave the machine.
 
 > This repository is the **architecture-faithful skeleton**. The full design lives
-> in [`docs/`](docs/) (19 dependency-ordered documents). Start with
-> [`docs/00-README.md`](docs/00-README.md).
+> in [`docs/`](docs/) (22 dependency-ordered documents: 00–18 v1, **19–21 the R2
+> refinement pass**, 22 the v2 draft; process/handoff notes in
+> [`docs/handoff/`](docs/handoff/)). Start with
+> [`docs/00-README.md`](docs/00-README.md). Docs 00–18 already read as R2 (the
+> Doc 20 amendments are applied inline); Doc 21 supersedes Doc 18.
 
 ---
 
@@ -22,26 +25,34 @@ always see and approve the exact bytes that leave the machine.
 Every crate honors these (see [`docs/00-README.md`](docs/00-README.md) §"The three invariants"):
 
 1. **8 GB VRAM ceiling.** One heavyweight GPU model resident at a time (a single
-   GPU mutex); 3B-VLM default loadout; projected-VRAM cap **7.2 GB**. Enforced by
-   the [`orchestration`](crates/orchestration) crate (docs 04, 12).
-2. **The transparency gate.** Exactly **two** code paths may emit network traffic,
-   both inside the [`reasoning-gateway`](crates/reasoning-gateway) crate, both only
-   after the user approves the **exact serialized payload** (docs 09, 13). A CI
+   GPU mutex); 3B-VLM default loadout; projected-VRAM cap **7.0 GB** with the
+   projection **counting co-resident weights** (ADR-030). Co-residency (VLM +
+   faster-whisper STT) is conditional — STT is the swap victim under image-VLM
+   pressure. Enforced by the [`orchestration`](crates/orchestration) crate (docs 04, 12).
+2. **The transparency gate.** **Raw user data** leaves only via the
+   [`reasoning-gateway`](crates/reasoning-gateway) crate, only after the user
+   approves the **exact serialized payload** (an explicit Send **or** a scoped
+   allow with payload preview + cancel window + audit). That crate is the only
+   code that opens application network sockets — including the opt-in,
+   off-by-default, **aggregate-only diagnostics** path; the Tauri updater is a
+   separate framework path carrying no user data (docs 09, 13; ADR-026/036). A CI
    lint (`cargo xtask lint-emitters`) makes this a build-time guarantee, and the
-   SC5 test proves zero egress on the proactive path.
-3. **The capture toggle.** OFF stops capture, halts recording, and force-unloads
-   GPU models within **3 s**, with a visible indicator (docs 05, 12). Proven by
-   the SC6 gate.
+   SC5 test proves zero **user-data** egress on the proactive path.
+3. **The capture toggle.** OFF stops capture, halts recording, force-unloads
+   GPU models, **and halts browser-extension forwarding**, within **3 s**, with a
+   visible indicator (docs 05, 12; ADR-027/FIX 2.1). Proven by the SC6 gate.
 
 ## Locked decisions (do not relitigate — see docs/00)
 
 Windows 11, local-first hybrid · screen understanding → proactive bubbles ·
 bubbles are deep-link actions · bounded connector set (browser URL, video
-timestamp, document, IDE file) · proactive loop is **fully local**, Claude only on
-explicit action via a **swappable transport** (Claude Desktop MCP / Claude Code
-CLI / Messages API) · behavioral history in a local DB that **never leaves the
-device** · Chromemorphism & Liquid Meta design system · hardware ceiling
-**RTX 5060 8 GB VRAM / 16 GB RAM / Ryzen**.
+timestamp, document, IDE file), sourced by a **committed v1 browser extension**
+(Chrome + Opera GX) with UIA as the no-extension fallback (ADR-027) · proactive
+loop is **fully local**, Claude only on explicit action via a **swappable
+transport, MCP-primary** (Claude Desktop MCP → Claude Code CLI → Messages API;
+ADR-025) · behavioral history in a local DB that **never leaves the device** ·
+Chromemorphism & Liquid Meta design system (v1 = static glass; liquid refraction
+deferred post-v1) · hardware ceiling **RTX 5060 8 GB VRAM / 16 GB RAM / Ryzen**.
 
 ## Stack
 
@@ -61,7 +72,8 @@ device** · Chromemorphism & Liquid Meta design system · hardware ceiling
 Cargo.toml                      # workspace
 rust-toolchain.toml             # pinned 1.80 + msvc target
 config/settings.default.json    # first-run settings seed (runtime copy lives in the encrypted DB)
-docs/                           # the 19 architecture documents (authoritative)
+docs/                           # 00–18 v1 · 19–21 R2 refinement · 22 v2 draft (authoritative)
+docs/handoff/                   # process/handoff notes (session bridge, M1–M3 build prompt)
 
 crates/
   contracts/            # ★ the five interface contracts + test fakes (doc 15) — depend on this, not on each other
@@ -112,10 +124,10 @@ Each milestone has a **measured validation gate** on the real target.
 | M2 | OCR + embeddings + store | OCR ≤ 400 ms; embed ≤ 300 ms; sane KNN |
 | M3 | Pattern engine + minimal overlay | **SC2**: scripted workflow → bubble < 2 s; SC5 holds |
 | M4 | The four connectors + Path B | **US1**: YouTube reopens at the right timestamp |
-| M5 | VLM sidecar + GPU scheduler + budget enforcer | measured VRAM; never > 7.2 GB; SC3 |
+| M5 | VLM sidecar + GPU scheduler + budget enforcer | measured VRAM (incl. co-resident weights); never > 7.0 GB; SC3 |
 | M6 | STT + PTT + retrieval | **SC4**: < 2 s transcription; US2 |
 | M7 | Reasoning gateway + transparency gate (CLI **and** MCP) | **SC5 strict**: preview bytes == wire bytes; US3 |
-| M8 | Design-system hardening (glass tokens, degrade-under-load, multi-monitor) | ≤ 3 glass surfaces; no overlay frame drops during a VLM job |
+| M8 | Design-system hardening (glass tokens, degrade-under-load, multi-monitor) | ≤ 2 glass surfaces + opaque 3rd; no overlay frame drops during a VLM job |
 | M9 | Privacy hardening (encryption, retention/purge, consent, audit) | DB unreadable without the key; Purge All verified |
 
 > **This skeleton targets M0.** Subsystem crates beyond M0 are stubbed with faithful

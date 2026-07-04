@@ -15,7 +15,7 @@
 
 ## 3. Layer B — on-demand VLM (Tier 1, GPU, mutex)
 - **Model:** Qwen2.5-VL — **3B default (L1), 7B opt-in (L2)** per Doc 04 §3. Served by the `vlm-host` sidecar (llama.cpp server + mmproj). [VERIFY server flags/version.]
-- **Pre-processing:** downscale to ≤ 1024 px long edge before the sidecar [ASSUMPTION; enforces OOM rule R2], one image per job, JPEG q85.
+- **Pre-processing:** **adaptive downscale — 768 px long edge under memory pressure / 1024 px with headroom**, chosen by the BudgetEnforcer at admission [ASSUMPTION; enforces OOM rule R2 and eases co-residency per ADR-030], one image per job, JPEG q85 (ADR-032).
 - **Prompt template (system):** "You are a screen-understanding function. Given one screenshot of a Windows 11 desktop, return ONLY JSON matching the schema. Do not guess text you cannot read." 
 - **Structured output schema:**
 ```json
@@ -37,12 +37,14 @@ fn should_wake_vlm(ev, ocr) -> bool {
   trigger && budget_projection_ok()                           // Doc 04 R1 via Doc 12
 }
 ```
-- Wake reasons are logged (for tuning). Target wake rate: **< 6 wakes/hour** in normal use [ASSUMPTION; tune at M5].
+- Wake reasons are logged (for tuning). Target wake rate: **adaptive ~3/hr floor → ~10/hr ceiling, value-driven** — raised when VLM-enriched suggestions out-click un-enriched (requires a defensible attribution proxy); the **hard ceiling is non-negotiable so a "valuable" VLM never starves voice** [ASSUMPTION; tune at M5] (ADR-032).
+- **Priority tier (ADR-031):** `should_wake_vlm` keys the projection/preemption check off the **four-tier priority** — a user-explicit request → **user-VLM (80)**, an enrichment "add scene summary" → **enrichment-VLM (70)**, a pattern-requested or OCR-density-driven wake → **pattern-VLM (50)** (Doc 12 §3).
 - **VLM output never gates a bubble** (Doc 02 Path A invariant): results enrich `screen_context.vlm_summary` and improve the *next* pattern cycle and future payloads.
 
 ## 5. Internal flow
+> Upstream, Doc 05's **pHash near-duplicate gate** may drop a frame before it ever reaches this pipeline — on a static screen no OCR/embed runs (Q72).
 ```
-frame ──► downscale ──► OCR ──► screen_context.ocr_text ──► embed (Doc 03)
+frame ──► [pHash gate, Doc 05: near-dup? drop] ──► downscale ──► OCR ──► screen_context.ocr_text ──► embed (Doc 03)
                           │
                           └─ gate(§4)? ──► GPU job {kind:VLM, prio:50} ──► Doc 12 mutex
                                                   └─► vlm-host ──► JSON ──► screen_context.vlm_summary
@@ -56,3 +58,6 @@ frame ──► downscale ──► OCR ──► screen_context.ocr_text ──
 | VLM hallucinated entities | `resumable_hint` is advisory only — connectors validate against their own captured state before any suggestion uses it |
 | OCR garbage on image-heavy frames | Confidence filter drops it; density heuristic may wake the VLM instead |
 | Language pack missing | Fall back to en + notice; [VERIFY language coverage] |
+
+---
+> **R2 amendments applied** (see docs/19–21): ADR-031, ADR-032; Q72 (upstream pHash gate), Q85 (adaptive image downscale).
