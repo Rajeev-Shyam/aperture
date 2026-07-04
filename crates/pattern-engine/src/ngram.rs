@@ -25,12 +25,29 @@ pub struct NGram {
 
 impl NGram {
     /// The stable `signature` string `join(antecedent) ⇒ consequent` used as the
-    /// `patterns` row key (doc 08 §4).
+    /// `patterns` row key (doc 08 §4). Uses [`Token::encode`], which is
+    /// separator-safe, so the encoding round-trips stably and feedback
+    /// (doc 08 §7) always hits the same row.
     pub fn signature(&self) -> String {
-        // TODO(M3): canonical, collision-free encoding of (app_class, action,
-        // resource_class) tuples joined by a separator, then " ⇒ " + consequent.
-        // Must round-trip stably so feedback (doc 08 §7) hits the same row.
-        todo!("M3: encode antecedent ⇒ consequent signature (doc 08 §4)")
+        let ant = self
+            .antecedent
+            .iter()
+            .map(Token::encode)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        format!("{ant} ⇒ {}", self.consequent.encode())
+    }
+
+    /// The antecedent-only key (`join(antecedent) ⇒ *`) — the denominator row
+    /// for confidence (doc 08 §4: `W(antecedent ⇒ *)`).
+    pub fn antecedent_key(&self) -> String {
+        let ant = self
+            .antecedent
+            .iter()
+            .map(Token::encode)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        format!("{ant} ⇒ *")
     }
 }
 
@@ -56,16 +73,92 @@ impl NGramWindow {
 
     /// Push the newest token and return every n-gram (n = 2..4) that *ends* on
     /// it — i.e. the occurrences to credit in this step (doc 08 §4).
-    pub fn push(&mut self, _tok: Token) -> Vec<NGram> {
-        // TODO(M3): append; keep only the last MAX_N tokens; for n in MIN_N..=MAX_N
-        // where enough history exists, emit NGram{ antecedent: prefix, consequent }.
-        todo!("M3: emit closing n-grams for n=2..4 within the session (doc 08 §4)")
+    ///
+    /// Consecutive duplicate tokens are collapsed (a focus storm on one window
+    /// is one behavioral step, not four — doc 05 §4 debounce is upstream but
+    /// heartbeat samples can still repeat a context).
+    pub fn push(&mut self, tok: Token) -> Vec<NGram> {
+        if self.tokens.last() == Some(&tok) {
+            return Vec::new(); // duplicate step; nothing new closes
+        }
+        self.tokens.push(tok);
+        if self.tokens.len() > MAX_N {
+            let overflow = self.tokens.len() - MAX_N;
+            self.tokens.drain(..overflow);
+        }
+
+        let len = self.tokens.len();
+        let mut out = Vec::new();
+        for n in MIN_N..=MAX_N.min(len) {
+            let slice = &self.tokens[len - n..];
+            out.push(NGram {
+                antecedent: slice[..n - 1].to_vec(),
+                consequent: slice[n - 1].clone(),
+            });
+        }
+        out
     }
 
     /// The current token tail (up to `MAX_N - 1`) used to match pattern
     /// antecedents during candidate generation (doc 08 §5).
     pub fn antecedent_tail(&self) -> &[Token] {
-        // TODO(M3): return the trailing up-to-(MAX_N-1) tokens.
-        &self.tokens
+        let len = self.tokens.len();
+        let take = (MAX_N - 1).min(len);
+        &self.tokens[len - take..]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tok(a: &str) -> Token {
+        Token {
+            app_class: a.into(),
+            action: "focus".into(),
+            resource_class: None,
+        }
+    }
+
+    #[test]
+    fn closing_ngrams_grow_with_history() {
+        let mut w = NGramWindow::new();
+        assert!(w.push(tok("a")).is_empty(), "one token closes nothing");
+        let g2 = w.push(tok("b"));
+        assert_eq!(g2.len(), 1, "a→b closes one 2-gram");
+        assert_eq!(g2[0].signature(), "a:focus:∅ ⇒ b:focus:∅");
+        let g3 = w.push(tok("c"));
+        assert_eq!(g3.len(), 2, "2-gram b→c and 3-gram a,b→c");
+        let g4 = w.push(tok("d"));
+        assert_eq!(g4.len(), 3, "n=2,3,4 all close");
+        let g5 = w.push(tok("e"));
+        assert_eq!(g5.len(), 3, "window trimmed to MAX_N; still n=2..4");
+    }
+
+    #[test]
+    fn session_reset_clears_history() {
+        let mut w = NGramWindow::new();
+        w.push(tok("a"));
+        w.push(tok("b"));
+        w.reset();
+        assert!(w.push(tok("c")).is_empty(), "no cross-session grams (doc 08 §3)");
+    }
+
+    #[test]
+    fn duplicate_steps_collapse() {
+        let mut w = NGramWindow::new();
+        w.push(tok("a"));
+        assert!(w.push(tok("a")).is_empty(), "duplicate focus is one step");
+        assert_eq!(w.antecedent_tail().len(), 1);
+    }
+
+    #[test]
+    fn antecedent_tail_is_capped() {
+        let mut w = NGramWindow::new();
+        for name in ["a", "b", "c", "d", "e"] {
+            w.push(tok(name));
+        }
+        assert_eq!(w.antecedent_tail().len(), MAX_N - 1);
+        assert_eq!(w.antecedent_tail()[0], tok("c"));
     }
 }

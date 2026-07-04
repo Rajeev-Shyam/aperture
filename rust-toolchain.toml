@@ -1,6 +1,11 @@
 # Pin the toolchain so the 8 GB-VRAM target and the Windows capture APIs build
 # identically on every machine. Bump deliberately; record in the milestone notes.
+#
+# [VERIFY resolved — Step 0, 2026-07-04]: bumped 1.80.0 → 1.96.1 (current stable
+# at first compile). Rationale: current tauri v2 / windows / rusqlite releases
+# require a newer rustc than mid-2024's 1.80; pinning the actual first-compile
+# toolchain keeps the pin honest. Recorded per the milestone-notes rule above.
 [toolchain]
-channel = "1.80.0"
+channel = "1.96.1"
 components = ["rustfmt", "clippy"]
 targets = ["x86_64-pc-windows-msvc"]

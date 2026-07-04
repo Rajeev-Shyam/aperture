@@ -55,12 +55,22 @@ pub enum CaptureError {
 pub struct CaptureConfig {
     /// Coalesce focus storms (doc 05 §4 [ASSUMPTION] 300 ms).
     pub debounce_ms: u64,
-    /// Heartbeat cadence while the user is active (doc 05 §4 [ASSUMPTION] 10 s).
-    pub heartbeat_ms: u64,
+    /// Heartbeat cadence while the user is active — **adaptive ~5–20 s**
+    /// (ADR-032/Q41: modulated by input activity + event density), 10 s default.
+    pub heartbeat_default_ms: u64,
+    /// Adaptive heartbeat floor (ADR-032). Never sample faster than this.
+    pub heartbeat_min_ms: u64,
+    /// Adaptive heartbeat ceiling (ADR-032).
+    pub heartbeat_max_ms: u64,
     /// "User is active" window — input seen within this span (doc 05 §4, 60 s).
     pub active_window_ms: u64,
     /// Longest edge after downscale before handing a frame to OCR (doc 05 §4).
     pub max_frame_edge_px: u32,
+    /// pHash near-duplicate gate (ADR-032/Q72): skip OCR/embed when a new
+    /// frame's pHash is within this Hamming distance of the last frame's.
+    /// [ASSUMPTION — start at 4, tuned at M2]. The gate only *removes* work;
+    /// it can never delay a bubble (Doc 21 §2).
+    pub phash_hamming_threshold: u32,
 }
 
 impl Default for CaptureConfig {
@@ -68,9 +78,12 @@ impl Default for CaptureConfig {
         // TODO(M1): load overrides from settings (doc 13 §7) instead of hardcoding.
         Self {
             debounce_ms: 300,
-            heartbeat_ms: 10_000,
+            heartbeat_default_ms: 10_000,
+            heartbeat_min_ms: 5_000,
+            heartbeat_max_ms: 20_000,
             active_window_ms: 60_000,
             max_frame_edge_px: 1600,
+            phash_hamming_threshold: 4,
         }
     }
 }

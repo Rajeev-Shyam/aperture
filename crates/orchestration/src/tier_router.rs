@@ -13,9 +13,12 @@
 
 use aperture_contracts::Event;
 
-/// Target wake rate the M5 gate asserts: **< 6 wakes/hour** in normal use
-/// (doc 06 §4 [ASSUMPTION; tune at M5]).
-pub const TARGET_WAKES_PER_HOUR: u32 = 6;
+/// Adaptive wake-rate band the M5 gate asserts (ADR-032): floor ~3/hr
+/// (cold-start), **hard ceiling ~10/hr** (non-negotiable — protects voice).
+/// Value-driven: raised only when VLM-enriched suggestions out-click un-enriched.
+pub const WAKES_PER_HOUR_FLOOR: u32 = 3;
+/// See [`WAKES_PER_HOUR_FLOOR`]. `[ASSUMPTION; tune at M5]`.
+pub const WAKES_PER_HOUR_CEILING: u32 = 10;
 /// Per-app anti-thrash debounce on VLM wakes (doc 06 §4).
 pub const WAKE_DEBOUNCE_PER_APP_SECS: u64 = 30;
 

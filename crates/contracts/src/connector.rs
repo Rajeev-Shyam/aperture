@@ -4,8 +4,11 @@
 //! connectors (Slack thread, terminal cwd, Figma frame…) plug in without core
 //! changes. `reconstruct_payload` carries a `payload_version` for forward
 //! migration; migrations are per-connector pure functions `v(n) -> v(n+1)`.
-//! `validate()` is mandatory for any Claude-suggested action to gain a button —
-//! the cloud can *suggest*, only a connector can *act*.
+//! `validate()` is mandatory before any action **executes** — validate-on-click
+//! (ADR-035): the button renders optimistically, the connector validates before
+//! any `ShellExecute`/protocol dispatch and fails gracefully. The safety law is
+//! unchanged: the cloud can *suggest*, only a connector can *act*, and nothing
+//! executes unvalidated.
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;

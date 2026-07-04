@@ -1,12 +1,15 @@
 //! The exclusion list — data minimization at the earliest gate (doc 05 §4, doc 13 §4).
 //!
 //! Exclusion stops collection **before** any frame is pulled or OCR runs (doc 05
-//! §4). A match by **process**, **window-class**, or **title-regex** yields a
-//! metadata-only [`aperture_contracts::Event`] flagged
-//! [`redaction_flags::EXCLUDED`] (doc 13 §4); such events **can never appear in
-//! any payload** (doc 13 §2/§4). Shipped defaults are a curated, user-editable
-//! list: password managers and common banking-domain window titles (doc 13 §4
-//! [ASSUMPTION]).
+//! §4). A match by **process**, **window-class**, **title-regex**, or
+//! **url_pattern** (ADR-040) yields a metadata-only
+//! [`aperture_contracts::Event`] flagged [`redaction_flags::EXCLUDED`]
+//! (doc 13 §4); such events **can never appear in any payload** (doc 13 §2/§4).
+//! **Defaults ship EMPTY** (ADR-029/Q15 — the user chose max control): safety is
+//! restored by the onboarding **detect-and-suggest** flow (scan installed
+//! password managers / banking apps locally, *suggest* exclusions the user
+//! confirms — never auto-excluded) and the one-click "exclude this domain/app"
+//! affordances (ADR-040).
 //!
 //! Private/incognito browser windows are detected via title-suffix heuristics and
 //! treated as excluded, additionally flagged [`redaction_flags::PRIVATE_WINDOW`]
@@ -65,12 +68,13 @@ impl ExclusionList {
         todo!("M1: compile exclusion rules")
     }
 
-    /// The shipped defaults: password managers + common banking-domain titles
-    /// (doc 13 §4 [ASSUMPTION], curated + user-editable).
+    /// The shipped defaults: **EMPTY** (ADR-029/Q15). Sensitive-app protection
+    /// comes from onboarding's detect-and-suggest (user-confirmed, M9/ADR-040),
+    /// never from silent auto-exclusion.
     pub fn shipped_defaults() -> Self {
-        // TODO(M1): seed default rules (1Password, Bitwarden, KeePass, etc.).
-        //   M9: merge user edits from the encrypted settings store (doc 13 §6/§7).
-        todo!("M1: shipped default exclusion list")
+        // ADR-029: defaults ship empty. M9 merges user-confirmed rules from the
+        // encrypted settings store (doc 13 §6/§7) + detect-and-suggest results.
+        Self::default()
     }
 
     /// The core predicate (doc 05 §4, doc 13 §4): is this context excluded?

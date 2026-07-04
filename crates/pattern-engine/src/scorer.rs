@@ -1,7 +1,8 @@
 //! Recency-weighted statistics & candidate scoring (doc 08 §4-§5).
 //!
 //! Support is recency-weighted: each occurrence contributes
-//! `w = 0.5^(age_days / HALF_LIFE_DAYS)` (exponential half-life 7 days, doc 08 §4).
+//! `w = 0.5^(age_days / H)` with the half-life **split by pattern type**
+//! (ADR-033): sequence patterns H ≈ 14 d, temporal patterns H ≈ 5 d (doc 08 §4).
 //! Confidence is the recency-weighted conditional probability
 //! `conf = W(antecedent ⇒ consequent) / W(antecedent ⇒ *)` (doc 08 §4).
 //! The final candidate score multiplies confidence by the feedback decay,
@@ -14,14 +15,16 @@ use aperture_contracts::connector::ConnectorState;
 
 use crate::config;
 
-/// Recency weight of a single occurrence (doc 08 §4):
-/// `w = 0.5^(age_days / HALF_LIFE_DAYS)`. `age_days` is `(now - ts) / 1 day`.
+/// Recency weight of a single occurrence (doc 08 §4, ADR-033):
+/// `w = 0.5^(age_days / half_life_days)`. `age_days` is `(now - ts) / 1 day`.
+/// Callers pass [`config::HALF_LIFE_SEQUENCE_DAYS`] for n-gram patterns and
+/// [`config::HALF_LIFE_TEMPORAL_DAYS`] for time-of-day patterns.
 ///
 /// Pure and side-effect-free so [`crate::temporal`] can reuse it for weighted
 /// return-visit mass.
-pub fn recency_weight(now_ms: i64, occurrence_ms: i64) -> f64 {
+pub fn recency_weight(now_ms: i64, occurrence_ms: i64, half_life_days: f64) -> f64 {
     let age_days = (now_ms - occurrence_ms).max(0) as f64 / 86_400_000.0;
-    0.5_f64.powf(age_days / config::HALF_LIFE_DAYS)
+    0.5_f64.powf(age_days / half_life_days)
 }
 
 /// Recency-weighted support and confidence for one antecedent ⇒ consequent

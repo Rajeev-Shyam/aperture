@@ -7,8 +7,8 @@
 //!
 //! The three invariants this crate enforces:
 //! 1. **8 GB VRAM ceiling / single GPU mutex** — [`gpu_scheduler`] holds one
-//!    `Semaphore` permit; [`budget_enforcer`] admits only `<= 7.2 GB` projected
-//!    (doc 04 §4, R1).
+//!    `Semaphore` permit; [`budget_enforcer`] admits only `<= 7.0 GB` projected,
+//!    **counting co-resident weights** (doc 04 §4, R1, ADR-030).
 //! 2. **Two-emitter transparency gate** — this crate opens **no** network
 //!    sockets; the *only* `std::process::Command` it runs is the local sidecar
 //!    spawn in [`model_lifecycle`] (doc 13 §2). Explicit reasoning is *routed*
@@ -35,8 +35,10 @@ use crate::toggle_owner::ToggleOwner;
 /// Which sanctioned loadout is active (doc 04 §3). No third loadout exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Loadout {
-    /// L1 default: Qwen2.5-VL **3B** + Whisper **small** co-resident; the mutex
-    /// still serializes execution (doc 04 §3).
+    /// L1 default: Qwen2.5-VL **3B** + **faster-whisper** *conditionally*
+    /// co-resident (ADR-030: co-resident when memory allows; STT is the swap
+    /// victim under image-VLM pressure); the mutex still serializes execution
+    /// (doc 04 §3).
     L1,
     /// L2 opt-in: Qwen2.5-VL **7B** *exclusive*; STT forces an unload->load swap
     /// (doc 04 §3).

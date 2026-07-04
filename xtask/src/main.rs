@@ -95,13 +95,21 @@ const FORBIDDEN_API_NEEDLES: &[&str] = &[
     "tokio::process::",
 ];
 
-/// The only two crates allowed to carry the forbidden surface (doc 13 §2):
+/// The only two crates allowed to carry the full forbidden surface (doc 13 §2):
 ///   1. `reasoning-gateway` — the sole network/Claude-CLI emitter.
 ///   2. `orchestration`     — ModelLifecycle's sanctioned sidecar spawn
 ///      (`vlm-host`/`stt-host` via `std::process::Command`); doc 12 §3, doc 16 M5.
-/// Sidecar *host* crates run the model in-process and never emit, so they are NOT
-/// exempt. `xtask` and `gates` are tooling, not product, and are skipped entirely.
 const SANCTIONED_CRATES: &[&str] = &["reasoning-gateway", "orchestration"];
+
+/// Loopback-scoped crates (ADR-028/ADR-036, doc 13 §2 R2 precision): the emitter
+/// rule governs *external user-data* egress; loopback IPC between our own
+/// components is exempt-but-scoped. The sidecar *host* binaries bind a local
+/// model server on **127.0.0.1 only** (pinned port/pipe supplied by the
+/// orchestrator, doc 12 §5) — they may name socket types for that bind, and each
+/// use is printed for audit. The SC5 monitor whitelists loopback (ADR-028);
+/// anything binding a non-loopback interface is still a violation, caught at the
+/// SC5 dynamic gate (M7) and code review.
+const LOOPBACK_SCOPED_CRATES: &[&str] = &["vlm-host", "stt-host"];
 
 /// Crates skipped entirely (tooling / not part of the product egress surface).
 const SKIPPED_CRATES: &[&str] = &["gates", "xtask"];
@@ -125,6 +133,7 @@ fn lint_emitters() -> Result<()> {
             continue;
         }
         let sanctioned = SANCTIONED_CRATES.contains(&crate_name.as_str());
+        let loopback_scoped = LOOPBACK_SCOPED_CRATES.contains(&crate_name.as_str());
         let src = entry.path().join("src");
         if !src.is_dir() {
             continue;
@@ -136,6 +145,17 @@ fn lint_emitters() -> Result<()> {
                     // (and SC5) can confirm each sanctioned use.
                     println!(
                         "  [sanctioned] {}:{} uses `{}` (crate `{}`)",
+                        rel(file),
+                        line_no,
+                        needle,
+                        crate_name
+                    );
+                } else if loopback_scoped && needle.contains("net") {
+                    // ADR-028/036: sidecar hosts may bind 127.0.0.1 model servers.
+                    // Socket-type mentions are audited, not denied; process spawns
+                    // are still forbidden here (only `net` needles pass).
+                    println!(
+                        "  [loopback-scoped] {}:{} uses `{}` (crate `{}`; 127.0.0.1-only, ADR-028)",
                         rel(file),
                         line_no,
                         needle,
@@ -306,19 +326,10 @@ fn run_sc6() -> Result<()> {
 
 fn seed_db() -> Result<()> {
     println!("seed-db: apply migrations to a scratch DB + round-trip every EventType (doc 16 M0)");
-    // This is the same proof as the M0 gate test, but as a runnable dev command:
-    // build a throwaway DB, apply aperture_db::migrations::MIGRATIONS, insert one
-    // Event per aperture_contracts::EventType::ALL, read each back.
-    //
-    // It is not implemented inline because xtask intentionally depends only on
-    // std + anyhow (it must not pull rusqlite into the workspace's tooling crate).
-    // The authoritative round-trip lives in the gate test; this command just runs
-    // it so a developer can `cargo xtask seed-db` and watch it.
-    // TODO(M0:): decide — either (a) shell out to the gate test (preferred, keeps
-    // xtask dep-free):
-    //     cargo_test(&["-p", "aperture-gates", "--test", "m0_schema_roundtrip"])
-    // or (b) add a tiny `aperture-db` helper `seed_scratch(path)` and call it.
-    todo!("M0: run the M0 round-trip against a scratch DB (delegate to the gate test or a db helper)")
+    // The authoritative round-trip lives in the gate test; this command runs it
+    // so a developer can `cargo xtask seed-db` and watch it. Option (a) from the
+    // original TODO — shelling out keeps xtask std-only (no rusqlite here).
+    cargo_test(&["-p", "aperture-gates", "--test", "m0_schema_roundtrip"])
 }
 
 // ---------------------------------------------------------------------------
