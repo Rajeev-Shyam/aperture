@@ -82,6 +82,10 @@ impl FrameSink for OcrStoreSink {
                 window_title: ctx.identity.window_title.clone(),
                 payload: serde_json::json!({ "heartbeat": true }),
                 connector_id: None,
+                // TODO(M4): heartbeat rows are written here, off the bus→engine
+                // path, so the sessionizer never sees them — they stay NULL and
+                // retrieval joins them by ts range. Routing them through the
+                // bus (or sharing session state) closes this at M4.
                 session_id: None,
                 redaction_flags: 0,
             };
@@ -96,23 +100,43 @@ impl FrameSink for OcrStoreSink {
 }
 
 /// Spawn the pattern-engine consumer (doc 02 §4 steps 6–8): bus → engine →
-/// suggestion rows → `bubble_spec` events to the overlay.
+/// pattern flush → suggestion rows → `bubble_spec` events to the overlay.
 ///
 /// The connector lookup is the doc 10 seam: **`None` until M4** — trigger rule 3
 /// (fresh resumable state) therefore keeps the live engine silent, exactly as
 /// specced (no connector, no bubble); the SC2 gate exercises the full path with
-/// the contracts fakes. `capture_rx` mirrors the toggle into the engine (rule 7).
+/// the contracts fakes. `capture_rx` mirrors the toggle into the engine (rule 7);
+/// `feedback_rx` carries bubble feedback into the decay/mute ladder (doc 08 §7);
+/// `snooze_until` gates bubble EMISSION only — capture + learning continue
+/// while snoozed (ADR-040/Q95).
 pub fn spawn_pattern_task(
     bus: &EventBus,
     db: Arc<Db>,
     mut capture_rx: tokio::sync::broadcast::Receiver<
         aperture_orchestration::toggle_owner::CaptureState,
     >,
+    mut feedback_rx: tokio::sync::mpsc::UnboundedReceiver<(
+        i64,
+        aperture_pattern_engine::FeedbackEvent,
+    )>,
+    snooze_until: Arc<std::sync::atomic::AtomicI64>,
     app: tauri::AppHandle,
 ) -> tokio::task::JoinHandle<()> {
     let mut events = bus.subscribe();
     tokio::spawn(async move {
-        let mut engine = PatternEngine::new();
+        // Hydrate the session id source past the DB's max (doc 03 §3:
+        // session_id is monotonic; ADR-032 forbids retro-sessionizing, so a
+        // restart must never reuse persisted ids).
+        let next_session = db
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT COALESCE(MAX(session_id), 0) + 1 FROM events",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+            })
+            .unwrap_or(1);
+        let mut engine = PatternEngine::with_next_session_id(next_session);
         loop {
             tokio::select! {
                 state = capture_rx.recv() => {
@@ -124,6 +148,13 @@ pub fn spawn_pattern_task(
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(_) => break, // owner gone: shutdown
                     }
+                }
+                fb = feedback_rx.recv() => {
+                    let Some((pattern_id, fb)) = fb else { break }; // shell gone
+                    // Decay / reinforce / mute (doc 08 §7); flush so the ladder
+                    // survives restarts (dismiss_decay is a patterns column).
+                    engine.apply_feedback(pattern_id, fb, epoch_ms());
+                    flush_patterns(&db, &mut engine);
                 }
                 ev = events.recv() => {
                     let ev = match ev {
@@ -143,7 +174,33 @@ pub fn spawn_pattern_task(
                         connector_lookup: &lookup,
                         now_ms,
                     });
+
+                    // Stamp the assigned session onto the durable row (doc 03
+                    // §3): the engine sessionizes in-memory; SQLite is the
+                    // durable truth (doc 15 §1) — without this every events row
+                    // keeps NULL session_id, unrecoverably (ADR-032).
+                    if ev.id > 0 {
+                        if let Some(session) = engine.last_session() {
+                            if let Err(e) = db.with_conn(|c| {
+                                c.execute(
+                                    "UPDATE events SET session_id = ?1 WHERE id = ?2",
+                                    rusqlite::params![session, ev.id],
+                                )
+                                .map(|_| ())
+                            }) {
+                                tracing::error!(%e, "session stamp failed");
+                            }
+                        }
+                    }
+
+                    // Flush dirty pattern rows BEFORE the suggestion insert:
+                    // candidates carry engine-local negative ids, and
+                    // suggestions.pattern_id is an FK into patterns — inserting
+                    // an unflushed id is a guaranteed constraint failure.
+                    let remap = flush_patterns(&db, &mut engine);
                     for cand in candidates {
+                        let pattern_id =
+                            remap.get(&cand.pattern_id).copied().unwrap_or(cand.pattern_id);
                         // Resolve the candidate's connector_state row for
                         // rendering (doc 03 §3; written by connectors at M4 —
                         // with the None-lookup above, candidates cannot fire
@@ -172,26 +229,33 @@ pub fn spawn_pattern_task(
                             continue;
                         };
                         let spec = aperture_suggestion_generator::render(&cand, &state, now_ms);
+                        // ADR-040/Q95: while snoozed, rows queue (learning
+                        // continues) and surface via list_suggestions when the
+                        // snooze lifts; only EMISSION is silenced.
+                        let snoozed =
+                            snooze_until.load(std::sync::atomic::Ordering::SeqCst) > now_ms;
                         // Persist the suggestion row (doc 03 §3) then emit to the overlay.
                         let insert = db.with_conn(|c| {
                             c.execute(
                                 "INSERT INTO suggestions (pattern_id, connector_id, source, title, glyph, confidence, state, shown_ts) \
-                                 VALUES (?1, ?2, 'local', ?3, ?4, ?5, 'shown', ?6)",
+                                 VALUES (?1, ?2, 'local', ?3, ?4, ?5, ?6, ?7)",
                                 rusqlite::params![
-                                    cand.pattern_id,
+                                    pattern_id,
                                     cand.connector_id,
                                     spec.title,
                                     spec.glyph,
                                     spec.confidence,
-                                    now_ms
+                                    if snoozed { "queued" } else { "shown" },
+                                    (!snoozed).then_some(now_ms),
                                 ],
                             )?;
                             Ok(c.last_insert_rowid())
                         });
                         match insert {
-                            Ok(id) => {
+                            Ok(id) if !snoozed => {
                                 let _ = crate::events::emit_bubble_spec(&app, &id.to_string(), &spec);
                             }
+                            Ok(_) => {}
                             Err(e) => tracing::error!(%e, "suggestion persist failed"),
                         }
                     }
@@ -199,4 +263,71 @@ pub fn spawn_pattern_task(
             }
         }
     })
+}
+
+/// Flush the engine's dirty pattern rows to the `patterns` table (doc 03 §3,
+/// doc 08 §4/§7) and swap its local negative ids for the DB-assigned ones via
+/// `mark_flushed`. Returns the local→DB id remap so in-flight candidates can
+/// persist with a real FK target. Rows that fail stay dirty and retry on the
+/// next call. Upsert is by `signature` (UNIQUE), so a restarted engine
+/// converges onto the same rows it wrote before.
+fn flush_patterns(
+    db: &Db,
+    engine: &mut PatternEngine,
+) -> std::collections::HashMap<i64, i64> {
+    // Collect owned copies first — dirty_rows() borrows the engine.
+    let dirty: Vec<(String, i64, i64, i64, f64, i64, f64)> = engine
+        .dirty_rows()
+        .into_iter()
+        .map(|(sig, row)| {
+            // Signature shape: "a | b ⇒ c" — antecedent joined by " | ",
+            // so n = antecedent count + 1 (gram length, doc 08 §4).
+            let n = sig.split(" | ").count() as i64 + 1;
+            (
+                sig.to_string(),
+                row.pattern_id,
+                n,
+                row.stats.weighted_support.round() as i64,
+                row.stats.confidence(),
+                row.stats.last_updated_ms,
+                row.stats.dismiss_decay,
+            )
+        })
+        .collect();
+
+    let mut remap = std::collections::HashMap::new();
+    for (sig, local_id, n, support, confidence, last_seen, decay) in dirty {
+        let flushed = db.with_conn(|c| {
+            c.query_row(
+                "INSERT INTO patterns (signature, n, support, confidence, last_seen, dismiss_decay) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(signature) DO UPDATE SET \
+                   support = excluded.support, confidence = excluded.confidence, \
+                   last_seen = excluded.last_seen, dismiss_decay = excluded.dismiss_decay \
+                 RETURNING id",
+                rusqlite::params![sig, n, support, confidence, last_seen, decay],
+                |r| r.get::<_, i64>(0),
+            )
+        });
+        match flushed {
+            Ok(db_id) => {
+                engine.mark_flushed(&sig, db_id);
+                if local_id != db_id {
+                    remap.insert(local_id, db_id);
+                }
+            }
+            Err(e) => {
+                tracing::error!(%e, signature = %sig, "pattern flush failed; will retry")
+            }
+        }
+    }
+    remap
+}
+
+/// Epoch ms for feedback/snooze timestamps (the event path uses `ev.ts`).
+pub(crate) fn epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }

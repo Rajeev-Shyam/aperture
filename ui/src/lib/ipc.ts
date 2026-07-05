@@ -229,6 +229,23 @@ export function bubbleClick(id: string, actionRef: string): Promise<OpenOutcome>
   return invoke<OpenOutcome>("bubble_click", { id, actionRef });
 }
 
+/** Bubble feedback into the durable suggestions row + the engine's decay/mute
+ *  ladder (doc 08 §7, Q81). Without this, dismissed bubbles resurrect on a
+ *  WebView respawn and dismissal decay never learns. */
+export function recordFeedback(
+  id: string,
+  kind: "clicked" | "dismissed" | "expired" | "up" | "down",
+): Promise<void> {
+  return invoke<void>("record_feedback", { id, kind });
+}
+
+/** Global bubble snooze (ADR-040/Q95): silences bubbles while capture +
+ *  learning continue. TODO(M3-followup): render the snooze control
+ *  (15 min / 1 h / until re-enabled) in the overlay's overflow menu. */
+export function setSnooze(mode: "off" | "15m" | "1h" | "forever"): Promise<void> {
+  return invoke<void>("set_snooze", { mode });
+}
+
 /** Ask the core to BUILD a Context Payload for preview (doc 03 §4). The returned
  *  object IS the thing that will ship — the panel renders/edits it in place. */
 export function requestPreview(intent: Intent, seedActionRef?: string): Promise<ContextPayload> {

@@ -119,6 +119,10 @@ pub struct PatternEngine {
     /// Synthetic id source for rows not yet persisted (negative; replaced by DB
     /// ids at flush via [`Self::mark_flushed`]).
     next_local_id: i64,
+    /// The session id assigned to the most recent [`Self::on_event`] event —
+    /// `None` when that event was not sessionized (capture off / not minable).
+    /// The shell stamps it back onto the durable events row (doc 03 §3).
+    last_session: Option<i64>,
 }
 
 impl PatternEngine {
@@ -139,7 +143,26 @@ impl PatternEngine {
             last_focused: HashMap::new(),
             foreground_resource: None,
             next_local_id: -1,
+            last_session: None,
         }
+    }
+
+    /// Construct with the session id source hydrated past the DB's max
+    /// (doc 03 §3: `session_id` is monotonic across restarts — ADR-032 forbids
+    /// retro-sessionizing, so ids must never collide with persisted rows).
+    pub fn with_next_session_id(next_id: i64) -> Self {
+        Self {
+            sessionizer: Sessionizer::with_next_id(next_id),
+            ..Self::new()
+        }
+    }
+
+    /// The session id assigned to the most recent [`Self::on_event`] event
+    /// (doc 08 §3), or `None` when that event was not sessionized. The shell
+    /// stamps it onto the durable events row — SQLite is the durable truth
+    /// (doc 15 §1); in-memory sessions alone would leave every row NULL.
+    pub fn last_session(&self) -> Option<i64> {
+        self.last_session
     }
 
     /// Reflect a capture-toggle change (invariant 3, trigger rule 7, doc 08 §6.7).
@@ -151,6 +174,7 @@ impl PatternEngine {
     /// Ingest one event and return any candidates that pass all 7 trigger rules
     /// (doc 08 §2-§6). Pure with respect to the network: **never a cloud call**.
     pub fn on_event(&mut self, ev: &Event, ctx: &EngineContext<'_>) -> Vec<SuggestionCandidate> {
+        self.last_session = None; // set only if this event sessionizes below
         // Invariant 3 / rule 7: capture OFF ⇒ observe nothing, emit nothing.
         if !self.capture_on {
             return Vec::new();
@@ -164,6 +188,7 @@ impl PatternEngine {
         // 2. sessionize (§3); reset the window on a session boundary.
         let prev_session = self.sessionizer.current();
         let session = self.sessionizer.assign(ev);
+        self.last_session = Some(session);
         if prev_session.is_some() && prev_session != Some(session) {
             self.window.reset();
         }
