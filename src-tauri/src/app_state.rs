@@ -36,7 +36,10 @@ pub struct AppState {
     pub db: Arc<Db>,
 
     /// The capture subsystem mechanism (doc 05). Driven by the orchestration
-    /// toggle broadcast — commands never call start/stop directly.
+    /// toggle broadcast — commands never call start/stop directly. Read by the
+    /// M2-tuning/diagnostics surfaces (frame counters); held from M0 so the
+    /// composition is complete.
+    #[allow(dead_code)]
     pub capture: Arc<CaptureSubsystem>,
 
     /// Orchestration: the toggle single-writer + GPU scheduler (doc 12).

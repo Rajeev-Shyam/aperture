@@ -22,7 +22,7 @@
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::exclusion::{ExclusionList, ExclusionVerdict};
+use crate::exclusion::ExclusionList;
 use crate::hooks::WindowIdentity;
 use crate::phash::{dhash64_bgra, to_hex, NearDuplicateGate};
 use crate::wgc::{EphemeralFrame, WgcSampler, WindowRect};

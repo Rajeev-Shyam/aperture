@@ -129,6 +129,7 @@ impl VlmLayer {
 
     /// Construct the GPU job for one image (doc 06 §3 / gpu_job.rs).
     /// `repair` switches the prompt to the repair instruction for the single retry.
+    #[allow(dead_code)] // consumed by `understand` at M5 (doc 16)
     fn build_job(&self, image_jpeg: Vec<u8>, _repair: bool) -> GpuJob {
         // TODO(M5): compose the prompt (system + schema reminder, or repair text);
         // pattern-VLM is always priority::VLM_PATTERN and cancellable (doc 12 §3).

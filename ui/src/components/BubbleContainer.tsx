@@ -108,10 +108,12 @@ export function BubbleContainer({ onAskClaude }: Props) {
 
   return (
     <div className="bubble-stack" aria-live="polite">
-      {visible.map((b) => (
+      {visible.map((b, i) => (
         <Bubble
           key={b.id}
           instance={b}
+          // ADR-039/C4 (R2): ≤2 glass surfaces; the 3rd+ visible renders opaque.
+          opaque={i >= 2}
           onResume={() => onResume(b)}
           onDismiss={() => applyLifecycle(b.id, "dismissed")}
           onExited={() => removeBubble(b.id)}

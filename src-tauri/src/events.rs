@@ -7,6 +7,11 @@
 //! Honors the degrade-under-load contract (doc 14, wired here): `gpu_busy`
 //! drives the glass <-> opaque-fallback swap in the overlay (doc 11 §6).
 
+// Contract surface: several channels/emitters are consumed by later milestones
+// (gpu_busy forwarder at M5, voice surfaces at M6, lifecycle at M3-UI) — kept
+// warning-free so the UI-facing names never churn.
+#![allow(dead_code)]
+
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 

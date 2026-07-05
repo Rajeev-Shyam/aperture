@@ -1,7 +1,7 @@
-//! Bubble lifecycle state machine + 12s dwell timer (doc 11 §3, doc 14 §4).
+//! Bubble lifecycle state machine + 20s dwell timer (doc 11 §3 R2/Q65, doc 14 §4).
 //
 //  The machine drives one bubble through:
-//      queued ─► entering(180ms) ─► idle(dwell 12s, hover pauses)
+//      queued ─► entering(180ms) ─► idle(dwell 20s, hover pauses)
 //                                      ├─► clicked   ─► resolving ─► exit
 //                                      ├─► dismissed ─► exit
 //                                      └─► expired   ─► exit
@@ -21,8 +21,8 @@ import type { BubbleSpec, BubbleLifecycleState } from "../lib/ipc";
 export const DEFAULTS = {
   /** doc 14 §4: scale .96->1 + fade. */
   enterMs: 180,
-  /** doc 11 §3: idle dwell before mild-decay expiry. */
-  dwellMs: 12_000,
+  /** doc 11 §3 (R2/Q65: 12s → 20s): idle dwell before mild-decay expiry. */
+  dwellMs: 20_000,
   /** doc 14 §4: exit fade + 4px translate-down. */
   exitMs: 180,
 } as const;
@@ -58,7 +58,7 @@ export function resolutionState(r: Resolution): BubbleLifecycleState {
  *
  * TODO(M3:) the container constructs one of these when a bubble enters `idle`;
  *           it must NOT start until the 180ms enter animation completes so the
- *           12s dwell is honest (doc 11 §3).
+ *           20s dwell is honest (doc 11 §3, R2/Q65).
  */
 export class DwellTimer {
   private remainingMs: number;

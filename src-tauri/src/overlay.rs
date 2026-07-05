@@ -10,6 +10,10 @@
 //! 3. Per-monitor instances, re-anchored on `WM_DPICHANGED` / display-change
 //!    (doc 11 §7). v1 ships primary-monitor-only (Q42); multi-monitor lands at M8.
 
+// Contract surface: BubbleRect/set_hit_test_rects are driven by the UI's bubble
+// lifecycle (M3-UI wiring); create_overlays fans out at M8. Kept warning-free.
+#![allow(dead_code)]
+
 use tauri::{AppHandle, WebviewWindow};
 
 /// The overlay window label declared in `tauri.conf.json`. The per-monitor
