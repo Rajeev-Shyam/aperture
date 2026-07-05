@@ -15,11 +15,13 @@
 //! [VERIFY resolved — M2]: the build prompt suggested `llama-cpp-2`, but that
 //! crate needs cmake + libclang (bindgen) on MSVC — friction this box doesn't
 //! have. The swappable-trait seam absorbs the change (doc 06 §2 spirit):
-//! - **`NomicEmbedder`** (feature `nomic`, default OFF): `fastembed` (ONNX
+//! - **`NomicEmbedder`** (feature `nomic`, default ON since 2026-07-05 — the
+//!   weights are fetched into the repo's `models/`): `fastembed` (ONNX
 //!   Runtime, CPU) serving nomic-embed-text-v1.5 with the proper
-//!   `search_document:` / `search_query:` task prefixes. First use downloads
-//!   the model (~250 MB) — **kept off by default so no build ever pulls
-//!   gigabytes without an explicit opt-in** (the user is on metered data).
+//!   `search_document:` / `search_query:` task prefixes. First construction
+//!   downloads the model if missing (`examples/fetch_model.rs` is the
+//!   documented setup step); `--no-default-features` restores the
+//!   zero-download dev path.
 //! - **`HashEmbedder`** (always available): a deterministic char-3-gram
 //!   feature-hash embedding. NOT semantic — it exists so the full pipeline
 //!   (store → ctx_vec → KNN) runs end-to-end in dev/tests with zero downloads.

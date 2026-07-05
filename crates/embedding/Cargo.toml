@@ -13,13 +13,13 @@ tracing = { workspace = true }
 # [VERIFY resolved — M2]: backend = fastembed (ONNX Runtime, CPU) behind the
 # `nomic` feature. Chosen over the build prompt's llama-cpp-2 suggestion because
 # llama-cpp-2 needs cmake + libclang on MSVC; the Embedder trait absorbs the
-# swap. Feature is OFF by default: first use downloads the model (~250 MB) —
-# an explicit opt-in setup step, never an implicit build cost (metered data).
+# swap.
 fastembed = { version = "4", optional = true }
 
 [features]
-default = []
-# The real nomic-embed-text-v1.5 backend. Enable with:
-#   cargo build -p aperture-embedding --features nomic
-# First run downloads the ONNX weights into the configured cache dir (models/).
+# Default ON since 2026-07-05: the weights are fetched (repo models/, ~295 MB
+# on disk — the one-time setup step, examples/fetch_model.rs). Build with
+# --no-default-features for the zero-download HashEmbedder dev path.
+default = ["nomic"]
+# The real nomic-embed-text-v1.5 backend (the M2 spec default, doc 04 §7).
 nomic = ["dep:fastembed"]

@@ -96,8 +96,9 @@ fn init_tracing() {
 }
 
 /// The M2 frame sink: OCR (Windows.Media.Ocr, en fallback) + embedding
-/// (HashEmbedder by default; the real nomic backend is the opt-in `nomic`
-/// feature — see `aperture-embedding`'s module doc on the download cost).
+/// (nomic-embed-text-v1.5 by default since 2026-07-05 — weights live in
+/// `models/`; `--no-default-features` falls back to the non-semantic
+/// HashEmbedder dev path, as does a failed model load).
 /// If no OCR engine is constructible (missing language packs), degrade to
 /// event-only capture (doc 06 §6) with a one-time notice.
 fn build_frame_sink(db: Arc<aperture_db::Db>) -> Arc<dyn aperture_capture::sampler::FrameSink> {
