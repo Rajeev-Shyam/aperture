@@ -19,6 +19,8 @@
 //!
 //! It never opens a socket and never spawns a process — invariant (2) (doc 13 §2).
 
+use std::sync::Arc;
+
 use aperture_contracts::{Event, EventType};
 use aperture_event_bus::EventBus;
 
@@ -26,12 +28,25 @@ use crate::exclusion::{ExclusionList, ExclusionVerdict};
 use crate::hooks::{HookEvent, WindowIdentity};
 use crate::uia::{self, AddressBarHints, AddressBarRead};
 
+/// The durable-store seam (doc 15 §1: "SQLite is the durable form ... the
+/// durable form is always written before the at-most-once notify"). The shell
+/// implements this over `aperture_db::Db`; tests use an in-memory recorder.
+/// Returning `None` (store unavailable) degrades to notify-only — capture keeps
+/// working, durability resumes when the store does (doc 05 §7 resilience).
+pub trait EventStore: Send + Sync {
+    /// Persist one event; returns the DB-assigned id.
+    fn persist(&self, ev: &Event) -> Option<i64>;
+}
+
 /// Turns raw hook/sample signals into normalized bus [`Event`]s (doc 05 §6).
-/// Holds the bus sender, the exclusion list, and the browser address-bar hints.
+/// Holds the store seam, the bus sender, the exclusion list, and the browser
+/// address-bar hints.
 pub struct Normalizer {
     bus: EventBus,
     exclusion: ExclusionList,
     hints: AddressBarHints,
+    /// The durable form (doc 15 §1). `None` in bring-up harnesses.
+    store: Option<Arc<dyn EventStore>>,
     /// Last successfully read URL per browser hwnd (RK4: fall back to last-known).
     last_urls: std::sync::Mutex<std::collections::HashMap<isize, String>>,
 }
@@ -55,8 +70,29 @@ impl Normalizer {
             bus,
             exclusion,
             hints: AddressBarHints::default(),
+            store: None,
             last_urls: Default::default(),
         }
+    }
+
+    /// Attach the durable store (doc 15 §1). The shell wires `aperture_db::Db`
+    /// here at composition time; events then persist **before** they notify.
+    pub fn with_store(mut self, store: Arc<dyn EventStore>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// Persist-then-publish (doc 15 §1 ordering). Stamps the DB id onto the
+    /// published event so downstream consumers (frame sink, pattern engine)
+    /// reference the durable row.
+    fn commit(&self, mut ev: Event) -> Event {
+        if let Some(store) = &self.store {
+            if let Some(id) = store.persist(&ev) {
+                ev.id = id;
+            }
+        }
+        let _ = self.bus.publish(ev.clone()); // no-subscriber send is fine (doc 15 §1)
+        ev
     }
 
     /// Normalize a raw hook event into bus [`Event`]s and publish them
@@ -85,7 +121,7 @@ impl Normalizer {
         let verdict = self.apply_exclusion(&mut primary, None);
         let capture_frame =
             !verdict.is_excluded() && !matches!(raw, HookEvent::WindowClosed { .. });
-        let _ = self.bus.publish(primary.clone()); // no-subscriber send is fine (doc 15 §1)
+        let primary = self.commit(primary); // persist THEN notify (doc 15 §1)
         out.push(Normalized { event: primary, identity: identity.clone(), capture_frame });
 
         // Browser navigation read on focus/title change (doc 05 §3; UIA is the
@@ -98,8 +134,8 @@ impl Normalizer {
         {
             if let Some(process) = identity.process.as_deref() {
                 if uia::is_browser_process(process, &self.hints) {
-                    if let Some(nav) = self.navigation_event(hwnd, &identity, now_ms) {
-                        let _ = self.bus.publish(nav.event.clone());
+                    if let Some(mut nav) = self.navigation_event(hwnd, &identity, now_ms) {
+                        nav.event = self.commit(nav.event); // persist THEN notify
                         out.push(nav);
                     }
                 }

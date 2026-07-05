@@ -39,6 +39,9 @@ pub struct FrameContext {
     pub thumb_phash: String,
     /// epoch ms of the sample.
     pub ts: i64,
+    /// The DB id of the event this frame belongs to (`0` = none, e.g. a
+    /// heartbeat sample — the store sink then writes event+context atomically).
+    pub event_id: i64,
 }
 
 /// Where sampled frames go (M2 wires `aperture-vision-ocr::FrameProcessor` here;
@@ -65,7 +68,7 @@ pub struct Sampler {
     gate: Mutex<NearDuplicateGate>,
     sink: Arc<dyn FrameSink>,
     /// Latest debounce-pending identity (focus storms overwrite; one sample fires).
-    pending: Mutex<Option<(SampleTrigger, WindowIdentity)>>,
+    pending: Mutex<Option<(SampleTrigger, WindowIdentity, i64)>>,
     /// Whether a debounce timer is armed.
     debounce_armed: AtomicBool,
     /// Suspended (toggle OFF / idle) — heartbeat + debounce both stop.
@@ -156,7 +159,16 @@ impl Sampler {
     /// Enqueue a sample request. Trigger samples are debounced by
     /// `config.debounce_ms` (latest identity wins); a heartbeat trigger bypasses
     /// the debounce but is suppressed while the user is idle (doc 05 §4).
-    pub fn request(self: &Arc<Self>, trigger: SampleTrigger, identity: WindowIdentity, now_ms: i64) {
+    ///
+    /// `event_id` is the durable row this frame will attach to (`0` for
+    /// heartbeat samples — the sink then writes event+context atomically).
+    pub fn request(
+        self: &Arc<Self>,
+        trigger: SampleTrigger,
+        identity: WindowIdentity,
+        event_id: i64,
+        now_ms: i64,
+    ) {
         if self.suspended.load(Ordering::SeqCst) {
             return;
         }
@@ -164,12 +176,12 @@ impl Sampler {
             if !self.user_is_active(now_ms) {
                 return; // idle ⇒ heartbeat suspended (doc 05 §4)
             }
-            self.sample_once(trigger, identity, now_ms);
+            self.sample_once(trigger, identity, event_id, now_ms);
             return;
         }
 
         // Debounce: remember the latest identity; arm one timer.
-        *self.pending.lock().expect("pending lock") = Some((trigger, identity));
+        *self.pending.lock().expect("pending lock") = Some((trigger, identity, event_id));
         if self
             .debounce_armed
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -181,10 +193,10 @@ impl Sampler {
                 tokio::time::sleep(debounce).await;
                 me.debounce_armed.store(false, Ordering::SeqCst);
                 let fired = me.pending.lock().expect("pending lock").take();
-                if let Some((trigger, identity)) = fired {
+                if let Some((trigger, identity, event_id)) = fired {
                     if !me.suspended.load(Ordering::SeqCst) {
                         let now = epoch_ms();
-                        me.sample_once(trigger, identity, now);
+                        me.sample_once(trigger, identity, event_id, now);
                     }
                 }
             });
@@ -199,7 +211,13 @@ impl Sampler {
     /// 3. **pHash gate** — near-duplicate frames stop here (ADR-032/Q72).
     /// 4. Hand the ephemeral frame to the sink; it is moved + dropped there.
     ///    WGC failure for this window → event-only mode (doc 05 §7).
-    pub fn sample_once(&self, trigger: SampleTrigger, identity: WindowIdentity, now_ms: i64) {
+    pub fn sample_once(
+        &self,
+        trigger: SampleTrigger,
+        identity: WindowIdentity,
+        event_id: i64,
+        now_ms: i64,
+    ) {
         // 1. exclusion gate (earliest, doc 05 §4 / doc 13 §4).
         if self
             .exclusion
@@ -243,7 +261,13 @@ impl Sampler {
         self.frames_delivered.fetch_add(1, Ordering::Relaxed);
         self.sink.submit(
             frame,
-            FrameContext { identity, trigger, thumb_phash: to_hex(hash), ts: now_ms },
+            FrameContext {
+                identity,
+                trigger,
+                thumb_phash: to_hex(hash),
+                ts: now_ms,
+                event_id,
+            },
         );
     }
 
@@ -259,7 +283,9 @@ impl Sampler {
             }
             let now = epoch_ms();
             let identity = current_identity.lock().expect("identity lock").clone();
-            self.request(SampleTrigger::Heartbeat, identity, now);
+            // Heartbeats carry no pre-existing event row (event_id 0): the sink
+            // writes event+context in one transaction (doc 02 §4 step 5).
+            self.request(SampleTrigger::Heartbeat, identity, 0, now);
         }
     }
 }

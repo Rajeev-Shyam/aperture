@@ -191,6 +191,40 @@ impl Db {
         Ok(event_id)
     }
 
+    /// Attach a `screen_context` row (+ optional 768-d embedding) to an event
+    /// that was already persisted (the trigger-sampled path: the event row was
+    /// written persist-then-notify, the frame's OCR finished afterwards). One
+    /// transaction, mirroring [`Self::insert_event_with_context`].
+    pub fn attach_context(
+        &self,
+        event_id: i64,
+        ctx: &ScreenContextInsert,
+        embedding: Option<&[f32]>,
+    ) -> Result<(), DbError> {
+        let mut guard = self.conn.lock().expect("db mutex poisoned");
+        let tx = guard.transaction().map_err(DbError::from)?;
+        tx.execute(
+            "INSERT INTO screen_context (event_id, ocr_text, ocr_confidence, vlm_summary, thumb_phash) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![event_id, ctx.ocr_text, ctx.ocr_confidence, ctx.vlm_summary, ctx.thumb_phash],
+        )
+        .map_err(DbError::from)?;
+        if let Some(vec) = embedding {
+            if !self.vec_loaded {
+                return Err(DbError::Sqlite(
+                    "ctx_vec write requested but sqlite-vec is not loaded".into(),
+                ));
+            }
+            debug_assert_eq!(vec.len(), 768, "ctx_vec is pinned to 768-d (doc 03 §3)");
+            tx.execute(
+                "INSERT INTO ctx_vec (event_id, embedding) VALUES (?1, ?2)",
+                rusqlite::params![event_id, vec_to_blob(vec)],
+            )
+            .map_err(DbError::from)?;
+        }
+        tx.commit().map_err(DbError::from)
+    }
+
     /// Read one event back by id (round-trip surface for the M0 gate).
     pub fn read_event(&self, id: i64) -> Result<Event, DbError> {
         self.with_conn(|conn| {

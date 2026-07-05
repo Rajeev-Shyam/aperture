@@ -168,6 +168,7 @@ dependencies = [
  "aperture-suggestion-generator",
  "aperture-vision-ocr",
  "aperture-voice",
+ "rusqlite",
  "serde",
  "serde_json",
  "tauri",

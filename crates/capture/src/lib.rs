@@ -132,15 +132,22 @@ impl CaptureSubsystem {
     ///
     /// `bus` is the publish handle for normalized [`Event`]s (doc 15 §1);
     /// `sink` is where sampled frames go (M2: the vision-ocr FrameProcessor;
-    /// M1 bring-up: [`sampler::DropSink`]).
+    /// M1 bring-up: [`sampler::DropSink`]); `store` is the durable form —
+    /// events persist through it BEFORE they notify (doc 15 §1). `None` only in
+    /// bring-up harnesses.
     pub fn new(
         config: CaptureConfig,
         bus: EventBus,
         exclusion: ExclusionList,
         sink: Arc<dyn FrameSink>,
+        store: Option<Arc<dyn normalizer::EventStore>>,
     ) -> Arc<Self> {
         let sampler = Sampler::new(config, WgcSampler::new(), exclusion.clone(), sink);
-        let normalizer = Arc::new(Normalizer::new(bus.clone(), exclusion));
+        let mut norm = Normalizer::new(bus.clone(), exclusion);
+        if let Some(s) = &store {
+            norm = norm.with_store(Arc::clone(s));
+        }
+        let normalizer = Arc::new(norm);
         let current_identity = Arc::new(Mutex::new(WindowIdentity::default()));
 
         // The hook→pipeline channel: std mpsc out of the C callback, bridged to
@@ -148,13 +155,17 @@ impl CaptureSubsystem {
         let (hook_tx, hook_rx) = std::sync::mpsc::channel::<HookEvent>();
         let hook_rx = Arc::new(Mutex::new(hook_rx));
 
+        let toggle = Arc::new(CaptureToggle::new(
+            Arc::clone(&sampler),
+            Box::new(move || HookThread::install(hook_tx.clone())),
+            bus,
+        ));
+        if let Some(s) = &store {
+            toggle.set_store(Arc::clone(s)); // audit rows must persist (doc 13 §7)
+        }
         let subsystem = Arc::new(Self {
             sampler: Arc::clone(&sampler),
-            toggle: Arc::new(CaptureToggle::new(
-                Arc::clone(&sampler),
-                Box::new(move || HookThread::install(hook_tx.clone())),
-                bus,
-            )),
+            toggle,
             normalizer,
             current_identity,
             tasks: Mutex::new(Vec::new()),
@@ -204,7 +215,8 @@ impl CaptureSubsystem {
                     (HookEvent::TitleChanged { .. }, _) => SampleTrigger::TitleChange,
                     _ => SampleTrigger::FocusChange,
                 };
-                self.sampler.request(trigger, n.identity, now);
+                // n.event.id is the durable row (0 when no store is wired).
+                self.sampler.request(trigger, n.identity, n.event.id, now);
             }
         }
     }
