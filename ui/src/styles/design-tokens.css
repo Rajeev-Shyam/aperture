@@ -6,8 +6,9 @@
  *
  * INVARIANT NOTES:
  *  - Surface fills use rgba ALPHA, never `opacity` (doc 14 §2): keeps text crisp.
- *  - Blur ceiling is 16px (doc 14 §2): beyond ~20px the backdrop smears and the
- *    GPU copy->blur->paste cost climbs for no legibility gain.
+ *  - Blur ceiling is 12px (doc 14 §2, R2/ADR-039 — tightened from 16px; scale 8/12):
+ *    beyond that the backdrop smears and the GPU copy->blur->paste cost climbs
+ *    for no legibility gain on a card shared with inference.
  *  - Animatable properties are `opacity` and `transform` ONLY (doc 14 §2);
  *    `backdrop-filter` is NEVER animated (doc 14 §4).
  *  - ≤3 concurrent glass surfaces (doc 14 §5) — a hard cap enforced in JS
@@ -55,7 +56,7 @@
   /* ---- Blur scale — 16 is the CEILING (doc 14 §2) --------------------- */
   --blur-8: 8px;
   --blur-12: 12px; /* bubble backdrop blur */
-  --blur-16: 16px; /* ceiling */
+  --blur-16: 16px; /* post-v1 only (refraction tier, ADR-039) — v1 ceiling is --blur-12 */
   --saturate: 160%;
 
   /* ---- Motion (doc 14 §2) — durations + the single easing curve ------- */
@@ -89,6 +90,18 @@
  * component wears; here we neutralize its blur and swap the fill.
  */
 body.gpu-busy .surface-glass {
+  background: var(--fallback-opaque) !important;
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+}
+
+/*
+ * ADR-039/C4 (R2): ≤2 glass surfaces — the 3rd visible bubble wears this class
+ * instead of `.surface-glass` (2 glass + 1 opaque = 3 visible; the final cap is
+ * set at the M8 PresentMon test). Same recipe as the degrade fallback: opaque
+ * fill, zero blur, specular sweep retained by the component's own ::before.
+ */
+.surface-opaque {
   background: var(--fallback-opaque) !important;
   -webkit-backdrop-filter: none !important;
   backdrop-filter: none !important;

@@ -58,6 +58,7 @@ impl ScreenContextRow {
     /// Attach a VLM scene summary (doc 06 §3) — serialized to the
     /// `vlm_summary` TEXT column. Called when the async Layer-B job returns; the
     /// caller then issues the UPDATE through `aperture-db`.
+    #[allow(unused_mut)] // `mut` is the M5 body's shape (self.vlm_summary = ...)
     pub fn with_vlm_summary(mut self, _scene: &SceneJson) -> Self {
         // TODO(M5): self.vlm_summary = Some(serde_json::to_string(scene)?);
         todo!("M5: serialize SceneJson into the vlm_summary column")

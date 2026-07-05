@@ -3,7 +3,7 @@
 //  Anatomy: glyph · title · sublabel · Resume (primary) · dismiss (×) · overflow
 //  (⋯ → "Ask Claude about this" / "Mute this pattern" / "Exclude this app").
 //
-//  Lifecycle (doc 11 §3): queued ─► entering(180ms) ─► idle(dwell 12s, hover
+//  Lifecycle (doc 11 §3): queued ─► entering(180ms) ─► idle(dwell 20s, hover
 //  pauses) ─► clicked/dismissed/expired ─► exit. Hover PAUSES the dwell; this
 //  component owns the DwellTimer for its own idle phase and reports every
 //  transition up via `onLifecycle` (so the container fans it to the core as the
@@ -27,6 +27,11 @@ interface Props {
   onLifecycle: (state: BubbleLifecycleState) => void;
   /** Overflow → "Ask Claude about this" opens the Context-Preview panel. */
   onAskClaude: () => void;
+  /**
+   * ADR-039/C4 (R2): at most 2 glass surfaces — the 3rd visible bubble renders
+   * in the opaque fallback class (3 visible total; final cap at M8 PresentMon).
+   */
+  opaque?: boolean;
 }
 
 export function Bubble({
@@ -36,6 +41,7 @@ export function Bubble({
   onExited,
   onLifecycle,
   onAskClaude,
+  opaque = false,
 }: Props) {
   const { spec, state } = instance;
   const [overflowOpen, setOverflowOpen] = useState(false);
@@ -94,7 +100,7 @@ export function Bubble({
 
   return (
     <div
-      className={`bubble surface-glass surface-interactive ${stateClass}`}
+      className={`bubble ${opaque ? "surface-opaque" : "surface-glass"} surface-interactive ${stateClass}`}
       role="group"
       aria-label={spec.title}
       onMouseEnter={onMouseEnter}

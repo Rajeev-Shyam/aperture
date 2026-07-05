@@ -118,7 +118,9 @@ mod imp {
     /// serializes all access. [VERIFY at the M1 hardware gate.]
     pub struct MonitorCapture {
         pub monitor: MonitorId,
-        item: GraphicsCaptureItem,
+        /// Held to keep the WinRT capture item alive for the session's lifetime
+        /// (never read back — the pool/session were constructed from it).
+        _item: GraphicsCaptureItem,
         frame_pool: Direct3D11CaptureFramePool,
         session: GraphicsCaptureSession,
         d3d_device: ID3D11Device,
@@ -332,7 +334,7 @@ mod imp {
                     _winrt_device: winrt_device,
                     primary: MonitorCapture {
                         monitor: MonitorId(hmon.0 as isize),
-                        item,
+                        _item: item,
                         frame_pool,
                         session,
                         d3d_device: device,
