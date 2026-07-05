@@ -16,7 +16,8 @@
 //! - [`key_manager`] — the per-install at-rest key, wrapped by DPAPI (current
 //!   user) and stored in Windows Credential Manager (doc 13 §6).
 //! - [`consent`] — first-run capture opt-in (default OFF), per-send approval
-//!   (no "always allow" in v1), and voice opt-in at first PTT (doc 13 §8).
+//!   (base mode; ADR-026's scoped always-allow still previews with a cancel
+//!   window and audits every send), and voice opt-in at first PTT (doc 13 §8).
 //!
 //! ## Invariants honored here
 //! - **(2) transparency gate:** nothing in this crate touches the network. The

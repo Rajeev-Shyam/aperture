@@ -58,6 +58,11 @@ pub struct Normalized {
     pub event: Event,
     /// The resolved identity (reused by the sampler's exclusion gate).
     pub identity: WindowIdentity,
+    /// The browser URL resolved for this context (UIA read / last-known, RK4).
+    /// Carried **in-memory only** so the sampler's frame gate and the heartbeat
+    /// can enforce `url_pattern` rules (FIX 2.2) — an excluded URL never
+    /// persists (the event payload is stripped separately).
+    pub url: Option<String>,
     /// `false` for excluded contexts: metadata-only, no frame, no OCR, no
     /// connector capture (doc 05 §4).
     pub capture_frame: bool,
@@ -118,14 +123,15 @@ impl Normalizer {
 
         let mut out = Vec::new();
         let mut primary = self.build_event(ty, &identity, serde_json::json!({}), now_ms);
-        let verdict = self.apply_exclusion(&mut primary, None);
-        let capture_frame =
-            !verdict.is_excluded() && !matches!(raw, HookEvent::WindowClosed { .. });
-        let primary = self.commit(primary); // persist THEN notify (doc 15 §1)
-        out.push(Normalized { event: primary, identity: identity.clone(), capture_frame });
+        // Identity gate first (process / class / title): an excluded identity
+        // is never UIA-read — collection stops at the earliest gate (doc 13 §4).
+        let class = identity.window_class.clone();
+        let mut verdict = self.apply_exclusion(&mut primary, class.as_deref(), None);
 
-        // Browser navigation read on focus/title change (doc 05 §3; UIA is the
-        // no-extension fallback, ADR-027). Never for excluded contexts.
+        // Resolve the browser URL BEFORE the frame decision (FIX 2.2): a
+        // `url_pattern` hit must exclude the primary event and the frame, not
+        // just the Navigation payload.
+        let mut url = None;
         if !verdict.is_excluded()
             && matches!(
                 raw,
@@ -134,40 +140,60 @@ impl Normalizer {
         {
             if let Some(process) = identity.process.as_deref() {
                 if uia::is_browser_process(process, &self.hints) {
-                    if let Some(mut nav) = self.navigation_event(hwnd, &identity, now_ms) {
-                        nav.event = self.commit(nav.event); // persist THEN notify
-                        out.push(nav);
+                    url = self.resolve_url(hwnd);
+                    if let Some(u) = url.as_deref() {
+                        verdict = self.apply_exclusion(&mut primary, class.as_deref(), Some(u));
                     }
                 }
             }
         }
+
+        let capture_frame =
+            !verdict.is_excluded() && !matches!(raw, HookEvent::WindowClosed { .. });
+        let primary = self.commit(primary); // persist THEN notify (doc 15 §1)
+        out.push(Normalized {
+            event: primary,
+            identity: identity.clone(),
+            url: url.clone(),
+            capture_frame,
+        });
+
+        // Browser navigation event off the resolved URL (doc 05 §3; UIA is the
+        // no-extension fallback, ADR-027). `url` is None for identity-excluded
+        // contexts — they were never read.
+        if let Some(u) = url {
+            let mut nav = self.navigation_event(u, &identity, now_ms);
+            nav.event = self.commit(nav.event); // persist THEN notify
+            out.push(nav);
+        }
         out
     }
 
-    /// Attempt the UIA address-bar read and build a `navigation` event
-    /// (doc 05 §3). RK4 semantics: `Unavailable` falls back to the last-known
-    /// URL for this hwnd; no known URL ⇒ **no event** (never fabricate).
-    fn navigation_event(
-        &self,
-        hwnd: isize,
-        identity: &WindowIdentity,
-        now_ms: i64,
-    ) -> Option<Normalized> {
-        let url = match uia::read_address_bar(hwnd, &self.hints) {
+    /// Resolve the current URL for a browser hwnd (doc 05 §3). RK4 semantics:
+    /// `Unavailable` falls back to the last-known URL for this hwnd; no known
+    /// URL ⇒ `None` (never fabricate). Feeds both exclusion verdicts and the
+    /// `navigation` event.
+    fn resolve_url(&self, hwnd: isize) -> Option<String> {
+        match uia::read_address_bar(hwnd, &self.hints) {
             AddressBarRead::Url(u) => {
                 self.last_urls
                     .lock()
                     .expect("url cache lock")
                     .insert(hwnd, u.clone());
-                u
+                Some(u)
             }
-            AddressBarRead::Empty => return None, // new tab page: nothing to record
+            AddressBarRead::Empty => None, // new tab page: nothing to record
             AddressBarRead::Unavailable => {
                 // RK4: last-known or skip. A wrong URL is worse than no URL.
-                self.last_urls.lock().expect("url cache lock").get(&hwnd)?.clone()
+                self.last_urls.lock().expect("url cache lock").get(&hwnd).cloned()
             }
-        };
+        }
+    }
 
+    /// Build a `navigation` event from the resolved URL (doc 05 §3). The URL
+    /// runs the exclusion gate again so an excluded URL persists metadata-only
+    /// (FIX 2.2) — never in a payload-reachable field (doc 13 §4).
+    fn navigation_event(&self, url: String, identity: &WindowIdentity, now_ms: i64) -> Normalized {
         let browser = identity
             .process
             .as_deref()
@@ -179,18 +205,19 @@ impl Normalizer {
             serde_json::json!({ "url": url, "browser": browser }),
             now_ms,
         );
-        // FIX 2.2: URLs traverse the same exclusion gate incl. `url_pattern`.
-        let verdict = self.apply_exclusion(&mut ev, Some(&url));
+        let verdict =
+            self.apply_exclusion(&mut ev, identity.window_class.as_deref(), Some(&url));
         if verdict.is_excluded() {
             // Metadata-only: strip the URL itself (an excluded URL must never
             // persist in a payload-reachable field, doc 13 §4).
             ev.payload = serde_json::json!({ "browser": browser, "excluded": true });
         }
-        Some(Normalized {
+        Normalized {
             capture_frame: !verdict.is_excluded(),
             identity: identity.clone(),
+            url: Some(url),
             event: ev,
-        })
+        }
     }
 
     /// Build a normalized [`Event`] with identity attached. `id` is `0` on the
@@ -222,12 +249,22 @@ impl Normalizer {
     /// capture independently (doc 05 §4). Both are required: a metadata-only
     /// event for an excluded context must still carry the flag.
     ///
+    /// `window_class` rides in from the resolved [`WindowIdentity`] — the
+    /// [`Event`] contract has no class field, but class-only rules are a
+    /// first-class match kind (doc 13 §4) and must flag events here too, not
+    /// just gate frames in the sampler.
+    ///
     /// Excluded events also drop their `window_title` — the title itself can
     /// leak the sensitive context (doc 13 §4 "metadata-only").
-    pub fn apply_exclusion(&self, ev: &mut Event, url: Option<&str>) -> ExclusionVerdict {
+    pub fn apply_exclusion(
+        &self,
+        ev: &mut Event,
+        window_class: Option<&str>,
+        url: Option<&str>,
+    ) -> ExclusionVerdict {
         let verdict = self.exclusion.is_excluded(
             ev.process.as_deref(),
-            None, // window_class travels on identity; title/process cover the M1 gate
+            window_class,
             ev.window_title.as_deref(),
             url,
         );
@@ -236,6 +273,16 @@ impl Normalizer {
             ev.window_title = None; // metadata-only (doc 13 §4)
         }
         verdict
+    }
+
+    /// Seed the last-known-URL cache (tests only — the UIA read is unavailable
+    /// for synthetic hwnds, so RK4's last-known fallback is the testable path).
+    #[cfg(test)]
+    fn seed_last_url(&self, hwnd: isize, url: &str) {
+        self.last_urls
+            .lock()
+            .expect("url cache lock")
+            .insert(hwnd, url.to_string());
     }
 }
 
@@ -293,6 +340,64 @@ mod tests {
         assert!(!out[0].capture_frame, "no frame for excluded contexts (doc 05 §4)");
         let ev = rx.try_recv().expect("metadata-only event still published");
         assert_ne!(ev.redaction_flags & redaction_flags::EXCLUDED, 0);
+        assert_eq!(ev.window_title, None, "title stripped (doc 13 §4)");
+    }
+
+    #[test]
+    fn url_pattern_rule_excludes_the_primary_event_and_frame() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let list = ExclusionList::compile(vec![ExclusionRule {
+            url_pattern: Some(r"^https://banking\.".into()),
+            label: "Banking site".into(),
+            ..Default::default()
+        }]);
+        let n = Normalizer::new(bus, list);
+        // Synthetic hwnd → UIA read is Unavailable → RK4 last-known fallback.
+        n.seed_last_url(7, "https://banking.example/accounts");
+
+        let out = n.normalize_hook(
+            &HookEvent::TitleChanged { hwnd: 7 },
+            identity("chrome.exe", "My Bank — Chrome"),
+            1,
+        );
+        // Primary event: excluded by the URL, not just the nav payload.
+        assert!(!out[0].capture_frame, "url_pattern gates the frame (FIX 2.2)");
+        assert_eq!(
+            out[0].url.as_deref(),
+            Some("https://banking.example/accounts"),
+            "raw URL rides in-memory for the sampler/heartbeat gate"
+        );
+        let primary = rx.try_recv().expect("primary published");
+        assert_ne!(primary.redaction_flags & redaction_flags::EXCLUDED, 0);
+        assert_eq!(primary.window_title, None, "title stripped (doc 13 §4)");
+        // Navigation event: metadata-only, URL stripped from the payload.
+        assert!(!out[1].capture_frame);
+        let nav = rx.try_recv().expect("nav published");
+        assert_eq!(nav.payload.get("url"), None, "excluded URL never persists");
+    }
+
+    #[test]
+    fn window_class_rule_flags_the_event_metadata_only() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let list = ExclusionList::compile(vec![ExclusionRule {
+            window_class: Some("BankShellWnd".into()),
+            label: "Banking app".into(),
+            ..Default::default()
+        }]);
+        let n = Normalizer::new(bus, list);
+
+        let mut id = identity("bankapp.exe", "Accounts — MyBank");
+        id.window_class = Some("BankShellWnd".into());
+        let out = n.normalize_hook(&HookEvent::ForegroundChanged { hwnd: 8 }, id, 1);
+        assert!(!out[0].capture_frame, "class rule gates the frame");
+        let ev = rx.try_recv().expect("published");
+        assert_ne!(
+            ev.redaction_flags & redaction_flags::EXCLUDED,
+            0,
+            "class-only rules must flag the event, not just suppress frames"
+        );
         assert_eq!(ev.window_title, None, "title stripped (doc 13 §4)");
     }
 

@@ -60,7 +60,11 @@ pub fn run_nightly_prune(db: &Db, now_ms: i64, policy: &RetentionPolicy) -> Resu
 
     db.with_conn(|conn| {
         conn.execute_batch("BEGIN")?;
-
+        // The connection is shared (single Mutex<Connection>): an error that
+        // escapes with BEGIN still open would silently swallow every later
+        // write into the dead transaction — ROLLBACK before propagating, same
+        // as migrations::run.
+        let pruned = (|| -> Result<(), rusqlite::Error> {
         // 1. ctx_vec rows for expired events (explicit — virtual table, no cascade).
         report.ctx_vec_deleted = conn.execute(
             "DELETE FROM ctx_vec WHERE event_id IN (SELECT id FROM events WHERE ts < ?1)",
@@ -118,9 +122,16 @@ pub fn run_nightly_prune(db: &Db, now_ms: i64, policy: &RetentionPolicy) -> Resu
              WHERE stale_after_ts IS NOT NULL AND stale_after_ts < ?1",
             [now_ms - DAY_MS],
         )?;
-
-        conn.execute_batch("COMMIT")?;
         Ok(())
+        })();
+
+        match pruned {
+            Ok(()) => conn.execute_batch("COMMIT"),
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     })?;
 
     tracing::info!(?report, "retention prune complete");
@@ -194,5 +205,24 @@ mod tests {
             })
             .unwrap();
         assert_eq!(text, None, "ocr_text nullified");
+    }
+
+    #[test]
+    fn prune_error_rolls_back_and_frees_the_shared_connection() {
+        let db = Db::open_in_memory().expect("open");
+        let now = 1_700_000_000_000 + 100 * DAY_MS;
+        // Force a mid-prune statement failure after BEGIN.
+        db.with_conn(|c| c.execute_batch("DROP TABLE suggestions").map(|_| ()))
+            .unwrap();
+
+        assert!(run_nightly_prune(&db, now, &RetentionPolicy::default()).is_err());
+
+        // The failed prune must not leave BEGIN open: a write that opens its
+        // own transaction (insert_event_with_context) still succeeds, and its
+        // row is durable (not silently joined to a dead transaction).
+        let id = db
+            .insert_event_with_context(&ev_at(now, EventType::WindowFocus), None, None)
+            .expect("connection free after failed prune");
+        assert!(db.read_event(id).is_ok());
     }
 }

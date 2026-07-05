@@ -53,7 +53,7 @@
   --shadow-elev: 0 8px 24px rgba(0, 0, 0, 0.35);
   --lens-lip: inset 0 1px 0 rgba(255, 255, 255, 0.12); /* inner top highlight */
 
-  /* ---- Blur scale — 16 is the CEILING (doc 14 §2) --------------------- */
+  /* ---- Blur scale 8/12 — 12 is the v1 CEILING (doc 14 §2, ADR-039) ---- */
   --blur-8: 8px;
   --blur-12: 12px; /* bubble backdrop blur */
   --blur-16: 16px; /* post-v1 only (refraction tier, ADR-039) — v1 ceiling is --blur-12 */

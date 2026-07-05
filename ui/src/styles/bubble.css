@@ -235,8 +235,8 @@ body.gpu-busy .bubble--exit {
   gap: 14px;
 
   background: var(--glass-2);
-  -webkit-backdrop-filter: blur(var(--blur-16)) saturate(var(--saturate));
-  backdrop-filter: blur(var(--blur-16)) saturate(var(--saturate));
+  -webkit-backdrop-filter: blur(var(--blur-12)) saturate(var(--saturate));
+  backdrop-filter: blur(var(--blur-12)) saturate(var(--saturate));
   border: 1px solid var(--border-hairline);
   border-radius: var(--radius-24);
   box-shadow: var(--shadow-elev), var(--lens-lip);

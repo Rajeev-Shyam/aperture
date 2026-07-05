@@ -8,8 +8,8 @@
 //! Job spec (doc 07 §3): `{ kind: Stt, priority: 100 (highest) }`. Voice preempts
 //! queued VLM jobs and is **never cancellable** (doc 12 §3) — STT runs to
 //! completion or deadline. The orchestrator owns the **CPU fallback** to
-//! Whisper-small when the GPU is unavailable (driver issue / projection refused,
-//! doc 07 §3, §6); callers see only the [`JobOutput::Stt`] result.
+//! whisper.cpp base/tiny (ADR-024) when the GPU is unavailable (driver issue /
+//! projection refused, doc 07 §3, §6); callers see only the [`JobOutput::Stt`] result.
 
 use std::time::Duration;
 

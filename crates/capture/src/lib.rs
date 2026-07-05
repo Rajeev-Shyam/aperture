@@ -26,6 +26,7 @@ pub mod toggle;
 pub mod uia;
 pub mod wgc;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use aperture_event_bus::EventBus;
@@ -33,7 +34,7 @@ use aperture_event_bus::EventBus;
 use crate::exclusion::ExclusionList;
 use crate::hooks::{HookEvent, HookThread, WindowIdentity};
 use crate::normalizer::Normalizer;
-use crate::sampler::{epoch_ms, FrameSink, Sampler};
+use crate::sampler::{epoch_ms, ForegroundContext, FrameSink, Sampler};
 use crate::toggle::CaptureToggle;
 use crate::wgc::WgcSampler;
 
@@ -120,8 +121,13 @@ pub struct CaptureSubsystem {
     sampler: Arc<Sampler>,
     toggle: Arc<CaptureToggle>,
     normalizer: Arc<Normalizer>,
-    /// The most recent foreground identity (heartbeat samples re-use it).
-    current_identity: Arc<Mutex<WindowIdentity>>,
+    /// The most recent foreground context — identity + browser URL (heartbeat
+    /// samples re-use it; the URL feeds the `url_pattern` gate, FIX 2.2).
+    foreground: Arc<Mutex<ForegroundContext>>,
+    /// hwnd → identity for windows seen alive. `EVENT_OBJECT_DESTROY` arrives
+    /// after the hwnd is gone (all win32 lookups fail), so `window_close`
+    /// events resolve their identity from here instead.
+    identity_cache: Mutex<HashMap<isize, WindowIdentity>>,
     /// Drain + heartbeat tasks, aborted on drop.
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -148,7 +154,7 @@ impl CaptureSubsystem {
             norm = norm.with_store(Arc::clone(s));
         }
         let normalizer = Arc::new(norm);
-        let current_identity = Arc::new(Mutex::new(WindowIdentity::default()));
+        let foreground = Arc::new(Mutex::new(ForegroundContext::default()));
 
         // The hook→pipeline channel: std mpsc out of the C callback, bridged to
         // tokio by a blocking drain task spawned in `start`.
@@ -167,7 +173,8 @@ impl CaptureSubsystem {
             sampler: Arc::clone(&sampler),
             toggle,
             normalizer,
-            current_identity,
+            foreground,
+            identity_cache: Mutex::new(HashMap::new()),
             tasks: Mutex::new(Vec::new()),
         });
 
@@ -182,7 +189,7 @@ impl CaptureSubsystem {
         });
         // Heartbeat task (parks itself while suspended).
         let hb = tokio::spawn(
-            Arc::clone(&subsystem.sampler).run_heartbeat(Arc::clone(&subsystem.current_identity)),
+            Arc::clone(&subsystem.sampler).run_heartbeat(Arc::clone(&subsystem.foreground)),
         );
         subsystem.tasks.lock().expect("tasks lock").extend([drain, hb]);
 
@@ -201,12 +208,37 @@ impl CaptureSubsystem {
             | HookEvent::WindowClosed { hwnd }
             | HookEvent::TitleChanged { hwnd } => hwnd,
         };
-        let identity = hooks::window_identity(hwnd);
-        if matches!(raw, HookEvent::ForegroundChanged { .. } | HookEvent::TitleChanged { .. }) {
-            *self.current_identity.lock().expect("identity lock") = identity.clone();
+        let mut identity = hooks::window_identity(hwnd);
+
+        // `EVENT_OBJECT_DESTROY` arrives after the hwnd is gone, so the win32
+        // lookups above come back all-None: serve the close from the identity
+        // cached while the window lived (doc 05 §3 identity attachment).
+        // Unknown hwnds (child windows, never-seen top-levels) are dropped
+        // rather than persisted as anonymous rows.
+        if matches!(raw, HookEvent::WindowClosed { .. }) {
+            match self.identity_cache.lock().expect("identity cache lock").remove(&hwnd) {
+                Some(cached) => identity = cached,
+                None if identity.process.is_none() => return,
+                None => {}
+            }
+        } else if identity.process.is_some() {
+            let mut cache = self.identity_cache.lock().expect("identity cache lock");
+            if cache.len() >= 512 && !cache.contains_key(&hwnd) {
+                cache.clear(); // crude bound; repopulates from live focus traffic
+            }
+            cache.insert(hwnd, identity.clone());
         }
 
-        let normalized = self.normalizer.normalize_hook(&raw, identity, now);
+        let normalized = self.normalizer.normalize_hook(&raw, identity.clone(), now);
+
+        // Heartbeat samples re-use the latest foreground context, including the
+        // URL verdict input (FIX 2.2: a lingering excluded page stays excluded).
+        if matches!(raw, HookEvent::ForegroundChanged { .. } | HookEvent::TitleChanged { .. }) {
+            let mut fg = self.foreground.lock().expect("identity lock");
+            fg.identity = identity;
+            fg.url = normalized.first().and_then(|n| n.url.clone());
+        }
+
         for n in normalized {
             if n.capture_frame {
                 let trigger = match (&raw, n.event.r#type) {
@@ -216,7 +248,7 @@ impl CaptureSubsystem {
                     _ => SampleTrigger::FocusChange,
                 };
                 // n.event.id is the durable row (0 when no store is wired).
-                self.sampler.request(trigger, n.identity, n.event.id, now);
+                self.sampler.request(trigger, n.identity, n.url, n.event.id, now);
             }
         }
     }

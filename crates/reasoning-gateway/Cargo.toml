@@ -3,7 +3,7 @@ name = "aperture-reasoning-gateway"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "The reasoning & Claude integration gateway (doc 09): builds/previews/sends the Context Payload via swappable transports (CLI / Desktop-MCP / Messages API). THE ONLY crate permitted to open network sockets or spawn the Claude CLI (two-emitter rule, doc 13 §2)."
+description = "The reasoning & Claude integration gateway (doc 09): builds/previews/sends the Context Payload via swappable transports (Desktop-MCP / CLI / Messages API, MCP-primary per ADR-025). THE ONLY crate permitted to open network sockets or spawn the Claude CLI (two-emitter rule, doc 13 §2)."
 
 [dependencies]
 aperture-contracts = { workspace = true }

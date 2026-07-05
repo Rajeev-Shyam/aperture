@@ -115,26 +115,41 @@ const LOOPBACK_SCOPED_CRATES: &[&str] = &["vlm-host", "stt-host"];
 const SKIPPED_CRATES: &[&str] = &["gates", "xtask"];
 
 fn lint_emitters() -> Result<()> {
-    let crates_dir = workspace_root().join("crates");
-    println!("lint-emitters: scanning {} (doc 13 §2)", crates_dir.display());
+    let root = workspace_root();
+    let crates_dir = root.join("crates");
+    println!(
+        "lint-emitters: scanning {} + src-tauri (doc 13 §2)",
+        crates_dir.display()
+    );
 
     let mut violations: Vec<String> = Vec::new();
     let mut scanned_files = 0usize;
 
+    // Every crate under crates/, PLUS the root `src-tauri` shell crate — the
+    // shipped binary promises "no sockets, no CLI spawn" (its own header) and
+    // is exactly the surface the two-emitter rule protects.
+    let mut crate_dirs: Vec<std::path::PathBuf> = Vec::new();
     for entry in std::fs::read_dir(&crates_dir)
         .with_context(|| format!("read {}", crates_dir.display()))?
     {
         let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
+        if entry.file_type()?.is_dir() {
+            crate_dirs.push(entry.path());
         }
-        let crate_name = entry.file_name().to_string_lossy().to_string();
+    }
+    crate_dirs.push(root.join("src-tauri"));
+
+    for dir in crate_dirs {
+        let crate_name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
         if SKIPPED_CRATES.contains(&crate_name.as_str()) {
             continue;
         }
         let sanctioned = SANCTIONED_CRATES.contains(&crate_name.as_str());
         let loopback_scoped = LOOPBACK_SCOPED_CRATES.contains(&crate_name.as_str());
-        let src = entry.path().join("src");
+        let src = dir.join("src");
         if !src.is_dir() {
             continue;
         }
