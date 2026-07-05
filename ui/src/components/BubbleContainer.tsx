@@ -7,10 +7,16 @@
 //  also pulls `list_suggestions` so a WebView2 respawn restores the queue from
 //  SQLite (doc 11 §7).
 //
-//  Each visible bubble renders entering -> idle (12s dwell, hover pauses) and
-//  emits the matching `suggestion_*` feedback via `suggestion_lifecycle`
-//  (SC7's data source). The actual feedback-event write happens in the core when
-//  it receives `bubble_click` / the lifecycle signal.
+//  Each visible bubble renders entering -> idle (20 s dwell, hover pauses) and
+//  records user-driven transitions (dismiss / expiry / click) through the
+//  `record_feedback` IPC so the durable suggestions row updates and the
+//  engine's decay/mute ladder learns (doc 08 §7, SC7's data source).
+//  Core-driven transitions arriving via `suggestion_lifecycle` are NOT
+//  re-recorded — the core already knows.
+//
+//  TODO(M3-followup): the 👍/👎 "useful?" thumbs affordance (doc 11 §3, Q81) —
+//  `recordFeedback(id, "up" | "down")` is wired and waiting. Also pending:
+//  draggable stack + persisted position (doc 11 §3/§8, Q66).
 
 import { useEffect, useRef, useState } from "react";
 
@@ -20,6 +26,7 @@ import {
   listSuggestions,
   onBubbleSpec,
   onSuggestionLifecycle,
+  recordFeedback,
   type BubbleLifecycleState,
   type UnlistenFn,
 } from "../lib/ipc";
@@ -97,8 +104,11 @@ export function BubbleContainer({ onAskClaude }: Props) {
   }
 
   function onResume(b: BubbleInstance) {
-    // Core resolves action_ref -> connector -> open AND records suggestion_clicked.
+    // Core resolves action_ref -> connector -> open (M4). The durable
+    // clicked-state + engine reinforcement go through record_feedback (the
+    // M4 bubble_click impl should not double-record).
     void bubbleClick(b.id, b.spec.action_ref);
+    void recordFeedback(b.id, "clicked");
     applyLifecycle(b.id, "clicked");
   }
 
@@ -115,9 +125,18 @@ export function BubbleContainer({ onAskClaude }: Props) {
           // ADR-039/C4 (R2): ≤2 glass surfaces; the 3rd+ visible renders opaque.
           opaque={i >= 2}
           onResume={() => onResume(b)}
-          onDismiss={() => applyLifecycle(b.id, "dismissed")}
+          onDismiss={() => {
+            // User-driven: persist + teach the ladder (doc 08 §7) so the
+            // bubble cannot resurrect on a WebView respawn.
+            void recordFeedback(b.id, "dismissed");
+            applyLifecycle(b.id, "dismissed");
+          }}
           onExited={() => removeBubble(b.id)}
-          onLifecycle={(state) => applyLifecycle(b.id, state)}
+          onLifecycle={(state) => {
+            // Dwell expiry originates in this WebView -> record it once.
+            if (state === "expired") void recordFeedback(b.id, "expired");
+            applyLifecycle(b.id, state);
+          }}
           onAskClaude={() => onAskClaude(b.spec.action_ref)}
         />
       ))}

@@ -46,6 +46,16 @@ pub struct AppState {
     /// `toggle_capture` routes here so capture state has exactly one writer
     /// (doc 02 §7); the tokio Mutex covers the `&mut` turn_on/turn_off surface.
     pub orchestration: Arc<tokio::sync::Mutex<OrchestratedSystem>>,
+
+    /// Bubble feedback into the pattern task's engine (doc 08 §7, Q81):
+    /// `(pattern_id, signal)` pairs sent by `record_feedback`.
+    pub feedback_tx:
+        tokio::sync::mpsc::UnboundedSender<(i64, aperture_pattern_engine::FeedbackEvent)>,
+
+    /// Global bubble snooze deadline, epoch ms (ADR-040/Q95): `0` = off,
+    /// `i64::MAX` = until re-enabled. Written by `set_snooze`; read by the
+    /// pattern task's emit gate and `list_suggestions`.
+    pub snooze_until: Arc<std::sync::atomic::AtomicI64>,
     // gateway: wired at M7 (doc 09) — the ONLY field that may reach the network.
 }
 
@@ -57,7 +67,12 @@ impl AppState {
         db: Arc<Db>,
         capture: Arc<CaptureSubsystem>,
         orchestration: Arc<tokio::sync::Mutex<OrchestratedSystem>>,
+        feedback_tx: tokio::sync::mpsc::UnboundedSender<(
+            i64,
+            aperture_pattern_engine::FeedbackEvent,
+        )>,
+        snooze_until: Arc<std::sync::atomic::AtomicI64>,
     ) -> Self {
-        Self { bus, db, capture, orchestration }
+        Self { bus, db, capture, orchestration, feedback_tx, snooze_until }
     }
 }

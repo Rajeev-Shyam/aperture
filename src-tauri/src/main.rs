@@ -78,12 +78,15 @@ fn main() {
         Some(store),
     );
 
-    // Drive capture off the toggle broadcast (single writer, doc 02 §7).
-    let capture_rx = rt.block_on(async { orchestration.lock().await.subscribe_capture() });
-    spawn_capture_driver(Arc::clone(&capture), capture_rx);
+    // Bubble feedback channel (doc 08 §7) + global snooze deadline (ADR-040):
+    // commands write, the pattern task reads.
+    let (feedback_tx, feedback_rx) = tokio::sync::mpsc::unbounded_channel();
+    let snooze_until = Arc::new(std::sync::atomic::AtomicI64::new(0));
 
-    let state = AppState::new(bus, db, capture, orchestration);
-    run_tauri(state, &rt);
+    // The capture driver + pattern task spawn inside Tauri's setup — both need
+    // the AppHandle (indicator events / bubble_spec events).
+    let state = AppState::new(bus, db, capture, orchestration, feedback_tx, snooze_until);
+    run_tauri(state, feedback_rx, &rt);
 }
 
 /// Local-only structured logging (doc 13). Never logs payload contents or wire
@@ -128,24 +131,39 @@ fn build_frame_sink(db: Arc<aperture_db::Db>) -> Arc<dyn aperture_capture::sampl
 
 /// React to the orchestration toggle broadcast: ON → capture STARTING path,
 /// OFF → the ≤3 s release (doc 05 §5, doc 12 §6).
+///
+/// The indicator is emitted from the OBSERVED outcome — never the requested
+/// state (doc 13 §8: "the indicator is always truthful"). A failed start
+/// reverts the single writer to Off so every reader (indicator, pattern
+/// engine rule 7) agrees, and the next toggle(true) can re-broadcast a retry
+/// (turn_on is idempotent only against a latched On).
 fn spawn_capture_driver(
     capture: Arc<aperture_capture::CaptureSubsystem>,
+    orchestration: Arc<tokio::sync::Mutex<aperture_orchestration::OrchestratedSystem>>,
     mut rx: tokio::sync::broadcast::Receiver<aperture_orchestration::toggle_owner::CaptureState>,
+    app: tauri::AppHandle,
 ) {
     tokio::spawn(async move {
         use aperture_orchestration::toggle_owner::CaptureState;
         loop {
             match rx.recv().await {
-                Ok(CaptureState::On) => {
-                    if let Err(e) = capture.start().await {
-                        tracing::error!(%e, "capture start failed (event-only until retry)");
+                Ok(CaptureState::On) => match capture.start().await {
+                    Ok(()) => {
+                        let _ = events::emit_capture_indicator(&app, events::CaptureIndicator::On);
                     }
-                }
+                    Err(e) => {
+                        tracing::error!(%e, "capture start failed — reverting to OFF (doc 05 §7)");
+                        orchestration.lock().await.toggle().turn_off().await;
+                        let _ =
+                            events::emit_capture_indicator(&app, events::CaptureIndicator::Off);
+                    }
+                },
                 Ok(CaptureState::Off) => {
                     if let Err(e) = capture.stop().await {
                         // ToggleSlaBreach: force path already ran; surface once.
                         tracing::error!(%e, "capture stop breached the SLA (doc 05 §7)");
                     }
+                    let _ = events::emit_capture_indicator(&app, events::CaptureIndicator::Off);
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(_) => break,
@@ -174,7 +192,14 @@ fn spawn_retention(db: Arc<aperture_db::Db>) {
 
 /// Build and run the Tauri app: manage [`AppState`], register the IPC command
 /// contract, create the overlay + spawn the WebView forwarders in `setup`, run.
-fn run_tauri(state: AppState, _rt: &tokio::runtime::Runtime) {
+fn run_tauri(
+    state: AppState,
+    feedback_rx: tokio::sync::mpsc::UnboundedReceiver<(
+        i64,
+        aperture_pattern_engine::FeedbackEvent,
+    )>,
+    _rt: &tokio::runtime::Runtime,
+) {
     let setup_state = state.clone();
     tauri::Builder::default()
         .manage(state)
@@ -182,6 +207,8 @@ fn run_tauri(state: AppState, _rt: &tokio::runtime::Runtime) {
             commands::toggle_capture,
             commands::list_suggestions,
             commands::bubble_click,
+            commands::record_feedback,
+            commands::set_snooze,
             commands::request_preview,
             commands::preview_set_approved,
             commands::preview_send,
@@ -206,15 +233,24 @@ fn run_tauri(state: AppState, _rt: &tokio::runtime::Runtime) {
                 app.handle(),
                 events::CaptureIndicator::Off,
             );
-            // The pattern-engine consumer (doc 02 §4 steps 6-8) needs the app
-            // handle to emit bubble_spec events; spawned here.
-            let capture_rx = tauri::async_runtime::block_on(async {
-                setup_state.orchestration.lock().await.subscribe_capture()
+            // The capture driver + pattern-engine consumer (doc 02 §4) need
+            // the app handle (indicator / bubble_spec events); spawned here.
+            let (driver_rx, engine_rx) = tauri::async_runtime::block_on(async {
+                let orch = setup_state.orchestration.lock().await;
+                (orch.subscribe_capture(), orch.subscribe_capture())
             });
+            spawn_capture_driver(
+                Arc::clone(&setup_state.capture),
+                Arc::clone(&setup_state.orchestration),
+                driver_rx,
+                app.handle().clone(),
+            );
             pipeline::spawn_pattern_task(
                 &setup_state.bus,
                 std::sync::Arc::clone(&setup_state.db),
-                capture_rx,
+                engine_rx,
+                feedback_rx,
+                Arc::clone(&setup_state.snooze_until),
                 app.handle().clone(),
             );
             Ok(())

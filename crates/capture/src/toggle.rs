@@ -124,12 +124,28 @@ impl CaptureToggle {
     /// hooks, resume the sampler, then emit `capture_toggle(on)`. Indicator
     /// flips are the shell's reaction to the orchestration broadcast.
     /// Invoked only when orchestration's ToggleOwner has decided ON.
+    /// A failed acquire rolls back fully: hooks must not keep feeding events
+    /// while the mechanism reports a failed start, and the state returns to
+    /// `Off` so the owner can honestly re-drive a retry (doc 05 §7).
     pub async fn acquire(&self) -> Result<(), CaptureError> {
         self.state.store(CaptureState::Starting.as_u8(), Ordering::SeqCst);
 
-        let hooks = (self.hook_factory.lock().expect("factory lock"))()?;
+        let hooks = match (self.hook_factory.lock().expect("factory lock"))() {
+            Ok(h) => h,
+            Err(e) => {
+                self.state.store(CaptureState::Off.as_u8(), Ordering::SeqCst);
+                return Err(e);
+            }
+        };
         *self.hooks.lock().expect("hooks lock") = Some(hooks);
-        self.sampler.resume()?;
+        if let Err(e) = self.sampler.resume() {
+            // Partial acquisition: unhook before surfacing the failure.
+            if let Some(mut hooks) = self.hooks.lock().expect("hooks lock").take() {
+                hooks.uninstall();
+            }
+            self.state.store(CaptureState::Off.as_u8(), Ordering::SeqCst);
+            return Err(e);
+        }
 
         self.emit_toggle_event(true);
         self.state.store(CaptureState::On.as_u8(), Ordering::SeqCst);
@@ -149,6 +165,13 @@ impl CaptureToggle {
     /// ToggleOwner has decided OFF (orchestration itself kills the sidecars —
     /// its step 4 — in parallel).
     pub async fn release(self: &Arc<Self>) -> Result<(), CaptureError> {
+        if self.state() == CaptureState::Off {
+            // Idempotent: nothing acquired, nothing to release — and no
+            // spurious capture_toggle(off) audit row (e.g. the shell's
+            // revert-after-failed-start broadcasts Off to a toggle that
+            // never left Off).
+            return Ok(());
+        }
         self.state.store(CaptureState::Stopping.as_u8(), Ordering::SeqCst);
 
         let this = Arc::clone(self);
@@ -268,6 +291,16 @@ mod tests {
     async fn release_emits_audit_event_and_lands_off_within_sla() {
         let t = toggle();
         let mut rx = t.bus.subscribe();
+
+        // Releasing while already Off is a no-op: no audit row (e.g. the
+        // shell's revert-after-failed-start broadcasts Off to a toggle that
+        // never left Off).
+        t.release().await.expect("no-op release");
+        assert!(rx.try_recv().is_err(), "no audit event for a no-op release");
+
+        // Simulate an acquired toggle (the test hook factory cannot succeed),
+        // then release for real.
+        t.state.store(CaptureState::On.as_u8(), Ordering::SeqCst);
         let started = std::time::Instant::now();
         t.release().await.expect("release path");
         assert!(started.elapsed() < Duration::from_millis(TOGGLE_OFF_SLA_MS));
@@ -300,7 +333,9 @@ mod tests {
         let t = toggle();
         let err = t.acquire().await.expect_err("test factory fails");
         assert!(matches!(err, CaptureError::HookFailed(_)));
-        // Starting (stuck) is observable — the shell surfaces it (doc 05 §7).
-        assert_eq!(t.state(), CaptureState::Starting);
+        // A failed start rolls back to Off (never stuck in Starting) so the
+        // owner can re-drive a retry; the error return is the shell's signal
+        // to surface it (doc 05 §7).
+        assert_eq!(t.state(), CaptureState::Off);
     }
 }

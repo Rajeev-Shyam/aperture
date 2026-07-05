@@ -29,6 +29,11 @@ use crate::events::{self, BubbleSpecEnvelope, CaptureIndicator};
 /// state. OFF runs the release sequence (capture release; sidecar kill wires at
 /// M5, doc 12 §6); the capture subsystem emits the `capture_toggle` audit row.
 /// Capture defaults OFF until opt-in (doc 13 §8).
+///
+/// The indicator is emitted from the OBSERVED outcome by the capture driver
+/// (`main::spawn_capture_driver`) — never from the requested state here
+/// (doc 13 §8: "the indicator is always truthful"). Only the transitional
+/// "releasing…" hint is emitted eagerly.
 #[tauri::command]
 pub async fn toggle_capture(
     on: bool,
@@ -45,11 +50,89 @@ pub async fn toggle_capture(
             orch.toggle().turn_off().await;
         }
     }
-    let _ = events::emit_capture_indicator(
-        &app,
-        if on { CaptureIndicator::On } else { CaptureIndicator::Off },
-    );
     Ok(on)
+}
+
+/// Record bubble feedback (doc 08 §7, ADR-040/Q81): update the durable
+/// suggestions row (state/resolved_ts/useful_rating — dismissed bubbles must
+/// not resurrect on a WebView respawn) and forward the signal to the pattern
+/// engine's decay/mute ladder. `kind`: "clicked" | "dismissed" | "expired" |
+/// "up" | "down". The 👍/👎 affordance renders at the next UI pass (doc 11 §3);
+/// this seam already accepts it.
+#[tauri::command]
+pub async fn record_feedback(
+    id: String,
+    kind: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let row_id: i64 = id.parse().map_err(|_| format!("bad suggestion id: {id}"))?;
+    let now = crate::pipeline::epoch_ms();
+    let (fb, sql, uses_ts) = match kind.as_str() {
+        "clicked" => (
+            aperture_pattern_engine::FeedbackEvent::Clicked,
+            "UPDATE suggestions SET state='clicked', resolved_ts=?2 WHERE id=?1",
+            true,
+        ),
+        "dismissed" => (
+            aperture_pattern_engine::FeedbackEvent::Dismissed,
+            "UPDATE suggestions SET state='dismissed', resolved_ts=?2 WHERE id=?1",
+            true,
+        ),
+        "expired" => (
+            aperture_pattern_engine::FeedbackEvent::Expired,
+            "UPDATE suggestions SET state='expired', resolved_ts=?2 WHERE id=?1",
+            true,
+        ),
+        "up" => (
+            aperture_pattern_engine::FeedbackEvent::ThumbsUp,
+            "UPDATE suggestions SET useful_rating='up' WHERE id=?1",
+            false,
+        ),
+        "down" => (
+            aperture_pattern_engine::FeedbackEvent::ThumbsDown,
+            "UPDATE suggestions SET useful_rating='down' WHERE id=?1",
+            false,
+        ),
+        other => return Err(format!("unknown feedback kind: {other}")),
+    };
+    let pattern_id = state
+        .db
+        .with_conn(|c| {
+            if uses_ts {
+                c.execute(sql, rusqlite::params![row_id, now])?;
+            } else {
+                c.execute(sql, rusqlite::params![row_id])?;
+            }
+            c.query_row(
+                "SELECT pattern_id FROM suggestions WHERE id = ?1",
+                [row_id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+        })
+        .map_err(|e| e.to_string())?;
+    if let Some(pid) = pattern_id {
+        let _ = state.feedback_tx.send((pid, fb)); // task gone = shutdown; fine
+    }
+    Ok(())
+}
+
+/// Global bubble snooze (ADR-040/Q95, doc 11 §6, doc 13 §8): silences bubble
+/// EMISSION while capture + learning continue — distinct from the capture
+/// toggle. `mode`: "off" | "15m" | "1h" | "forever" (until re-enabled).
+#[tauri::command]
+pub async fn set_snooze(mode: String, state: State<'_, AppState>) -> Result<(), String> {
+    let now = crate::pipeline::epoch_ms();
+    let until = match mode.as_str() {
+        "off" => 0,
+        "15m" => now + 15 * 60_000,
+        "1h" => now + 3_600_000,
+        "forever" => i64::MAX,
+        other => return Err(format!("unknown snooze mode: {other}")),
+    };
+    state
+        .snooze_until
+        .store(until, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
 }
 
 /// Return the currently-renderable bubbles for the overlay (doc 11 §3).
@@ -61,6 +144,15 @@ pub async fn toggle_capture(
 pub async fn list_suggestions(
     state: State<'_, AppState>,
 ) -> Result<Vec<BubbleSpecEnvelope>, String> {
+    // ADR-040/Q95: while snoozed the overlay renders nothing; queued rows
+    // surface here once the snooze lifts.
+    let snoozed = state
+        .snooze_until
+        .load(std::sync::atomic::Ordering::SeqCst)
+        > crate::pipeline::epoch_ms();
+    if snoozed {
+        return Ok(Vec::new());
+    }
     state
         .db
         .with_conn(|c| {
