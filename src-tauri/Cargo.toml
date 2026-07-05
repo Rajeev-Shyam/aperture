@@ -65,7 +65,8 @@ workspace = true
 tauri-build = { version = "2", features = [] }  # [VERIFY] at build time
 
 [features]
-default = []
-# Opt-in real embedding backend (downloads ~250 MB on first run — see
-# crates/embedding). Enable with: cargo build -p aperture --features nomic
+# Default ON since 2026-07-05 — the model is fetched into models/ (see
+# crates/embedding). Build with --no-default-features to fall back to the
+# zero-download HashEmbedder dev path.
+default = ["nomic"]
 nomic = ["aperture-embedding/nomic"]
