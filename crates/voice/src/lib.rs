@@ -15,8 +15,8 @@
 //! - **VRAM ceiling / single GPU mutex (doc 04, doc 12):** STT runs *only* as a
 //!   [`aperture_contracts::GpuJob`] enqueued on the orchestration crate's
 //!   [`GpuScheduler`]. This crate never touches the GPU, a sidecar, or VRAM
-//!   accounting. Whisper-small CPU fallback is the orchestrator's decision; we
-//!   simply submit the job (doc 07 §3).
+//!   accounting. The whisper.cpp base/tiny CPU fallback (ADR-024) is the
+//!   orchestrator's decision; we simply submit the job (doc 07 §3).
 //! - **Two-emitter transparency gate (doc 13 §2):** voice escalation (`"ask claude …"`)
 //!   only *assembles* a [`ContextPayload`] and hands it to the preview→Send gate.
 //!   This crate opens **no** network socket and spawns **no** Claude CLI — only the

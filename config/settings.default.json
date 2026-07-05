@@ -1,10 +1,13 @@
 {
-  "$comment": "Default settings seed for Aperture. At runtime these live INSIDE the encrypted DB (doc 13 §6); this file is the first-run seed. [VERIFY] all model names / hotkeys / thresholds against the real target and current vendor docs (doc 00 conventions).",
+  "$comment": "Default settings seed for Aperture — R2 values (Docs 19-21). At runtime these live INSIDE the encrypted DB (doc 13 §6); this file is the first-run seed. [VERIFY] all model names / hotkeys / thresholds against the real target and current vendor docs (doc 00 conventions).",
 
   "capture": {
     "default_state": "off",
     "$comment_default_state": "Capture is OFF until the user opts in at first run (doc 13 §8).",
-    "heartbeat_ms": 10000,
+    "$comment_heartbeat": "Adaptive heartbeat band (ADR-032/Q41): default 10 s, pulled toward the floor when event density is high and the ceiling when quiet.",
+    "heartbeat_default_ms": 10000,
+    "heartbeat_min_ms": 5000,
+    "heartbeat_max_ms": 20000,
     "debounce_ms": 300,
     "inactivity_idle_ms": 60000,
     "toggle_off_sla_ms": 3000
@@ -12,11 +15,12 @@
 
   "loadout": {
     "active": "L1",
-    "$comment": "L1 = Qwen2.5-VL-3B + Whisper small (co-resident, mutex serializes execution). L2 = Qwen2.5-VL-7B exclusive (opt-in, doc 04 §3).",
+    "$comment": "L1 = Qwen2.5-VL-3B + faster-whisper small, co-residency CONDITIONAL on the 7.0 GB projection (ADR-030 — STT is the swap victim when it doesn't fit). L2 = Qwen2.5-VL-7B exclusive (opt-in, doc 04 §3).",
     "vlm_model": "qwen2.5-vl-3b",
-    "stt_model": "whisper-small",
-    "vram_ceiling_gb": 7.2,
-    "idle_unload_sec": 90,
+    "stt_model": "faster-whisper-small",
+    "$comment_stt": "GPU path = faster-whisper (CTranslate2) small ~2 GB; CPU fallback = whisper.cpp base/tiny (ADR-024).",
+    "vram_ceiling_gb": 7.0,
+    "idle_unload_sec": 60,
     "vlm_deadline_s": 10,
     "stt_deadline_s": 15,
     "min_residency_sec": 20
@@ -30,36 +34,44 @@
   },
 
   "pattern_engine": {
-    "tau_conf": 0.6,
+    "tau_conf": 0.7,
     "cold_start_support_floor": 3,
     "semantic_similarity_threshold": 0.75,
     "cooldown_min": 30,
-    "suggestion_cap_per_hour": 4,
-    "session_gap_min": 15,
-    "recency_half_life_days": 7
+    "$comment_cap": "Adaptive global cap 2-8/hr (ADR-032); the default is only the cold-start value.",
+    "cap_per_hour_floor": 2,
+    "cap_per_hour_ceiling": 8,
+    "cap_per_hour_default": 4,
+    "$comment_session_gap": "Rolling idle-gap sessionizer (ADR-032): 15 min is the cold-start default; the learned gap clamps to 5-45 min.",
+    "session_gap_cold_start_min": 15,
+    "$comment_half_life": "Split decay half-lives (ADR-033): temporal patterns ~5 d, sequence patterns ~14 d.",
+    "half_life_temporal_days": 5,
+    "half_life_sequence_days": 14
   },
 
   "ui": {
     "max_concurrent_bubbles": 3,
-    "bubble_dwell_sec": 12,
-    "max_glass_surfaces": 3
+    "bubble_dwell_sec": 20,
+    "max_glass_surfaces": 2,
+    "$comment_glass": "ADR-039: at most 2 glass surfaces; the 3rd visible bubble renders in the opaque fallback class. Blur ceiling 12 px (doc 14 §2)."
   },
 
   "reasoning": {
-    "transport_order": ["claude-cli", "claude-desktop-mcp", "messages-api"],
+    "transport_order": ["claude-desktop-mcp", "claude-cli", "messages-api"],
+    "$comment_transport": "MCP-primary (ADR-025): Desktop MCP -> Claude CLI -> Messages API.",
     "payload_size_warn_kb": 50,
     "per_send_approval": true,
+    "$comment_scoped_allow": "ADR-026 scoped always-allow: per-call approval remains the base; a scope grant still displays the payload with a cancel window, and every send is audited.",
+    "scoped_allow_enabled": false,
+    "scoped_allow_cancel_window_sec": 3,
     "$comment_model": "Claude model id + any beta headers are settings, never code (locked NG8). [VERIFY at build time].",
     "messages_api_model": "",
     "messages_api_beta_headers": []
   },
 
   "privacy": {
-    "exclusion_defaults": [
-      { "match_kind": "process", "pattern": "1Password" },
-      { "match_kind": "process", "pattern": "KeePass" },
-      { "match_kind": "title_regex", "pattern": "(?i)(bank|chase|wells fargo|barclays)" }
-    ],
+    "exclusion_defaults": [],
+    "$comment_exclusions": "Defaults ship EMPTY (ADR-029/Q15): onboarding detects password managers/banking and SUGGESTS exclusions — the user confirms; nothing is ever auto-excluded.",
     "redaction_user_terms": [],
     "retention_days": {
       "events": 90,

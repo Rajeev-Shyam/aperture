@@ -137,41 +137,73 @@ impl CaptureToggle {
     }
 
     /// ON → STOPPING → OFF (doc 05 §5): run the capture-side release steps
-    /// within [`TOGGLE_OFF_SLA_MS`]. On timeout, escalate to
-    /// [`Self::force_release`] (doc 05 §7) — the release still completes; the
-    /// error only flags the breach. Invoked only when orchestration's
+    /// within [`TOGGLE_OFF_SLA_MS`]. The teardown is synchronous, potentially
+    /// blocking work (WGC `Close()` can stall on a lost device; the hook
+    /// uninstall joins the hook thread), so it runs on a blocking thread and
+    /// the SLA timer races it — polled inline, the whole block would complete
+    /// (or hang) inside a single poll and the timeout could never fire. On
+    /// breach, [`Self::force_release`] runs on a *separate* blocking thread
+    /// (it may contend on the same WGC lock the hung teardown holds) and the
+    /// breach is surfaced as [`CaptureError::ToggleSlaBreach`] (doc 05 §7) —
+    /// the caller's loop is never wedged. Invoked only when orchestration's
     /// ToggleOwner has decided OFF (orchestration itself kills the sidecars —
     /// its step 4 — in parallel).
-    pub async fn release(&self) -> Result<(), CaptureError> {
+    pub async fn release(self: &Arc<Self>) -> Result<(), CaptureError> {
         self.state.store(CaptureState::Stopping.as_u8(), Ordering::SeqCst);
 
-        let work = async {
+        let this = Arc::clone(self);
+        let result = race_release_sla(Duration::from_millis(TOGGLE_OFF_SLA_MS), move || {
             // 1. stop sampler thread + drop pending debounce; 2. Close() WGC +
             //    release D3D refs (both inside Sampler::suspend).
-            self.sampler.suspend();
+            this.sampler.suspend();
             // 3. UnhookWinEvent / stop the hook message loop.
-            if let Some(mut hooks) = self.hooks.lock().expect("hooks lock").take() {
+            if let Some(mut hooks) = this.hooks.lock().expect("hooks lock").take() {
                 hooks.uninstall();
             }
             // 3b. [M4 slot — FIX 2.1]: signal the native-messaging host to stop
             //     forwarding extension data (the extension is not built yet).
             // 4. sidecar kill: orchestration's step (doc 12 §6), not ours.
             // 5. indicator flip: the shell reacts to the state broadcast.
-            // 6. audit event:
-            self.emit_toggle_event(false);
-        };
+        })
+        .await;
 
-        let result = tokio::time::timeout(Duration::from_millis(TOGGLE_OFF_SLA_MS), work).await;
+        // 6. audit event — emitted exactly once, breach or not (the breached
+        //    OFF is still an OFF; the row survives Purge All 30 d, doc 03 §6).
+        self.emit_toggle_event(false);
         self.state.store(CaptureState::Off.as_u8(), Ordering::SeqCst);
-        match result {
-            Ok(()) => Ok(()),
-            Err(_elapsed) => {
-                self.force_release();
-                Err(CaptureError::ToggleSlaBreach)
-            }
-        }
-    }
 
+        if result.is_err() {
+            // The orderly teardown is still limping on its blocking thread;
+            // force-release what can be reclaimed without ever blocking the
+            // caller (doc 05 §7).
+            let this = Arc::clone(self);
+            tokio::task::spawn_blocking(move || this.force_release());
+        }
+        result
+    }
+}
+
+/// Race the blocking release steps against the OFF SLA (doc 05 §5, §7). The
+/// work runs on a `spawn_blocking` thread so the timer is real: a stalled
+/// `Close()`/thread-join cannot hold the caller past `sla`. A panicked
+/// teardown is reported as a breach too — either way the force path is the
+/// backstop.
+async fn race_release_sla(
+    sla: Duration,
+    work: impl FnOnce() + Send + 'static,
+) -> Result<(), CaptureError> {
+    let handle = tokio::task::spawn_blocking(work);
+    match tokio::time::timeout(sla, handle).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(join_err)) => {
+            tracing::error!("toggle OFF teardown panicked: {join_err}");
+            Err(CaptureError::ToggleSlaBreach)
+        }
+        Err(_elapsed) => Err(CaptureError::ToggleSlaBreach),
+    }
+}
+
+impl CaptureToggle {
     /// Force path on SLA breach (doc 05 §7): force-release WGC and the hooks,
     /// regardless of the orderly path's progress. The guaranteed VRAM-release
     /// primitive — the sidecar process kill — is orchestration's (doc 12 §5).
@@ -216,20 +248,20 @@ mod tests {
     use crate::wgc::WgcSampler;
     use crate::CaptureConfig;
 
-    fn toggle() -> CaptureToggle {
+    fn toggle() -> Arc<CaptureToggle> {
         let sampler = Sampler::new(
             CaptureConfig::default(),
             WgcSampler::new(),
             ExclusionList::shipped_defaults(),
             Arc::new(DropSink),
         );
-        CaptureToggle::new(
+        Arc::new(CaptureToggle::new(
             sampler,
             // Test factory: pretend hook install fails cleanly off a desktop
             // session; state transitions are what this test asserts.
             Box::new(|| Err(CaptureError::HookFailed("test".into()))),
             EventBus::new(),
-        )
+        ))
     }
 
     #[tokio::test]
@@ -243,6 +275,24 @@ mod tests {
         let ev = rx.try_recv().expect("audit event");
         assert_eq!(ev.r#type, EventType::CaptureToggle);
         assert_eq!(ev.payload["on"], serde_json::json!(false));
+    }
+
+    /// The SLA race must be real: a teardown that outlives the SLA is reported
+    /// as a breach (doc 05 §7) instead of silently blocking the caller.
+    #[tokio::test]
+    async fn sla_race_flags_breach_when_teardown_stalls() {
+        let r = race_release_sla(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_millis(400));
+        })
+        .await;
+        assert!(matches!(r, Err(CaptureError::ToggleSlaBreach)));
+    }
+
+    #[tokio::test]
+    async fn sla_race_passes_fast_teardown() {
+        race_release_sla(Duration::from_millis(TOGGLE_OFF_SLA_MS), || {})
+            .await
+            .expect("fast teardown is within SLA");
     }
 
     #[tokio::test]

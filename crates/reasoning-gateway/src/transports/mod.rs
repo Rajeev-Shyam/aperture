@@ -11,9 +11,10 @@
 //! | [`mcp`] (Claude Desktop via MCP) | **Pull** — Claude initiates | Gate lives *inside* the `aperture_get_context` tool handler, which blocks on the user's Send. |
 //! | [`api`] (Messages API) | **Push** | Preview *before* the HTTPS call. |
 //!
-//! Default fall-through order: CLI -> Desktop-MCP -> API, user-reorderable
-//! (doc 09 §3). Health failures fall through with a visible notice; offline
-//! means the local answer stands and nothing queues silently (doc 09 §6).
+//! Default fall-through order: Desktop-MCP -> CLI -> API (MCP-primary,
+//! ADR-025), user-reorderable (doc 09 §3). Health failures fall through with a
+//! visible notice; offline means the local answer stands and nothing queues
+//! silently (doc 09 §6).
 
 // TODO(M7:) all three transports implement ReasoningTransport in M7.
 

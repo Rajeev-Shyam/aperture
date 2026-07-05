@@ -1,4 +1,5 @@
-//! Claude Code CLI transport — **Push**, the primary candidate (doc 09 §3).
+//! Claude Code CLI transport — **Push**, the first fallback after Desktop-MCP
+//! (MCP-primary order, ADR-025 / doc 09 §3).
 //!
 //! Aperture initiates: spawn the headless CLI and parse its JSON result.
 //! Spawning a child process is a privileged capability — this file is one of the

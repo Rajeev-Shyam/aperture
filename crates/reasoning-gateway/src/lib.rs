@@ -20,7 +20,7 @@
 //!
 //! # Shape
 //! The gateway holds an ordered list of [`ReasoningTransport`]s from settings
-//! (default CLI -> Desktop-MCP -> API, doc 09 §3), picks the first healthy one,
+//! (default Desktop-MCP -> CLI -> API, ADR-025 / doc 09 §3), picks the first healthy one,
 //! falls through on health failure, and — when offline — leaves the local answer
 //! standing without queuing anything silently (doc 09 §6).
 //!
@@ -65,7 +65,8 @@ pub enum GatewayError {
 /// and the single egress chokepoint.
 pub struct Gateway {
     /// Ordered from settings; the gateway picks the first healthy one and falls
-    /// through on health failure (doc 09 §3). Default order: CLI -> Desktop-MCP -> API.
+    /// through on health failure (doc 09 §3). Default order: Desktop-MCP -> CLI
+    /// -> API (MCP-primary, ADR-025).
     transports: Vec<Box<dyn ReasoningTransport>>,
     /// Audit sink for the `cloud_send` row written at Send (doc 13 §3, doc 09 §5).
     /// // TODO(M9:) concrete type from `aperture_privacy::audit_log`.

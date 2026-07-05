@@ -47,7 +47,8 @@ pub mod win_events {
 }
 
 /// Logical identity of a window (doc 05 §3). Attached to events by the normalizer.
-#[derive(Debug, Clone, Default)]
+/// `PartialEq` backs the sampler's capture-time TOCTOU guard.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WindowIdentity {
     /// Friendly application name (e.g. `"Chrome"`), derived from the process stem.
     pub app: Option<String>,
@@ -105,7 +106,14 @@ mod imp {
             return;
         }
         let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
-        if root != hwnd {
+        // A destroyed hwnd no longer resolves its ancestor chain (GetAncestor
+        // returns null), so the top-level filter would drop every close event.
+        // Null-root DESTROYs pass through; the pipeline keeps only hwnds it saw
+        // as top-level (identity cache) — child windows were never cached and
+        // still drop there.
+        let top_level =
+            root == hwnd || (event == win_events::OBJECT_DESTROY && root.0.is_null());
+        if !top_level {
             return;
         }
         let ev = match event {

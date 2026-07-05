@@ -18,8 +18,10 @@
 //! ## Invariants honored here
 //! - **(1) 8 GB VRAM ceiling / single-GPU mutex.** This host does not arbitrate the
 //!   mutex (doc 12 §3) — but STT is priority 100 and **never cancellable** (doc 12
-//!   §3, doc 07 §3): once admitted, a transcribe job runs to completion. Whisper
-//!   small ~1 GB (doc 04 §2) is cheap enough to warm-keep (doc 04 §5).
+//!   §3, doc 07 §3): once admitted, a transcribe job runs to completion.
+//!   faster-whisper small is ~2 GB on GPU (ADR-024/ADR-030, doc 04 §2) — the
+//!   figure behind the 7.0 GB cap and conditional L1 co-residency; it is the
+//!   designated swap victim when the projection doesn't fit.
 //! - **(2) two-emitter transparency gate.** This binary opens sockets **only** on
 //!   loopback (`127.0.0.1:--port`) to its own whisper child. It is NOT the
 //!   reasoning gateway: never the public internet, never the Claude CLI (doc 13 §2).
@@ -27,10 +29,10 @@
 //!   the guaranteed-release path is the parent killing *this* PID, backstopped by
 //!   the OS-level child kill-on-drop (doc 12 §6 step 4).
 //!
-//! Model selection (doc 04 §3): **default = Whisper small (~1 GB; ≈95 % of large-v3
-//! quality — the right default for an 8 GB card, doc 07 §3)**; **opt-in =
-//! faster-whisper distil-large-v3 int8 (~1.48 GB measured)**. CPU fallback (whisper
-//! small on CPU) when the GPU is unavailable (doc 07 §3, §6) — slower but functional.
+//! Model selection (ADR-024, doc 04 §3): **default = faster-whisper (CTranslate2)
+//! small, ~2 GB GPU** — ≈95 % of large-v3 quality, the right default for an 8 GB
+//! card (doc 07 §3). CPU fallback = **whisper.cpp base (default) / tiny** when the
+//! GPU is unavailable or STT is swapped out (doc 07 §3, §6) — slower but functional.
 //!
 //! [VERIFY] exact whisper.cpp / faster-whisper server binary, flags, and measured
 //! latencies → **SC4** (doc 07 §3, doc 04 §9 measurement plan; cold-load < 2 s).

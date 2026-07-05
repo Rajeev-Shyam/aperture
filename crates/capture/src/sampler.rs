@@ -28,6 +28,15 @@ use crate::phash::{dhash64_bgra, to_hex, NearDuplicateGate};
 use crate::wgc::{EphemeralFrame, WgcSampler, WindowRect};
 use crate::{CaptureConfig, CaptureError, SampleTrigger};
 
+/// The most recent foreground context: identity plus the browser URL when one
+/// was resolved (doc 05 §3). The URL rides **in-memory only** so heartbeat
+/// samples of a lingering excluded page hit the `url_pattern` gate (FIX 2.2).
+#[derive(Debug, Clone, Default)]
+pub struct ForegroundContext {
+    pub identity: WindowIdentity,
+    pub url: Option<String>,
+}
+
 /// Context handed to the OCR sink with each frame: which foreground identity it
 /// belongs to and the frame's `thumb_phash` (doc 03 §3 — the only frame-derived
 /// artifact that persists).
@@ -67,8 +76,8 @@ pub struct Sampler {
     exclusion: ExclusionList,
     gate: Mutex<NearDuplicateGate>,
     sink: Arc<dyn FrameSink>,
-    /// Latest debounce-pending identity (focus storms overwrite; one sample fires).
-    pending: Mutex<Option<(SampleTrigger, WindowIdentity, i64)>>,
+    /// Latest debounce-pending context (focus storms overwrite; one sample fires).
+    pending: Mutex<Option<(SampleTrigger, WindowIdentity, Option<String>, i64)>>,
     /// Whether a debounce timer is armed.
     debounce_armed: AtomicBool,
     /// Suspended (toggle OFF / idle) — heartbeat + debounce both stop.
@@ -160,12 +169,15 @@ impl Sampler {
     /// `config.debounce_ms` (latest identity wins); a heartbeat trigger bypasses
     /// the debounce but is suppressed while the user is idle (doc 05 §4).
     ///
+    /// `url` is the browser URL resolved for this context (None otherwise) —
+    /// the exclusion gate needs it for `url_pattern` rules (FIX 2.2).
     /// `event_id` is the durable row this frame will attach to (`0` for
     /// heartbeat samples — the sink then writes event+context atomically).
     pub fn request(
         self: &Arc<Self>,
         trigger: SampleTrigger,
         identity: WindowIdentity,
+        url: Option<String>,
         event_id: i64,
         now_ms: i64,
     ) {
@@ -176,12 +188,12 @@ impl Sampler {
             if !self.user_is_active(now_ms) {
                 return; // idle ⇒ heartbeat suspended (doc 05 §4)
             }
-            self.sample_once(trigger, identity, event_id, now_ms);
+            self.sample_once(trigger, identity, url, event_id, now_ms);
             return;
         }
 
         // Debounce: remember the latest identity; arm one timer.
-        *self.pending.lock().expect("pending lock") = Some((trigger, identity, event_id));
+        *self.pending.lock().expect("pending lock") = Some((trigger, identity, url, event_id));
         if self
             .debounce_armed
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -193,10 +205,10 @@ impl Sampler {
                 tokio::time::sleep(debounce).await;
                 me.debounce_armed.store(false, Ordering::SeqCst);
                 let fired = me.pending.lock().expect("pending lock").take();
-                if let Some((trigger, identity, event_id)) = fired {
+                if let Some((trigger, identity, url, event_id)) = fired {
                     if !me.suspended.load(Ordering::SeqCst) {
                         let now = epoch_ms();
-                        me.sample_once(trigger, identity, event_id, now);
+                        me.sample_once(trigger, identity, url, event_id, now);
                     }
                 }
             });
@@ -205,6 +217,9 @@ impl Sampler {
 
     /// Perform exactly one sample for `identity` (doc 05 §4).
     ///
+    /// 0. **TOCTOU guard** — the request's identity can be up to 300 ms stale
+    ///    while the pull + crop target the *current* foreground; skip when
+    ///    focus moved on.
     /// 1. **Exclusion gate FIRST** — if excluded, return silently (the caller
     ///    already emitted the metadata-only event; no frame, no OCR).
     /// 2. Pull one frame, crop to the foreground rect when known.
@@ -215,17 +230,34 @@ impl Sampler {
         &self,
         trigger: SampleTrigger,
         identity: WindowIdentity,
+        url: Option<String>,
         event_id: i64,
         now_ms: i64,
     ) {
-        // 1. exclusion gate (earliest, doc 05 §4 / doc 13 §4).
+        // 0. Debounce-TOCTOU guard: when an EXCLUDED window takes focus inside
+        //    the debounce window, its verdict means no new request overwrote
+        //    `pending` — firing now would gate on the stale identity but pull
+        //    and crop the excluded window, attributing its OCR text to the
+        //    previous event row. If the capture-time foreground no longer
+        //    matches, skip: the next trigger/heartbeat re-samples.
+        //    (Windows-only: tests / non-Windows have no foreground to check.)
+        #[cfg(windows)]
+        {
+            match capture_time_identity() {
+                Some(current) if current == identity => {}
+                _ => return, // moved on, or no foreground mid-transition
+            }
+        }
+
+        // 1. exclusion gate (earliest, doc 05 §4 / doc 13 §4) — including the
+        //    context's URL so `url_pattern` rules gate frames too (FIX 2.2).
         if self
             .exclusion
             .is_excluded(
                 identity.process.as_deref(),
                 identity.window_class.as_deref(),
                 identity.window_title.as_deref(),
-                None,
+                url.as_deref(),
             )
             .is_excluded()
         {
@@ -274,7 +306,10 @@ impl Sampler {
     /// Drive the adaptive heartbeat while active; suspend while idle (doc 05 §4,
     /// ADR-032). Runs as a background task; exits when `stop` resolves (the
     /// toggle's STOPPING transition aborts it).
-    pub async fn run_heartbeat(self: Arc<Self>, current_identity: Arc<Mutex<WindowIdentity>>) {
+    ///
+    /// The shared [`ForegroundContext`] carries the URL alongside the identity
+    /// so a lingering excluded page is not re-sampled every beat (FIX 2.2).
+    pub async fn run_heartbeat(self: Arc<Self>, foreground: Arc<Mutex<ForegroundContext>>) {
         loop {
             let interval = self.heartbeat_interval_ms();
             tokio::time::sleep(std::time::Duration::from_millis(interval)).await;
@@ -282,12 +317,24 @@ impl Sampler {
                 continue; // parked; resume flips the flag
             }
             let now = epoch_ms();
-            let identity = current_identity.lock().expect("identity lock").clone();
+            let fg = foreground.lock().expect("identity lock").clone();
             // Heartbeats carry no pre-existing event row (event_id 0): the sink
             // writes event+context in one transaction (doc 02 §4 step 5).
-            self.request(SampleTrigger::Heartbeat, identity, 0, now);
+            self.request(SampleTrigger::Heartbeat, fg.identity, fg.url, 0, now);
         }
     }
+}
+
+/// The capture-time foreground identity (TOCTOU guard in [`Sampler::sample_once`]):
+/// `None` when there is no foreground window to attribute a frame to.
+#[cfg(windows)]
+fn capture_time_identity() -> Option<WindowIdentity> {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() {
+        return None;
+    }
+    Some(crate::hooks::window_identity(hwnd.0 as isize))
 }
 
 /// The foreground window's rect in screen physical px (doc 05 §4), when cheap.
