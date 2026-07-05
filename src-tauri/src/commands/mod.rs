@@ -10,44 +10,82 @@
 //!   and only with an already-approved payload (doc 15 §2(c), doc 13 §2).
 //! - [`bubble_click`] is Critical Path B (doc 02 §5): resolve `action_ref` ->
 //!   connector -> reconstruct -> open, target < 200 ms.
+//!
+//! Milestone policy: commands whose subsystems are later milestones return an
+//! honest `Err("not built until M<n>")` instead of `todo!()` — a stray invoke
+//! must never panic the overlay shell.
 
-use aperture_contracts::{ContextPayload, Intent, OpenOutcome, StructuredSuggestions};
+use aperture_contracts::suggestions::SuggestionSource;
+use aperture_contracts::{BubbleSpec, ContextPayload, Intent, OpenOutcome, StructuredSuggestions};
 use tauri::State;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
-use crate::events::BubbleSpecEnvelope;
+use crate::events::{self, BubbleSpecEnvelope, CaptureIndicator};
 
 /// Toggle capture ON/OFF (doc 02 §7, doc 12 §2, §6).
 ///
 /// Routes to the orchestration `ToggleOwner` — the single writer of capture
-/// state. OFF runs the end-to-end release sequence (capture release + sidecar
-/// kill, VRAM -> ~0 in < 3 s, doc 12 §6) and emits the `capture_toggle{off}`
-/// audit event. Capture defaults OFF until opt-in (doc 13 §8).
+/// state. OFF runs the release sequence (capture release; sidecar kill wires at
+/// M5, doc 12 §6); the capture subsystem emits the `capture_toggle` audit row.
+/// Capture defaults OFF until opt-in (doc 13 §8).
 #[tauri::command]
 pub async fn toggle_capture(
-    _on: bool,
-    _state: State<'_, AppState>,
+    on: bool,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
 ) -> Result<bool, String> {
-    // TODO(M1:) state.toggle_owner.set(on) -> broadcast capture state;
-    //   on OFF, drive the <3 s SLA (doc 12 §6) and emit CaptureIndicator::Releasing
-    //   then Off via events::emit_capture_indicator. Return the new capturing state
-    //   (the UI also reconciles via the capture_indicator event).
-    todo!("M1: route to orchestration::ToggleOwner (single writer); OFF release SLA")
+    {
+        let mut orch = state.orchestration.lock().await;
+        if on {
+            orch.toggle().turn_on().await;
+        } else {
+            // The UI shows "releasing…" while the ≤3 s OFF path runs (doc 12 §6).
+            let _ = events::emit_capture_indicator(&app, CaptureIndicator::Releasing);
+            orch.toggle().turn_off().await;
+        }
+    }
+    let _ = events::emit_capture_indicator(
+        &app,
+        if on { CaptureIndicator::On } else { CaptureIndicator::Off },
+    );
+    Ok(on)
 }
 
 /// Return the currently-renderable bubbles for the overlay (doc 11 §3).
 ///
-/// Reads the queued/idle `BubbleSpec`s; the cap of 3 visible (doc 11 §3, doc 14)
-/// is enforced by the UI, this just hands over the live set (queued survive a
-/// WebView2 respawn in SQLite, doc 11 §7).
+/// Reads the queued/shown suggestion rows; the cap of 3 visible (doc 11 §3,
+/// doc 14: ≤2 glass + opaque 3rd, ADR-039) is enforced by the UI — this hands
+/// over the live set (queued rows survive a WebView2 respawn in SQLite, doc 11 §7).
 #[tauri::command]
 pub async fn list_suggestions(
-    _state: State<'_, AppState>,
+    state: State<'_, AppState>,
 ) -> Result<Vec<BubbleSpecEnvelope>, String> {
-    // TODO(M3:) read live suggestions from the suggestion generator / DB and wrap
-    //   each as { id, spec } so the UI can key lifecycle events back to a bubble.
-    todo!("M3: return live {{ id, spec }} envelopes (UI enforces the 3-visible cap, doc 11 §3)")
+    state
+        .db
+        .with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, title, glyph, confidence, connector_id \
+                 FROM suggestions WHERE state IN ('queued','shown') \
+                 ORDER BY shown_ts DESC LIMIT 16",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let id: i64 = row.get(0)?;
+                Ok(BubbleSpecEnvelope {
+                    id: id.to_string(),
+                    spec: BubbleSpec {
+                        title: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        glyph: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        sublabel: None,
+                        action_ref: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                        source: SuggestionSource::Local,
+                        confidence: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+                    },
+                })
+            })?;
+            rows.collect()
+        })
+        .map_err(|e| e.to_string())
 }
 
 /// Critical Path B (doc 02 §5): resolve `action_ref` -> `connector_id`, load the
@@ -60,10 +98,9 @@ pub async fn bubble_click(
     _action_ref: String,
     _state: State<'_, AppState>,
 ) -> Result<OpenOutcome, String> {
-    // TODO(M4:) resolve action_ref -> connector; reconstruct + open (Critical
-    //   Path B); write SuggestionClicked{outcome} keyed by the bubble `id`
-    //   (doc 02 §5, doc 10). Return the OpenOutcome so the UI can honest-degrade.
-    todo!("M4: Critical Path B resume (<200ms); record suggestion_clicked{{outcome}}")
+    // M4: the connector registry (doc 10) resolves + validates-on-click
+    // (ADR-035) + dispatches. No connectors exist yet.
+    Err("bubble_click: connectors are the M4 milestone (doc 16)".into())
 }
 
 /// Build + redact the Context Payload for an intent and return the EXACT wire
@@ -80,77 +117,86 @@ pub async fn request_preview(
     _seed_action_ref: Option<String>,
     _state: State<'_, AppState>,
 ) -> Result<ContextPayload, String> {
-    // TODO(M7:) payload builder (doc 03 §4) -> redaction pipeline (doc 13 §5):
-    //   assemble items (seeded from seed_action_ref if present), cap event_trail
-    //   at 50, apply ordered redaction rules with hit counts, set transport_target
-    //   from settings. Return the wire object.
-    todo!("M7: build + redact the ContextPayload; preview==wire (doc 03 §4, doc 13 §5)")
+    // M7: payload builder (doc 03 §4) + redaction pipeline (doc 13 §5).
+    Err("request_preview: the reasoning gateway is the M7 milestone (doc 16)".into())
 }
 
 /// The ONLY setter of `ContextPayload::user_approved` (doc 15 §2(b), doc 11 §4).
-///
-/// Marks the previewed payload approved-for-send after the user clicks Send in
-/// the trust surface. The gateway refuses any payload this did not flip.
 #[tauri::command]
 pub async fn preview_set_approved(
     _payload_id: Uuid,
     _state: State<'_, AppState>,
 ) -> Result<(), String> {
-    // TODO(M7:) flip user_approved=true on the in-process payload keyed by
-    //   payload_id; this is the sole writer of that flag (doc 15 §2(b)).
-    todo!("M7: set user_approved=true (the ONLY setter, doc 15 §2(b))")
+    Err("preview_set_approved: the reasoning gateway is the M7 milestone (doc 16)".into())
 }
 
-/// The ONLY call that reaches the network (doc 15 §2(c), doc 13 §2).
-///
-/// Hands the already-approved payload to the reasoning gateway, which picks the
-/// first healthy transport, transmits the EXACT serialized bytes (SHA-256
-/// audit-logged as `cloud_send`, doc 03 §4 / doc 13 §3), and returns
-/// source-agnostic [`StructuredSuggestions`]. Rejects an unapproved payload.
+/// The ONLY call that reaches the network (doc 15 §2(c), doc 13 §2) — via the
+/// gateway, with an already-approved payload, SHA-256 audit-logged (M7).
 #[tauri::command]
 pub async fn preview_send(
     _payload: ContextPayload,
     _state: State<'_, AppState>,
 ) -> Result<StructuredSuggestions, String> {
-    // TODO(M7:) assert payload.user_approved (else reject); state.gateway.send(&payload).
-    //   The gateway is the sole network/Claude-CLI emitter (doc 13 §2) and the
-    //   sole consumer of an approved payload (doc 15 §2(c)). Hash-log the wire bytes.
-    todo!("M7: the ONLY network path — gateway.send on an approved payload (doc 13 §2)")
+    Err("preview_send: the reasoning gateway is the M7 milestone (doc 16)".into())
 }
 
-/// PTT key pressed (doc 07, Path C). Start WASAPI capture while held; surface the
-/// listening pill (doc 11 §5). STT runs later as a priority-100 GPU job (doc 12 §3).
+/// PTT key pressed (doc 07, Path C) — M6.
 #[tauri::command]
 pub async fn voice_ptt_down(_state: State<'_, AppState>) -> Result<(), String> {
-    // TODO(M6:) start voice capture (doc 07); emit_voice_surface(listening pill).
-    todo!("M6: PTT down -> start WASAPI capture, listening pill (doc 07, doc 11 §5)")
+    Err("voice_ptt_down: voice is the M6 milestone (doc 16)".into())
 }
 
-/// PTT key released (doc 07, Path C). Stop capture, VAD-trim, enqueue the STT job
-/// (priority 100, never cancellable, doc 12 §3); transcript -> answer surface.
+/// PTT key released (doc 07, Path C) — M6.
 #[tauri::command]
 pub async fn voice_ptt_up(_state: State<'_, AppState>) -> Result<(), String> {
-    // TODO(M6:) stop capture + VAD trim; STT GpuJob (priority STT_VOICE=100);
-    //   store voice_utterance; route query intent to retrieval (doc 07, doc 02 §6).
-    todo!("M6: PTT up -> STT job (priority 100) -> transcript/answer (doc 07)")
+    Err("voice_ptt_up: voice is the M6 milestone (doc 16)".into())
 }
 
-/// Read the current settings as opaque JSON (doc 13 §6). At runtime settings live
-/// inside the encrypted DB; this returns the merged effective view for the UI.
+/// Read the current settings as opaque JSON (doc 13 §6): the `settings` table's
+/// key/value rows, merged into one object. (First-run seeding from
+/// `config/settings.default.json` + the encrypted store land at M9.)
 #[tauri::command]
-pub async fn get_settings(_state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    // TODO(M0:) read settings from the encrypted DB (seeded from config/settings.default.json).
-    todo!("M0: return effective settings JSON (doc 13 §6)")
+pub async fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    state
+        .db
+        .with_conn(|c| {
+            let mut stmt = c.prepare("SELECT key, value FROM settings")?;
+            let mut obj = serde_json::Map::new();
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (k, v) = row?;
+                let parsed = serde_json::from_str(&v).unwrap_or(serde_json::Value::String(v));
+                obj.insert(k, parsed);
+            }
+            Ok(serde_json::Value::Object(obj))
+        })
+        .map_err(|e| e.to_string())
 }
 
-/// Persist settings (doc 13 §6). Some changes (e.g. loadout L1<->L2) are applied
-/// by orchestration on the next job; the shell only stores them.
+/// Persist settings (doc 13 §6): each top-level key of `patch` upserts one
+/// `settings` row. Some changes (e.g. loadout L1<->L2) are applied by
+/// orchestration on the next job; the shell only stores them.
 #[tauri::command]
 pub async fn set_settings(
-    _patch: serde_json::Value,
-    _state: State<'_, AppState>,
+    patch: serde_json::Value,
+    state: State<'_, AppState>,
 ) -> Result<(), String> {
-    // TODO(M0:) validate + persist settings into the encrypted DB; notify
-    //   orchestration of loadout/timer changes (doc 12 §7).
-    todo!("M0: persist settings to the encrypted DB (doc 13 §6)")
+    let serde_json::Value::Object(map) = patch else {
+        return Err("set_settings expects a JSON object".into());
+    };
+    state
+        .db
+        .with_conn(|c| {
+            for (k, v) in &map {
+                c.execute(
+                    "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    rusqlite::params![k, v.to_string()],
+                )?;
+            }
+            Ok(())
+        })
+        .map_err(|e| e.to_string())
 }

@@ -8,7 +8,7 @@
 //! 2. `SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)` => our own bubbles
 //!    never enter our own (or anyone's) capture (doc 11 §2, doc 05 §2).
 //! 3. Per-monitor instances, re-anchored on `WM_DPICHANGED` / display-change
-//!    (doc 11 §7). v1 ships primary-monitor-only; multi-monitor lands at M8.
+//!    (doc 11 §7). v1 ships primary-monitor-only (Q42); multi-monitor lands at M8.
 
 use tauri::{AppHandle, WebviewWindow};
 
@@ -37,49 +37,101 @@ pub enum OverlayError {
     Win32(String),
 }
 
-/// Create one overlay window per monitor at startup (doc 11 §2). Called from
-/// `main.rs` `setup`. In v1 this creates only the primary-monitor overlay; M8
-/// fans out to every monitor and wires display-change re-anchoring.
+/// Create one overlay window per monitor at startup (doc 11 §2). v1: the config
+/// window labeled `overlay` (primary monitor, Q42) already exists — `setup`
+/// hardens it directly; M8 fans out per-monitor and wires DPI re-anchoring.
 pub fn create_overlays(_app: &AppHandle) -> Result<Vec<WebviewWindow>, OverlayError> {
-    // TODO(M3:) primary-monitor overlay only (the config window labeled "overlay");
-    //   for each, call make_click_through + exclude_from_capture.
     // TODO(M8:) enumerate monitors (EnumDisplayMonitors), clone the overlay per
     //   monitor sized to that monitor's work area, and re-anchor on WM_DPICHANGED
     //   / display-change (doc 11 §7).
-    todo!("M3: create the primary overlay; M8: per-monitor + DPI re-anchor (doc 11 §2,§7)")
+    todo!("M8: per-monitor overlays + DPI re-anchor (doc 11 §2,§7)")
 }
 
 /// Apply `WS_EX_LAYERED | WS_EX_TRANSPARENT` so the window is click-through
 /// (doc 11 §2). With this set, all input falls through to the apps beneath;
 /// hit-testing is selectively restored by [`set_hit_test_rects`].
-pub fn make_click_through(_window: &WebviewWindow) -> Result<(), OverlayError> {
-    // TODO(M3:) hwnd = window.hwnd(); GetWindowLongPtrW(GWL_EXSTYLE) |=
-    //   WS_EX_LAYERED | WS_EX_TRANSPARENT; SetWindowLongPtrW back. (windows crate,
-    //   Win32_UI_WindowsAndMessaging.)
-    todo!("M3: set WS_EX_LAYERED|WS_EX_TRANSPARENT for click-through (doc 11 §2)")
+pub fn make_click_through(window: &WebviewWindow) -> Result<(), OverlayError> {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_LAYERED, WS_EX_TRANSPARENT,
+        };
+        let hwnd = window
+            .hwnd()
+            .map_err(|e| OverlayError::Win32(e.to_string()))?;
+        let hwnd = HWND(hwnd.0);
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let new_style = style | (WS_EX_LAYERED.0 as isize) | (WS_EX_TRANSPARENT.0 as isize);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = window;
+        Err(OverlayError::Win32("windows-only".into()))
+    }
 }
 
 /// `SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)` — keep our overlay
 /// out of all screen capture, including our own WGC sampler (doc 11 §2, doc 05 §2).
-pub fn exclude_from_capture(_window: &WebviewWindow) -> Result<(), OverlayError> {
-    // TODO(M3:) hwnd = window.hwnd(); SetWindowDisplayAffinity(hwnd,
-    //   WDA_EXCLUDEFROMCAPTURE). Verify the affinity took (some GPUs ignore it on
-    //   older drivers) and log if not (doc 11 §2).
-    todo!("M3: SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) (doc 11 §2, doc 05 §2)")
+pub fn exclude_from_capture(window: &WebviewWindow) -> Result<(), OverlayError> {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE,
+        };
+        let hwnd = window
+            .hwnd()
+            .map_err(|e| OverlayError::Win32(e.to_string()))?;
+        // Some GPUs/drivers ignore the affinity (doc 11 §2) — surface the error;
+        // the caller logs it and the truthful indicator remains the disclosure.
+        SetWindowDisplayAffinity(HWND(hwnd.0), WDA_EXCLUDEFROMCAPTURE)
+            .map_err(|e| OverlayError::Win32(e.to_string()))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = window;
+        Err(OverlayError::Win32("windows-only".into()))
+    }
 }
 
 /// Re-enable hit-testing ONLY over the given live bubble rects (doc 11 §2). With
 /// an empty slice the overlay is fully click-through. The §7 watchdog asserts the
 /// inverse: a hit-test region with no visible bubble resets to full click-through.
+///
+/// Window-level granularity: `WS_EX_TRANSPARENT` is toggled off while any bubble
+/// is live (the WebView's own CSS `pointer-events` gates per-rect input — the UI
+/// agent owns that half), and back on when none are.
 pub fn set_hit_test_rects(
-    _window: &WebviewWindow,
-    _rects: &[BubbleRect],
+    window: &WebviewWindow,
+    rects: &[BubbleRect],
 ) -> Result<(), OverlayError> {
-    // TODO(M3:) when rects is empty, keep WS_EX_TRANSPARENT (full click-through);
-    //   when non-empty, clear WS_EX_TRANSPARENT and let the WebView's own hit-test
-    //   (CSS pointer-events on bubble rects) gate input. The UI agent owns the
-    //   per-rect pointer-events; this fn flips the window-level transparency.
-    // TODO(M3:) watchdog: if rects empty but transparency cleared, force-reset
-    //   to full click-through (doc 11 §7 "click-through misconfiguration").
-    todo!("M3: gate input to live bubble rects; full click-through when empty (doc 11 §2,§7)")
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_TRANSPARENT,
+        };
+        let hwnd = window
+            .hwnd()
+            .map_err(|e| OverlayError::Win32(e.to_string()))?;
+        let hwnd = HWND(hwnd.0);
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let new_style = if rects.is_empty() {
+            style | (WS_EX_TRANSPARENT.0 as isize) // full click-through (watchdog reset)
+        } else {
+            style & !(WS_EX_TRANSPARENT.0 as isize) // bubbles live: WebView hit-tests
+        };
+        if new_style != style {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (window, rects);
+        Err(OverlayError::Win32("windows-only".into()))
+    }
 }

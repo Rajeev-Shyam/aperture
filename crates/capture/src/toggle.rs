@@ -34,6 +34,7 @@ use aperture_contracts::{Event, EventType};
 use aperture_event_bus::EventBus;
 
 use crate::hooks::HookThread;
+use crate::normalizer::EventStore;
 use crate::sampler::{epoch_ms, Sampler};
 use crate::CaptureError;
 
@@ -86,6 +87,9 @@ pub struct CaptureToggle {
     /// re-register after OFF released the previous one).
     hook_factory: Mutex<Box<dyn FnMut() -> Result<HookThread, CaptureError> + Send>>,
     bus: EventBus,
+    /// The durable store for the `capture_toggle` audit rows — these MUST
+    /// persist (they survive Purge All 30 d, doc 03 §6/doc 13 §7).
+    store: Mutex<Option<Arc<dyn EventStore>>>,
 }
 
 impl CaptureToggle {
@@ -102,7 +106,13 @@ impl CaptureToggle {
             hooks: Mutex::new(None),
             hook_factory: Mutex::new(hook_factory),
             bus,
+            store: Mutex::new(None),
         }
+    }
+
+    /// Attach the durable store for audit rows (doc 13 §7). Wired by the shell.
+    pub fn set_store(&self, store: Arc<dyn EventStore>) {
+        *self.store.lock().expect("store lock") = Some(store);
     }
 
     /// Current observed state (doc 05 §5).
@@ -173,10 +183,11 @@ impl CaptureToggle {
         }
     }
 
-    /// Emit the `capture_toggle` audit event (doc 05 §5 step 6; doc 12 §6).
-    /// This audit row survives Purge All for 30 d (doc 03 §6).
+    /// Emit the `capture_toggle` audit event (doc 05 §5 step 6; doc 12 §6):
+    /// persisted first (the audit row survives Purge All 30 d, doc 03 §6),
+    /// then notified on the bus.
     fn emit_toggle_event(&self, on: bool) {
-        let ev = Event {
+        let mut ev = Event {
             id: 0,
             ts: epoch_ms(),
             r#type: EventType::CaptureToggle,
@@ -188,6 +199,11 @@ impl CaptureToggle {
             session_id: None,
             redaction_flags: 0,
         };
+        if let Some(store) = self.store.lock().expect("store lock").as_ref() {
+            if let Some(id) = store.persist(&ev) {
+                ev.id = id;
+            }
+        }
         let _ = self.bus.publish(ev);
     }
 }

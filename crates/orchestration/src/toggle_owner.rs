@@ -61,30 +61,36 @@ impl ToggleOwner {
     }
 
     /// Turn capture **ON** lazily: flip state + broadcast so hooks and the WGC
-    /// sampler come up immediately; sidecars stay down until first demanded
-    /// (doc 12 §6).
+    /// sampler come up immediately (the capture subsystem reacts to the
+    /// broadcast and runs its STARTING path, incl. the `capture_toggle{on}`
+    /// audit row — doc 05 §5); sidecars stay down until first demanded
+    /// (doc 12 §6). This struct is the single writer of the state.
     pub async fn turn_on(&mut self) {
-        // TODO(M1:) set state=On; broadcast On; write a capture_toggle{on} audit
-        //   event (doc 12 §1 outputs). Do NOT spawn sidecars here (lazy, doc 12 §6).
-        todo!("M1: ON reverses lazily — hooks/sampler up now, sidecars on demand (doc 12 §6)")
+        if self.state == CaptureState::On {
+            return; // idempotent
+        }
+        self.state = CaptureState::On;
+        let _ = self.state_tx.send(CaptureState::On); // readers react (doc 02 §7)
     }
 
-    /// Turn capture **OFF** — the 6-step release sequence under the 3 s SLA
-    /// (doc 12 §6). The watchdog samples VRAM at the end; an SLA breach is logged
-    /// and surfaced once.
+    /// Turn capture **OFF** — the doc 12 §6 release sequence under the 3 s SLA.
+    ///
+    /// Step map: (1) flip + broadcast here (single writer); (2) the capture
+    /// subsystem reacts with its release steps incl. the `capture_toggle{off}`
+    /// audit row (doc 05 §5); (3) scheduler cancel + (4) sidecar kill are wired
+    /// when the GPU stack exists (M5 — no sidecar can be resident before then,
+    /// so "sidecars dead" holds vacuously at M1); (5) the indicator is the
+    /// shell's reaction to this broadcast; (6) the on-target VRAM watchdog
+    /// lands with the M5 telemetry.
     pub async fn turn_off(&mut self) {
-        // TODO(M1:) execute, racing the whole thing against OFF_SLA (doc 12 §6):
-        //   1. flip state -> Off; broadcast capture_off (this struct is the single writer).
-        //   2. Capture subsystem runs its release steps (doc 05 §5) — it reacts to the broadcast.
-        //   3. scheduler.cancel_all_for_off(): cancel queued; RUNNING_JOB_GRACE (1 s) for the
-        //      running job's cancel point, else proceed (a running STT is uncancellable).
-        //   4. lifecycle.kill_all_sidecars(): kill BOTH — no graceful drain, the SLA wins
-        //      (process death = guaranteed VRAM release, invariant 3).
-        //   5. flip the indicator (tray + overlay dot); write capture_toggle{off} audit event
-        //      (survives Purge All 30 d, doc 13).
-        //   6. watchdog samples nvidia-smi-equivalent; if release took > OFF_SLA ->
-        //      telemetry.record_toggle_sla_breach() + surface once (doc 12 §6, doc 04 §9).
-        todo!("M1: 6-step toggle-OFF, VRAM->~0 in < 3 s (doc 12 §6, SC6)")
+        if self.state == CaptureState::Off {
+            return; // idempotent
+        }
+        self.state = CaptureState::Off;
+        let _ = self.state_tx.send(CaptureState::Off);
+        // TODO(M5): scheduler.cancel_all_for_off() with RUNNING_JOB_GRACE, then
+        //   lifecycle.kill_all_sidecars() (process death = guaranteed VRAM
+        //   release, invariant 3) + the telemetry SLA watchdog (doc 12 §6).
     }
 
     /// L1<->L2 settings flip mid-session: treated as "unload all -> admit the

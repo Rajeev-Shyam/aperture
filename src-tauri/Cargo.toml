@@ -56,6 +56,16 @@ windows = { version = "0.58", features = [
     "Win32_UI_HiDpi",                 # WM_DPICHANGED re-anchoring (doc 11 §7)
 ] }  # [VERIFY] at build time
 
+# Required by the shell's DB reads (list_suggestions / settings / pipeline).
+[dependencies.rusqlite]
+workspace = true
+
 # Tauri build script dependency (generates context, embeds the config + icons).
 [build-dependencies]
 tauri-build = { version = "2", features = [] }  # [VERIFY] at build time
+
+[features]
+default = []
+# Opt-in real embedding backend (downloads ~250 MB on first run — see
+# crates/embedding). Enable with: cargo build -p aperture --features nomic
+nomic = ["aperture-embedding/nomic"]
