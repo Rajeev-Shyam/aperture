@@ -104,10 +104,18 @@ export function BubbleContainer({ onAskClaude }: Props) {
   }
 
   function onResume(b: BubbleInstance) {
-    // Core resolves action_ref -> connector -> open (M4). The durable
-    // clicked-state + engine reinforcement go through record_feedback (the
-    // M4 bubble_click impl should not double-record).
-    void bubbleClick(b.id, b.spec.action_ref);
+    // Core resolves action_ref -> connector -> open (Critical Path B, M4).
+    // The durable clicked-state + engine reinforcement go through
+    // record_feedback (bubble_click owns only the outcome column).
+    // TODO(M4-followup): swap to fallback copy in-bubble on a Failed outcome
+    // (doc 10 §6) instead of logging — lands with the thumbs/drag UI pass.
+    bubbleClick(b.id, b.spec.action_ref)
+      .then((outcome) => {
+        if (outcome !== "Resumed") {
+          console.warn("resume degraded/failed (doc 10 §6):", outcome);
+        }
+      })
+      .catch((e) => console.error("bubble_click failed:", e));
     void recordFeedback(b.id, "clicked");
     applyLifecycle(b.id, "clicked");
   }

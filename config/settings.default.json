@@ -69,6 +69,19 @@
     "messages_api_beta_headers": []
   },
 
+  "connectors": {
+    "$comment": "Per-connector staleness TTLs (doc 10, [ASSUMPTION] values). Code carries these as constants until the M9 settings-load pass wires overrides; kept here so the tunables are visible in one place.",
+    "browser_ttl_hours": 24,
+    "youtube_ttl_days": 7,
+    "document_ttl_days": 7,
+    "ide_ttl_days": 7,
+    "$comment_extension": "Browser extension feed (ADR-027/028): native messaging (stdio + named pipe), no sockets. Toggle OFF halts forwarding (FIX 2.1); extension URLs run the same exclusion pipeline (FIX 2.2).",
+    "extension_bridge_enabled": true,
+    "$comment_media": "media_state coalescing [ASSUMPTION]: publish on video/state change, >=15 s position delta, or 30 s silence; pause/hidden always report exactly.",
+    "media_min_position_delta_s": 15,
+    "media_max_silence_ms": 30000
+  },
+
   "privacy": {
     "exclusion_defaults": [],
     "$comment_exclusions": "Defaults ship EMPTY (ADR-029/Q15): onboarding detects password managers/banking and SUGGESTS exclusions — the user confirms; nothing is ever auto-excluded.",

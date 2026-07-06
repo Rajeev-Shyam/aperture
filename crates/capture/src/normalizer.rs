@@ -38,6 +38,14 @@ pub trait EventStore: Send + Sync {
     fn persist(&self, ev: &Event) -> Option<i64>;
 }
 
+/// The extension-primary URL seam (ADR-027): implemented by
+/// [`crate::nm_bridge::NmBridge`]. `Some` = a live extension feed covers this
+/// browser process and this is its freshest active-tab URL; `None` = fall back
+/// to the UIA address-bar read (the demoted RK4 path).
+pub trait ExtensionUrlSource: Send + Sync {
+    fn current_url(&self, process: &str) -> Option<String>;
+}
+
 /// Turns raw hook/sample signals into normalized bus [`Event`]s (doc 05 §6).
 /// Holds the store seam, the bus sender, the exclusion list, and the browser
 /// address-bar hints.
@@ -49,6 +57,9 @@ pub struct Normalizer {
     store: Option<Arc<dyn EventStore>>,
     /// Last successfully read URL per browser hwnd (RK4: fall back to last-known).
     last_urls: std::sync::Mutex<std::collections::HashMap<isize, String>>,
+    /// Extension-primary URL source (ADR-027); wired post-construction by the
+    /// composition root. `None` / a `None` answer ⇒ UIA fallback.
+    extension: std::sync::Mutex<Option<Arc<dyn ExtensionUrlSource>>>,
 }
 
 /// What the normalizer decided for one hook event — the pipeline uses this to
@@ -77,7 +88,15 @@ impl Normalizer {
             hints: AddressBarHints::default(),
             store: None,
             last_urls: Default::default(),
+            extension: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Wire the extension-primary URL source (ADR-027). Post-construction
+    /// because the bridge and the normalizer are built by different parts of
+    /// the composition root.
+    pub fn set_extension_source(&self, src: Arc<dyn ExtensionUrlSource>) {
+        *self.extension.lock().expect("extension lock") = Some(src);
     }
 
     /// Attach the durable store (doc 15 §1). The shell wires `aperture_db::Db`
@@ -140,7 +159,7 @@ impl Normalizer {
         {
             if let Some(process) = identity.process.as_deref() {
                 if uia::is_browser_process(process, &self.hints) {
-                    url = self.resolve_url(hwnd);
+                    url = self.resolve_url(hwnd, process);
                     if let Some(u) = url.as_deref() {
                         verdict = self.apply_exclusion(&mut primary, class.as_deref(), Some(u));
                     }
@@ -169,11 +188,23 @@ impl Normalizer {
         out
     }
 
-    /// Resolve the current URL for a browser hwnd (doc 05 §3). RK4 semantics:
-    /// `Unavailable` falls back to the last-known URL for this hwnd; no known
-    /// URL ⇒ `None` (never fabricate). Feeds both exclusion verdicts and the
-    /// `navigation` event.
-    fn resolve_url(&self, hwnd: isize) -> Option<String> {
+    /// Resolve the current URL for a browser hwnd (doc 05 §3, R2 hierarchy):
+    /// **extension feed first** (ADR-027 — tabs-API URL relayed over native
+    /// messaging), then the UIA read (the demoted RK4 fallback), then the
+    /// last-known URL for this hwnd; no known URL ⇒ `None` (never fabricate).
+    /// Feeds both exclusion verdicts and the `navigation` event.
+    fn resolve_url(&self, hwnd: isize, process: &str) -> Option<String> {
+        if let Some(ext) = self.extension.lock().expect("extension lock").as_ref() {
+            if let Some(u) = ext.current_url(process) {
+                // Keep the hwnd cache warm so an extension outage degrades to
+                // last-known rather than nothing (doc 05 §7).
+                self.last_urls
+                    .lock()
+                    .expect("url cache lock")
+                    .insert(hwnd, u.clone());
+                return Some(u);
+            }
+        }
         match uia::read_address_bar(hwnd, &self.hints) {
             AddressBarRead::Url(u) => {
                 self.last_urls
@@ -218,6 +249,71 @@ impl Normalizer {
             url: Some(url),
             event: ev,
         }
+    }
+
+    /// Extension-fed navigation (ADR-027): same exclusion + persist-then-publish
+    /// path as the UIA-sourced one (FIX 2.2). `brand` is the extension's browser
+    /// id (`"chrome" | "opera" | …`); identity is synthesized from it so process
+    /// exclusion rules match exactly as they do for hook-driven events.
+    pub fn extension_navigation(
+        &self,
+        brand: &str,
+        url: String,
+        title: Option<String>,
+        now_ms: i64,
+    ) -> Normalized {
+        let identity = WindowIdentity {
+            app: Some(brand.to_string()),
+            process: Some(crate::nm_bridge::process_for_brand(brand)),
+            window_title: title,
+            window_class: None,
+        };
+        let mut nav = self.navigation_event(url, &identity, now_ms);
+        nav.event = self.commit(nav.event); // persist THEN notify (doc 15 §1)
+        nav
+    }
+
+    /// Extension-fed media state (ADR-027, doc 03 §2 `media_state`): the
+    /// YouTube position feed. An excluded URL drops the event entirely — the
+    /// page visit was already recorded metadata-only by its navigation event,
+    /// and position ticks for an excluded page are pure leak surface (FIX 2.2).
+    #[allow(clippy::too_many_arguments)]
+    pub fn extension_media(
+        &self,
+        brand: &str,
+        url: Option<String>,
+        video_id: String,
+        position_s: Option<f64>,
+        state: Option<String>,
+        title: Option<String>,
+        now_ms: i64,
+    ) -> Option<Event> {
+        let identity = WindowIdentity {
+            app: Some(brand.to_string()),
+            process: Some(crate::nm_bridge::process_for_brand(brand)),
+            window_title: title.clone(),
+            window_class: None,
+        };
+        let mut payload = serde_json::json!({
+            "video_id": video_id,
+            "state": state,
+            "browser": brand,
+        });
+        if let Some(u) = &url {
+            payload["url"] = serde_json::json!(u);
+        }
+        if let Some(p) = position_s {
+            payload["position_s"] = serde_json::json!(p);
+        }
+        if let Some(t) = &title {
+            payload["title"] = serde_json::json!(t);
+        }
+        let mut ev = self.build_event(EventType::MediaState, &identity, payload, now_ms);
+        let verdict = self.apply_exclusion(&mut ev, None, url.as_deref());
+        if verdict.is_excluded() {
+            return None;
+        }
+        Some(self.commit(ev))
     }
 
     /// Build a normalized [`Event`] with identity attached. `id` is `0` on the

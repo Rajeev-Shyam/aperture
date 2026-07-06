@@ -1,0 +1,10 @@
+{
+  "name": "com.aperture.bridge",
+  "description": "Aperture native-messaging host (ADR-028): stdio bridge between the Capture Bridge extension and the local Aperture core. No sockets.",
+  "path": "{{NM_HOST_EXE_ABSOLUTE_PATH}}",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://{{CHROME_EXTENSION_ID}}/",
+    "chrome-extension://{{OPERA_EXTENSION_ID}}/"
+  ]
+}

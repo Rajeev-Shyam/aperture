@@ -11,17 +11,24 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# ConnectorState row ids (doc 03 `connector_state.id` is a uuid).
+uuid = { workspace = true }
 
 # URL parsing for the YouTube `v=`/`t=` and browser-URL connectors (doc 10 §2-3).
-url = "2"  # [VERIFY] at build time
+url = "2"  # [VERIFY resolved — compiles clean on 2.x]
 
-# Win32 Shell dispatch (ShellExecuteW) for Path B resumption, plus UIA for the
-# browser/IDE capture heuristics (doc 10 §2, §5; doc 02 §5). [VERIFY] feature set
-# + exact version at build time.
+# Read-only access to VS Code's own `state.vscdb` for the workspace-MRU path
+# resolution (Q56 spike decision, doc 10 §5). Local file read only — no network.
+rusqlite = { workspace = true }
+
+# Win32 Shell dispatch (ShellExecuteW) for Path B resumption (doc 02 §5), COM
+# shell-link resolution for the Recent-Items ladder rung (doc 10 §4).
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Accessibility",
-] }  # [VERIFY] at build time
+    "Win32_System_Com",
+    "Win32_Storage_FileSystem",
+] }

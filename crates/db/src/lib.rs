@@ -239,6 +239,111 @@ impl Db {
     }
 
     // ---------------------------------------------------------------------
+    // Connector state (doc 03 §3, doc 10 §1) — the M4 resumable-handle store
+    // ---------------------------------------------------------------------
+
+    /// Insert one `connector_state` row (Path A step 4, doc 02 §4). The id is
+    /// connector-assigned (uuid) — never generated here.
+    pub fn insert_connector_state(
+        &self,
+        st: &aperture_contracts::ConnectorState,
+    ) -> Result<(), DbError> {
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT INTO connector_state \
+                 (id, connector_type, reconstruct_payload, payload_version, captured_ts, stale_after_ts) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    st.id,
+                    st.connector_type,
+                    st.reconstruct_payload.to_string(),
+                    st.payload_version,
+                    st.captured_ts,
+                    st.stale_after_ts,
+                ],
+            )
+            .map(|_| ())
+        })
+    }
+
+    /// Refresh an existing row in place (the pipeline's coalescing path: same
+    /// resource re-observed ⇒ freshest payload/position wins, doc 10 §3).
+    /// Returns `false` when the row no longer exists (pruned) — insert instead.
+    pub fn refresh_connector_state(
+        &self,
+        id: &str,
+        reconstruct_payload: &serde_json::Value,
+        captured_ts: i64,
+        stale_after_ts: Option<i64>,
+    ) -> Result<bool, DbError> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE connector_state SET reconstruct_payload = ?2, captured_ts = ?3, stale_after_ts = ?4 \
+                 WHERE id = ?1",
+                rusqlite::params![id, reconstruct_payload.to_string(), captured_ts, stale_after_ts],
+            )
+            .map(|n| n > 0)
+        })
+    }
+
+    /// Load one `connector_state` row (Path B step 2, doc 02 §5).
+    pub fn read_connector_state(
+        &self,
+        id: &str,
+    ) -> Result<Option<aperture_contracts::ConnectorState>, DbError> {
+        self.with_conn(|c| {
+            c.query_row(
+                "SELECT id, connector_type, reconstruct_payload, payload_version, captured_ts, stale_after_ts \
+                 FROM connector_state WHERE id = ?1",
+                [id],
+                row_to_connector_state,
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })
+        })
+    }
+
+    /// The freshest non-stale states of one type, newest first (pattern-engine
+    /// trigger rule 3, doc 08 §6: "a fresh, resumable connector_state exists
+    /// for the consequent"). `limit` small — the caller may post-filter (e.g.
+    /// match a `doc:xlsx` token to a `.xlsx` payload path).
+    pub fn fresh_connector_states(
+        &self,
+        connector_type: &str,
+        now_ms: i64,
+        limit: u32,
+    ) -> Result<Vec<aperture_contracts::ConnectorState>, DbError> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, connector_type, reconstruct_payload, payload_version, captured_ts, stale_after_ts \
+                 FROM connector_state \
+                 WHERE connector_type = ?1 AND (stale_after_ts IS NULL OR stale_after_ts > ?2) \
+                 ORDER BY captured_ts DESC LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![connector_type, now_ms, limit],
+                row_to_connector_state,
+            )?;
+            rows.collect()
+        })
+    }
+
+    /// Stamp `events.connector_id` after a capture (doc 03 §3: the event row
+    /// references the resumable handle it produced).
+    pub fn set_event_connector(&self, event_id: i64, connector_id: &str) -> Result<(), DbError> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE events SET connector_id = ?2 WHERE id = ?1",
+                rusqlite::params![event_id, connector_id],
+            )
+            .map(|_| ())
+        })
+    }
+
+    // ---------------------------------------------------------------------
     // Retrieval (doc 03 §5) — KNN + join + filter
     // ---------------------------------------------------------------------
 
@@ -330,6 +435,22 @@ fn insert_event_tx(conn: &Connection, ev: &Event) -> Result<(), DbError> {
 }
 
 /// Map a DB row (in `read_event` column order) back into a typed [`Event`].
+fn row_to_connector_state(
+    row: &rusqlite::Row<'_>,
+) -> Result<aperture_contracts::ConnectorState, rusqlite::Error> {
+    let payload_text: String = row.get(2)?;
+    Ok(aperture_contracts::ConnectorState {
+        id: row.get(0)?,
+        connector_type: row.get(1)?,
+        reconstruct_payload: serde_json::from_str(&payload_text).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+        })?,
+        payload_version: row.get(3)?,
+        captured_ts: row.get(4)?,
+        stale_after_ts: row.get(5)?,
+    })
+}
+
 fn row_to_event(row: &rusqlite::Row<'_>) -> Result<Event, rusqlite::Error> {
     let type_text: String = row.get(2)?;
     let payload_text: String = row.get(6)?;

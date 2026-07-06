@@ -56,12 +56,18 @@ pub struct AppState {
     /// `i64::MAX` = until re-enabled. Written by `set_snooze`; read by the
     /// pattern task's emit gate and `list_suggestions`.
     pub snooze_until: Arc<std::sync::atomic::AtomicI64>,
+
+    /// The connector registry (doc 10 §1, M4): read by `bubble_click`
+    /// (Path B resolve → reconstruct → open) and the connector-capture task.
+    /// Only connectors act (ADR-035) — commands never dispatch directly.
+    pub connectors: Arc<aperture_connectors::ConnectorRegistry>,
     // gateway: wired at M7 (doc 09) — the ONLY field that may reach the network.
 }
 
 impl AppState {
     /// Assemble the handle bag at startup (doc 16 M0). Called from `main.rs`
     /// after the bus, DB, orchestration, and capture subsystem exist.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         bus: EventBus,
         db: Arc<Db>,
@@ -72,7 +78,8 @@ impl AppState {
             aperture_pattern_engine::FeedbackEvent,
         )>,
         snooze_until: Arc<std::sync::atomic::AtomicI64>,
+        connectors: Arc<aperture_connectors::ConnectorRegistry>,
     ) -> Self {
-        Self { bus, db, capture, orchestration, feedback_tx, snooze_until }
+        Self { bus, db, capture, orchestration, feedback_tx, snooze_until, connectors }
     }
 }

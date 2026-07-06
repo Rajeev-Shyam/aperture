@@ -11,7 +11,10 @@ aperture-event-bus = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+# Per-install native-messaging auth token (ADR-028 defense-in-depth).
+uuid = { workspace = true }
 # Exclusion title/url regexes (doc 05 §4, ADR-040). [VERIFY resolved — Step 0: regex 1.x]
 regex = "1"
 
@@ -42,8 +45,17 @@ windows = { version = "0.58", features = [
     "Win32_System_WinRT",
     "Win32_System_WinRT_Graphics_Capture",
     "Win32_System_WinRT_Direct3D11",
+    "Win32_System_Registry",
+    "Win32_Security",
     "Win32_Foundation",
 ] }  # [VERIFY] at build time — feature paths/version may shift across `windows` releases.
+
+# The native-messaging host (ADR-027/028): stdio bridge between the browser
+# extension and the core's named pipe. Ships with the app; registered per
+# browser via `aperture-nm-host install` (extension/README.md).
+[[bin]]
+name = "aperture-nm-host"
+path = "src/bin/aperture_nm_host.rs"
 
 [lints.clippy]
 # Invariant (2): the transparency gate. Only `reasoning-gateway` may open network

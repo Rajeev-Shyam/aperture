@@ -36,9 +36,10 @@ impl ConnectorRegistry {
         let id = connector.id();
         if self.by_id.insert(id, connector).is_none() {
             self.order.push(id);
+        } else {
+            tracing::debug!(connector_id = id, "connector re-registered (replaced)");
         }
-        // TODO(M4): emit a tracing span recording the registered id for the
-        // startup audit (doc 12 §3).
+        tracing::debug!(connector_id = id, "connector registered");
     }
 
     /// Lookup by `connector_id` — Path B step 1 (doc 02 §5). The Bubble UI
@@ -62,8 +63,8 @@ impl ConnectorRegistry {
     /// Path A step 4 (doc 02 §5): find the first connector that claims this event
     /// and snapshot its resumable handle. Order matters — the most specific
     /// connector (YouTube) is registered ahead of the generic browser one.
-    // TODO(M4): hook into the Tier-0 capture pipeline so the returned state is
-    // written as a `connector_state` row (~10 ms budget, doc 02 §4).
+    /// The Tier-0 pipeline (src-tauri `spawn_connector_task`) persists the
+    /// returned state as a `connector_state` row (~10 ms budget, doc 02 §4).
     pub fn capture(&self, ev: &Event) -> Option<ConnectorState> {
         for id in &self.order {
             let connector = self.by_id.get(id)?;

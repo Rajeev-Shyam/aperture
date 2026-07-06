@@ -19,6 +19,11 @@ aperture-db = { workspace = true }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
 
+# M4 gate (m4_us1_resume): the real connectors + the bubble renderer, driven
+# offline over synthetic events. CPU-only, no network — the gate stays honest.
+aperture-connectors = { workspace = true }
+aperture-suggestion-generator = { workspace = true }
+
 # NOTE (doc 16 M0): no extra dev-dependencies. The gate tests deliberately avoid a
 # network/HTTP/process-spawn crate — pulling one in here would itself violate the
 # two-emitter rule (doc 13 §2) that these very gates exist to protect. The SC5/SC6

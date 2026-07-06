@@ -32,7 +32,7 @@ use aperture_contracts::{BubbleSpec, ConnectorState, SuggestionCandidate};
 /// `now_ms` feeds the "·2h ago" age; `confidence` passes through (doc 08 §5).
 pub fn render(candidate: &SuggestionCandidate, state: &ConnectorState, now_ms: i64) -> BubbleSpec {
     let payload = &state.reconstruct_payload;
-    let title = expand_template(&candidate.action_template, payload);
+    let title = expand_template(&candidate.action_template, payload, &state.connector_type);
 
     let position = payload
         .get("position_s")
@@ -41,6 +41,9 @@ pub fn render(candidate: &SuggestionCandidate, state: &ConnectorState, now_ms: i
     let age = fmt_age(now_ms.saturating_sub(state.captured_ts));
     let sublabel = match position {
         Some(p) => Some(format!("{p} · {age}")),
+        // US1 acceptance d (doc 10 §3): an unknown video position is stated,
+        // not hidden — the honest degrade is part of the copy.
+        None if state.connector_type == "youtube" => Some(format!("from the start · {age}")),
         None => Some(age),
     };
 
@@ -57,7 +60,7 @@ pub fn render(candidate: &SuggestionCandidate, state: &ConnectorState, now_ms: i
 /// Expand `{placeholder}`s from the connector's versioned `reconstruct_payload`
 /// (doc 10 per-type schemas). A missing placeholder falls back to a sensible
 /// literal so the bubble never renders raw braces (graceful degrade, doc 10 §6).
-fn expand_template(template: &str, payload: &serde_json::Value) -> String {
+fn expand_template(template: &str, payload: &serde_json::Value, connector_type: &str) -> String {
     let mut out = String::with_capacity(template.len() + 16);
     let mut rest = template;
     while let Some(start) = rest.find('{') {
@@ -66,7 +69,7 @@ fn expand_template(template: &str, payload: &serde_json::Value) -> String {
         match after.find('}') {
             Some(end) => {
                 let key = &after[..end];
-                out.push_str(&resolve_placeholder(key, payload));
+                out.push_str(&resolve_placeholder(key, payload, connector_type));
                 rest = &after[end + 1..];
             }
             None => {
@@ -84,7 +87,7 @@ fn expand_template(template: &str, payload: &serde_json::Value) -> String {
 /// Resolve one placeholder against the payload (doc 10 v1 schemas):
 /// `{title}` → title | file name | video id | url host; `{position}` → `mm:ss`;
 /// `{line}` → line number.
-fn resolve_placeholder(key: &str, payload: &serde_json::Value) -> String {
+fn resolve_placeholder(key: &str, payload: &serde_json::Value, connector_type: &str) -> String {
     let str_field = |k: &str| payload.get(k).and_then(|v| v.as_str()).map(str::to_string);
     match key {
         "title" => str_field("title")
@@ -96,7 +99,15 @@ fn resolve_placeholder(key: &str, payload: &serde_json::Value) -> String {
             .get("position_s")
             .and_then(|v| v.as_i64())
             .map(fmt_position)
-            .unwrap_or_default(), // honest degrade: no position → "from the start" copy is the connector's job (doc 10 §3)
+            // US1 acceptance d (doc 10 §3): a video with no captured position
+            // says so honestly — "from the start", never a fabricated number.
+            .unwrap_or_else(|| {
+                if connector_type == "youtube" {
+                    "from the start".to_string()
+                } else {
+                    String::new()
+                }
+            }),
         "line" => payload
             .get("line")
             .and_then(|v| v.as_i64())
@@ -202,11 +213,27 @@ mod tests {
     }
 
     #[test]
-    fn missing_position_degrades_honestly() {
+    fn missing_position_says_from_the_start() {
+        // US1 acceptance d (doc 10 §3): the degrade is stated, not hidden.
         let mut st = yt_state();
         st.reconstruct_payload = serde_json::json!({"title": "A video"});
         let spec = render(&candidate("Continue {title} — {position}"), &st, 60_000);
-        assert_eq!(spec.title, "Continue A video", "no dangling separator");
+        assert_eq!(spec.title, "Continue A video — from the start");
+        assert_eq!(spec.sublabel.as_deref(), Some("from the start · 1m ago"));
+    }
+
+    #[test]
+    fn missing_position_on_non_youtube_drops_the_separator() {
+        let st = ConnectorState {
+            id: "c3".into(),
+            connector_type: "browser".into(),
+            reconstruct_payload: serde_json::json!({"title": "A page", "url": "https://x.example/p"}),
+            payload_version: 1,
+            captured_ts: 0,
+            stale_after_ts: None,
+        };
+        let spec = render(&candidate("Return to {title} — {position}"), &st, 60_000);
+        assert_eq!(spec.title, "Return to A page", "no dangling separator");
         assert_eq!(spec.sublabel.as_deref(), Some("1m ago"));
     }
 

@@ -32,12 +32,20 @@ pub enum ValidationError {
 
 /// Resolves a `connector_type` string to its [`Connector`] for re-validation
 /// (doc 10 §1). Backed by the connector registry; abstracted here so the
-/// validator does not depend on the concrete registry type. // TODO(M4:) impl on
-/// the `aperture_connectors` registry.
+/// validator's *callers* can fake it in tests.
 pub trait ConnectorLookup {
     /// Return the connector whose [`Connector::id`] equals `connector_type`, or
     /// `None` for unknown / `"none"` types.
     fn by_type(&self, connector_type: &str) -> Option<&dyn Connector>;
+}
+
+/// The real registry satisfies the lookup directly (M4). The gateway depending
+/// on `aperture-connectors` is the sanctioned direction: the cloud can only
+/// *suggest*; connectors — reached through this seam — are the only actors.
+impl ConnectorLookup for aperture_connectors::ConnectorRegistry {
+    fn by_type(&self, connector_type: &str) -> Option<&dyn Connector> {
+        aperture_connectors::ConnectorRegistry::by_type(self, connector_type)
+    }
 }
 
 /// Schema-check a raw cloud response and re-validate each suggestion against its

@@ -19,6 +19,7 @@
 
 pub mod exclusion;
 pub mod hooks;
+pub mod nm_bridge;
 pub mod normalizer;
 pub mod phash;
 pub mod sampler;
@@ -121,6 +122,10 @@ pub struct CaptureSubsystem {
     sampler: Arc<Sampler>,
     toggle: Arc<CaptureToggle>,
     normalizer: Arc<Normalizer>,
+    /// The native-messaging bridge state (ADR-027/028): the extension-primary
+    /// URL source, toggle-governed (FIX 2.1). Inert until
+    /// [`CaptureSubsystem::spawn_nm_server`] starts the pipe server.
+    nm_bridge: Arc<nm_bridge::NmBridge>,
     /// The most recent foreground context — identity + browser URL (heartbeat
     /// samples re-use it; the URL feeds the `url_pattern` gate, FIX 2.2).
     foreground: Arc<Mutex<ForegroundContext>>,
@@ -156,6 +161,13 @@ impl CaptureSubsystem {
         let normalizer = Arc::new(norm);
         let foreground = Arc::new(Mutex::new(ForegroundContext::default()));
 
+        // Native-messaging bridge (ADR-027/028): the extension-primary URL
+        // source. Constructed inert; the composition root spawns the pipe
+        // server via `spawn_nm_server`. The normalizer consults it first for
+        // browser URLs; the toggle governs its forwarding gate (FIX 2.1).
+        let bridge = nm_bridge::NmBridge::new(nm_bridge::NmBridgeConfig::default());
+        normalizer.set_extension_source(Arc::clone(&bridge) as Arc<dyn normalizer::ExtensionUrlSource>);
+
         // The hook→pipeline channel: std mpsc out of the C callback, bridged to
         // tokio by a blocking drain task spawned in `start`.
         let (hook_tx, hook_rx) = std::sync::mpsc::channel::<HookEvent>();
@@ -169,10 +181,12 @@ impl CaptureSubsystem {
         if let Some(s) = &store {
             toggle.set_store(Arc::clone(s)); // audit rows must persist (doc 13 §7)
         }
+        toggle.set_nm_bridge(Arc::clone(&bridge)); // FIX 2.1: OFF halts forwarding
         let subsystem = Arc::new(Self {
             sampler: Arc::clone(&sampler),
             toggle,
             normalizer,
+            nm_bridge: bridge,
             foreground,
             identity_cache: Mutex::new(HashMap::new()),
             tasks: Mutex::new(Vec::new()),
@@ -274,6 +288,26 @@ impl CaptureSubsystem {
     /// orchestration's ToggleOwner).
     pub fn state(&self) -> toggle::CaptureState {
         self.toggle.state()
+    }
+
+    /// Spawn the native-messaging pipe server (ADR-028): accepts connections
+    /// from `aperture-nm-host` processes (one per running browser) and pumps
+    /// authenticated extension messages through the normalizer. Called once by
+    /// the composition root, inside the tokio runtime. The task is tracked and
+    /// aborted on drop.
+    #[cfg(windows)]
+    pub fn spawn_nm_server(&self) {
+        let handle = nm_bridge::spawn_server(
+            Arc::clone(&self.nm_bridge),
+            Arc::clone(&self.normalizer),
+            Arc::clone(&self.foreground),
+        );
+        self.tasks.lock().expect("tasks lock").push(handle);
+    }
+
+    /// The bridge state (diagnostics + tests: forwarding gate, URL cache).
+    pub fn nm_bridge(&self) -> &Arc<nm_bridge::NmBridge> {
+        &self.nm_bridge
     }
 
     /// pHash-gate + delivery counters (M2 tuning telemetry).
