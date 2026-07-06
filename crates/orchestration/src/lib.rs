@@ -27,10 +27,14 @@ pub mod vram_table;
 use std::sync::Arc;
 
 use aperture_contracts::{GpuJob, GpuScheduler as GpuSchedulerContract, JobError, JobOutput};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex as TokioMutex};
 
-use crate::gpu_scheduler::GpuScheduler;
+use crate::budget_enforcer::BudgetEnforcer;
+use crate::gpu_scheduler::{GpuScheduler, JobRunner, SidecarRunner};
+use crate::model_lifecycle::ModelLifecycle;
+use crate::telemetry::Telemetry;
 use crate::toggle_owner::ToggleOwner;
+use crate::vram_table::VramTable;
 
 /// Which sanctioned loadout is active (doc 04 §3). No third loadout exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,24 +61,96 @@ impl Default for Loadout {
 pub struct OrchestratedSystem {
     scheduler: Arc<GpuScheduler>,
     toggle: ToggleOwner,
-    // lifecycle: Arc<tokio::sync::Mutex<model_lifecycle::ModelLifecycle>>,
-    // enforcer: budget_enforcer::BudgetEnforcer,
-    // router: tier_router::TierRouter,
-    // telemetry: Arc<telemetry::Telemetry>,
-    // loadout: Loadout,
+    lifecycle: Arc<TokioMutex<ModelLifecycle>>,
+    telemetry: Arc<Telemetry>,
+    router: tier_router::TierRouter,
+    loadout: Loadout,
 }
 
 impl OrchestratedSystem {
-    /// Build the system under `loadout`, in the given initial capture state.
-    /// Sidecars are **not** spawned here — ON is lazy (doc 12 §6).
-    pub fn new(_loadout: Loadout, initial: toggle_owner::CaptureState) -> Self {
-        // TODO(M5:) seed BudgetEnforcer with VramTable::seeded(), build the
-        //   ModelLifecycle + TierRouter + Telemetry, and hand the scheduler the
-        //   lifecycle/enforcer/telemetry handles it needs to run jobs (doc 12 §2).
+    /// Build the system under `loadout`, in the given initial capture state, with
+    /// the production sidecar runner ([`SidecarRunner`] + the default
+    /// [`ModelLifecycle`], which spawns the real `vlm-host`). Sidecars are **not**
+    /// spawned here — ON is lazy (doc 12 §6).
+    pub fn new(loadout: Loadout, initial: toggle_owner::CaptureState) -> Self {
+        Self::with_runner(loadout, initial, Arc::new(SidecarRunner::new()), None)
+    }
+
+    /// Build with an injected runner (+ optional lifecycle) — the seam the M5
+    /// gate + tests use to exercise the mutex/priority/preempt/deadline machinery
+    /// without a GPU (doc 15 §7). Production calls [`Self::new`].
+    pub fn with_runner(
+        loadout: Loadout,
+        initial: toggle_owner::CaptureState,
+        runner: Arc<dyn JobRunner>,
+        lifecycle: Option<Arc<TokioMutex<ModelLifecycle>>>,
+    ) -> Self {
+        let telemetry = Arc::new(Telemetry::new());
+        let lifecycle =
+            lifecycle.unwrap_or_else(|| Arc::new(TokioMutex::new(ModelLifecycle::default())));
+        let enforcer = BudgetEnforcer::new(VramTable::seeded());
+        let scheduler = Arc::new(GpuScheduler::new(
+            enforcer,
+            Arc::clone(&lifecycle),
+            runner,
+            Arc::clone(&telemetry),
+            loadout,
+        ));
+        let mut toggle = ToggleOwner::new(initial);
+        toggle.wire_resources(
+            Arc::clone(&scheduler),
+            Arc::clone(&lifecycle),
+            Arc::clone(&telemetry),
+        );
         Self {
-            scheduler: Arc::new(GpuScheduler::new()),
-            toggle: ToggleOwner::new(initial),
+            scheduler,
+            toggle,
+            lifecycle,
+            telemetry,
+            router: tier_router::TierRouter::new(),
+            loadout,
         }
+    }
+
+    /// The active loadout (doc 04 §3).
+    pub fn loadout(&self) -> Loadout {
+        self.loadout
+    }
+
+    /// A telemetry snapshot for the M-gate harnesses (doc 16 M5/M6). `now_ms`
+    /// bounds the trailing-hour wake window.
+    pub fn telemetry_snapshot(&self, now_ms: i64) -> telemetry::TelemetrySnapshot {
+        self.telemetry.snapshot(now_ms)
+    }
+
+    /// The VLM wake gate (doc 06 §4). The shell calls this after OCR to decide
+    /// whether to enqueue a `prio:50` enrichment job (VLM never gates a bubble,
+    /// doc 02 Path A). Mutable: it owns the per-app debounce + wake-rate ledger.
+    pub fn wake_gate(&mut self) -> &mut tier_router::TierRouter {
+        &mut self.router
+    }
+
+    /// Record a VLM wake in telemetry (the M5 3–10/h band assertion, ADR-032).
+    pub fn record_vlm_wake(&self, now_ms: i64) {
+        self.telemetry.record_vlm_wake(now_ms);
+    }
+
+    /// Whether the GPU mutex is *likely* free right now — advisory input to the
+    /// wake gate (doc 06 §4). The scheduler's admission is the real word.
+    pub fn mutex_likely_free(&self) -> bool {
+        self.scheduler.available_permits() > 0
+    }
+
+    /// The single GPU scheduler handle (contract 4), for callers that enqueue
+    /// VLM jobs off the bubble path (doc 06 §3, e.g. `aperture-vision-ocr`).
+    pub fn scheduler(&self) -> Arc<GpuScheduler> {
+        Arc::clone(&self.scheduler)
+    }
+
+    /// The sidecar lifecycle handle (for the idle-unload sweep timer the shell
+    /// drives, doc 04 §5).
+    pub fn lifecycle(&self) -> Arc<TokioMutex<ModelLifecycle>> {
+        Arc::clone(&self.lifecycle)
     }
 
     /// The `gpu_busy` observable (doc 11 §6, doc 14 §5): `true` while the single

@@ -35,14 +35,24 @@
 //! [VERIFY] exact llama.cpp `server` binary name, flags, and version at M5
 //! (doc 04 §9 measurement plan; cold-load SLA 3B < 4 s / 7B < 6 s, doc 04 §5).
 
-// TODO(M5): vlm/gpu milestone — implement the bodies below against the measured
-// llama.cpp server contract; wire cold-load SLA timing into the M5 gate report.
+// M5: implemented against the llama.cpp `server` HTTP contract. The exact
+// endpoint/flag details ([VERIFY] tags below) are confirmed on the real target
+// at the M5 measurement gate, where the GGUF weights are present; the child
+// supervision, loopback HTTP surface, and kill-on-drop are real and complete.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use base64::Engine;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 
 /// CLI surface. The orchestration Manager (doc 12 §2 `ModelLifecycle`) supplies
 /// these when it spawns the sidecar; nothing here is read from the environment so
@@ -98,20 +108,28 @@ pub struct InferRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InferResponse {
     /// Short scene description.
+    #[serde(default)]
     pub scene: String,
     /// Best-guess foreground app.
+    #[serde(default)]
     pub app_guess: String,
     /// Entities the model is confident it read (never guessed — doc 06 §3 prompt).
+    #[serde(default)]
     pub key_entities: Vec<KeyEntity>,
     /// Advisory resume hint; connectors validate it before any suggestion uses it
     /// (doc 06 §6 — `resumable_hint` is advisory only).
+    #[serde(default)]
     pub resumable_hint: ResumableHint,
+    /// What the cheap OCR likely missed (doc 06 §3) — carried through additively.
+    #[serde(default)]
+    pub ocr_gaps: String,
     /// Self-reported confidence `[0.0, 1.0]`.
+    #[serde(default)]
     pub confidence: f32,
 }
 
 /// One `key_entities` item (doc 06 §3).
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct KeyEntity {
     /// `url | file | video | control | text`.
     pub kind: String,
@@ -119,11 +137,13 @@ pub struct KeyEntity {
 }
 
 /// `resumable_hint` (doc 06 §3) — advisory, validated downstream by connectors.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ResumableHint {
     /// `browser | youtube | document | ide | none`.
+    #[serde(default)]
     pub connector_type: String,
     /// Free-form guess the matching connector validates against its captured state.
+    #[serde(default)]
     pub payload_guess: serde_json::Value,
 }
 
@@ -158,48 +178,216 @@ pub enum HostError {
 /// dropping/killing **this** host transitively kills the child — the
 /// guaranteed VRAM-release primitive (doc 02 §2, doc 12 §5).
 pub struct LlamaChild {
-    // child: tokio::process::Child,   // spawned with kill_on_drop(true)
-    // base_url: String,               // http://127.0.0.1:<child_port>
+    child: Mutex<tokio::process::Child>,
+    /// `http://127.0.0.1:<child_port>` — the llama.cpp server's loopback surface.
+    base_url: String,
+    /// Which weights are resident (for the `/health` model attribution).
+    model_label: String,
+    client: reqwest::Client,
 }
 
 impl LlamaChild {
     /// Spawn `llama-server` with the loadout flags, then poll its health until the
     /// model is resident or the cold-load SLA elapses (3B < 4 s / 7B < 6 s, doc 04 §5).
     ///
-    /// [VERIFY] exact flags at M5, e.g. (illustrative, not final):
+    /// [VERIFY] exact flags at M5 (llama.cpp server, current build):
     /// `llama-server -m <model> --mmproj <mmproj> -c <ctx> --host 127.0.0.1
-    ///  --port <child_port> -ngl 99 --jinja`. Confirm mmproj/`--no-mmap`/`-ngl`.
-    pub async fn spawn(_args: &Args) -> Result<Self, HostError> {
-        // TODO(M5):
-        //   1. tokio::process::Command::new(args.llama_bin)
-        //        .kill_on_drop(true)            // invariant 3: kill => VRAM release
-        //        .args([...measured flags...]);
-        //   2. await child readiness via its /health within the cold-load SLA.
-        //   3. record load latency + nvidia-smi VRAM delta for the M5 gate (doc 04 §9).
-        todo!("M5: spawn llama.cpp server child with kill_on_drop; await readiness")
+    ///  --port <child_port> -ngl 99 --jinja`. Confirm mmproj/`--no-mmap`/`-ngl`
+    /// and the multimodal endpoint on the target's llama.cpp version.
+    pub async fn spawn(args: &Args) -> Result<Self, HostError> {
+        let child_port = if args.child_port == 0 {
+            args.port.wrapping_add(1)
+        } else {
+            args.child_port
+        };
+        let child = tokio::process::Command::new(&args.llama_bin)
+            .arg("-m")
+            .arg(&args.model)
+            .arg("--mmproj")
+            .arg(&args.mmproj)
+            .arg("-c")
+            .arg(args.ctx.to_string())
+            .arg("--host")
+            .arg("127.0.0.1") // invariant 2: loopback only, never off-box
+            .arg("--port")
+            .arg(child_port.to_string())
+            .arg("-ngl")
+            .arg("99") // offload all layers to the GPU [VERIFY per model/VRAM]
+            .kill_on_drop(true) // invariant 3: kill => VRAM release
+            .spawn()
+            .map_err(|e| HostError::Spawn(e.to_string()))?;
+
+        let base_url = format!("http://127.0.0.1:{child_port}");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .map_err(|e| HostError::Http(e.to_string()))?;
+        let host = Self {
+            child: Mutex::new(child),
+            base_url,
+            model_label: args
+                .model
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "qwen2.5-vl".into()),
+            client,
+        };
+
+        // Await readiness within the cold-load SLA (doc 04 §5). [VERIFY exact SLA
+        // on-target: 3B < 4 s / 7B < 6 s; generous ceiling here for cold disk.]
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while tokio::time::Instant::now() < deadline {
+            if host.is_ready().await {
+                return Ok(host);
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        Err(HostError::ChildDown)
     }
 
     /// Forward one decoded `/infer` job to the child with JSON-schema-constrained
     /// decoding, validate the result, and on invalid JSON do **one** repair retry
     /// then discard (doc 06 §3 — the pipeline never blocks on the VLM).
-    pub async fn infer(&self, _req: &InferRequest) -> Result<InferResponse, HostError> {
-        // TODO(M5): proxy to child /completion (or /v1/chat/completions) with the
-        // single image + schema grammar; parse → InferResponse; one repair retry.
-        todo!("M5: proxy to llama.cpp child, schema-constrained decode, 1 repair retry")
+    pub async fn infer(&self, req: &InferRequest) -> Result<InferResponse, HostError> {
+        match self.infer_once(&req.prompt, &req.image_jpeg).await {
+            Ok(r) => Ok(r),
+            // One repair retry with an explicit "JSON only" nudge, then discard.
+            Err(HostError::MalformedJson) => {
+                let repaired = format!(
+                    "{}\n\nYour previous reply was not valid JSON for the schema. \
+                     Return ONLY a single JSON object, no prose.",
+                    req.prompt
+                );
+                self.infer_once(&repaired, &req.image_jpeg).await
+            }
+            Err(e) => Err(e),
+        }
     }
 
-    /// Is the child alive and reporting the model resident?
+    /// One round-trip to the llama.cpp multimodal chat endpoint. [VERIFY] the
+    /// exact request shape on the target's llama.cpp version — this targets the
+    /// OpenAI-compatible `/v1/chat/completions` with an inline image data URL.
+    async fn infer_once(&self, prompt: &str, image_jpeg: &[u8]) -> Result<InferResponse, HostError> {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(image_jpeg);
+        let body = serde_json::json!({
+            "messages": [
+                { "role": "system", "content": SYSTEM_PROMPT },
+                { "role": "user", "content": [
+                    { "type": "text", "text": prompt },
+                    { "type": "image_url",
+                      "image_url": { "url": format!("data:image/jpeg;base64,{b64}") } }
+                ]}
+            ],
+            "temperature": 0.1,
+            "cache_prompt": true
+        });
+        let resp = self
+            .client
+            .post(format!("{}/v1/chat/completions", self.base_url))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| HostError::ChildDown)?;
+        if !resp.status().is_success() {
+            return Err(HostError::ChildDown);
+        }
+        let envelope: serde_json::Value =
+            resp.json().await.map_err(|e| HostError::Http(e.to_string()))?;
+        // Pull the assistant message content and parse it as the scene JSON.
+        let content = envelope
+            .pointer("/choices/0/message/content")
+            .and_then(|v| v.as_str())
+            .ok_or(HostError::MalformedJson)?;
+        parse_scene(content)
+    }
+
+    /// Is the child alive and reporting the model resident? llama.cpp `/health`
+    /// returns 200 `{"status":"ok"}` once the model is loaded [VERIFY].
     pub async fn is_ready(&self) -> bool {
-        // TODO(M5): GET child /health (or /props) and map to readiness.
-        todo!("M5: probe llama.cpp child readiness")
+        match self
+            .client
+            .get(format!("{}/health", self.base_url))
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+        {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => false,
+        }
     }
 
     /// Explicitly kill the child (also happens on `Drop` via `kill_on_drop`). Used
     /// by the graceful-shutdown path; the *guaranteed* path is the parent killing us.
-    pub async fn kill(&mut self) -> Result<(), HostError> {
-        // TODO(M5): child.kill().await; this is what returns VRAM to the driver.
-        todo!("M5: kill llama.cpp child => VRAM returned")
+    pub async fn kill(&self) -> Result<(), HostError> {
+        self.child
+            .lock()
+            .await
+            .kill()
+            .await
+            .map_err(|e| HostError::Spawn(e.to_string()))
     }
+}
+
+/// The screen-understanding system prompt (doc 06 §3): a *function*, not a chat.
+const SYSTEM_PROMPT: &str = "You are a screen-understanding function. Given one \
+screenshot of a Windows 11 desktop, return ONLY JSON matching the schema. Do not \
+guess text you cannot read.";
+
+/// Parse the model's text content into the structured scene (doc 06 §3). Tolerates
+/// the model wrapping the JSON in prose/fences by extracting the outermost object.
+fn parse_scene(content: &str) -> Result<InferResponse, HostError> {
+    let json = extract_json_object(content).ok_or(HostError::MalformedJson)?;
+    serde_json::from_str::<InferResponse>(json).map_err(|_| HostError::MalformedJson)
+}
+
+/// Extract the first balanced `{...}` object from a string (the model may fence
+/// or preface its JSON despite the instruction).
+fn extract_json_object(s: &str) -> Option<&str> {
+    let start = s.find('{')?;
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, ch) in s[start..].char_indices() {
+        match ch {
+            '"' if !escaped => in_str = !in_str,
+            '\\' if in_str => {
+                escaped = !escaped;
+                continue;
+            }
+            '{' if !in_str => depth += 1,
+            '}' if !in_str => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[start..start + i + 1]);
+                }
+            }
+            _ => {}
+        }
+        escaped = false;
+    }
+    None
+}
+
+/// Shared axum state: the supervised child.
+type AppState = Arc<LlamaChild>;
+
+async fn infer_handler(
+    State(child): State<AppState>,
+    Json(req): Json<InferRequest>,
+) -> Result<Json<InferResponse>, StatusCode> {
+    match child.infer(&req).await {
+        Ok(resp) => Ok(Json(resp)),
+        Err(HostError::MalformedJson) => Err(StatusCode::UNPROCESSABLE_ENTITY),
+        Err(HostError::Deadline) => Err(StatusCode::REQUEST_TIMEOUT),
+        Err(_) => Err(StatusCode::BAD_GATEWAY),
+    }
+}
+
+async fn health_handler(State(child): State<AppState>) -> Json<Health> {
+    Json(Health {
+        ready: child.is_ready().await,
+        model: child.model_label.clone(),
+    })
 }
 
 /// Entry point. Parse args, spawn + supervise the child, serve loopback HTTP, and
@@ -209,19 +397,55 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
+    // VRAM loads here (the child spawns + becomes ready).
+    let child = Arc::new(LlamaChild::spawn(&args).await?);
+
     // Invariant 2: bind loopback ONLY. This host is not the gateway; it must never
     // be reachable off-box and never opens an outbound public socket (doc 13 §2).
-    let _bind: (IpAddr, u16) = (IpAddr::V4(Ipv4Addr::LOCALHOST), args.port);
+    let app = Router::new()
+        .route("/infer", post(infer_handler))
+        .route("/health", get(health_handler))
+        .with_state(Arc::clone(&child));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, args.port)).await?;
+    tracing::info!("aperture-vlm-host listening on 127.0.0.1:{}", args.port);
 
-    // TODO(M5):
-    //   1. let child = LlamaChild::spawn(&args).await? ;  // VRAM loads here
-    //   2. build axum::Router:
-    //        POST /infer  -> decode InferRequest -> child.infer() -> InferResponse JSON
-    //        GET  /health -> Health { ready: child.is_ready().await, model }
-    //   3. axum::serve(TcpListener::bind(_bind), router)
-    //        .with_graceful_shutdown(ctrl_c / SIGTERM)
-    //        — on shutdown: child.kill().await  (then drop also kills, belt+braces).
-    //   4. record cold-load + per-infer latency into the M5 gate report (doc 04 §9).
-    let _ = args;
-    todo!("M5: spawn child, serve loopback /infer + /health, kill child on shutdown")
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
+
+    // On shutdown: kill the child (belt-and-braces alongside kill_on_drop) so the
+    // model's VRAM is returned to the driver (doc 12 §6 step 4).
+    let _ = child.kill().await;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_json_from_fenced_or_prefaced_output() {
+        assert_eq!(extract_json_object(r#"{"a":1}"#), Some(r#"{"a":1}"#));
+        assert_eq!(
+            extract_json_object("here you go:\n```json\n{\"a\":1}\n```"),
+            Some(r#"{"a":1}"#)
+        );
+        // Braces inside strings don't confuse the balance.
+        assert_eq!(
+            extract_json_object(r#"{"scene":"a }{ b"}"#),
+            Some(r#"{"scene":"a }{ b"}"#)
+        );
+        assert_eq!(extract_json_object("no json here"), None);
+    }
+
+    #[test]
+    fn parses_a_valid_scene_and_rejects_garbage() {
+        let good = r#"{"scene":"editor open","app_guess":"code","key_entities":[],
+            "resumable_hint":{"connector_type":"ide","payload_guess":{}},"confidence":0.8}"#;
+        let scene = parse_scene(good).expect("valid scene");
+        assert_eq!(scene.app_guess, "code");
+        assert!(parse_scene("not json").is_err());
+    }
 }

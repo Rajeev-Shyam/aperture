@@ -24,6 +24,12 @@ serde_json = { workspace = true }
 aperture-connectors = { workspace = true }
 aperture-suggestion-generator = { workspace = true }
 
+# M5 gate (m5_budget_ceiling / m5_wake_band): the BudgetEnforcer + TierRouter, to
+# assert the ≤ 7.0 GB admission invariant (ADR-030) and the 3–10/h wake band
+# (ADR-032) as pure logic — no scheduler, no GPU, no network. Its transitive
+# reqwest (loopback-only, doc 13 §2) is never exercised by these gates.
+aperture-orchestration = { workspace = true }
+
 # NOTE (doc 16 M0): no extra dev-dependencies. The gate tests deliberately avoid a
 # network/HTTP/process-spawn crate — pulling one in here would itself violate the
 # two-emitter rule (doc 13 §2) that these very gates exist to protect. The SC5/SC6

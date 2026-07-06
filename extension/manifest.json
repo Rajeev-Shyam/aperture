@@ -17,5 +17,6 @@
       "run_at": "document_idle"
     }
   ],
+  "externally_connectable": { "ids": [], "matches": [] },
   "incognito": "not_allowed"
 }

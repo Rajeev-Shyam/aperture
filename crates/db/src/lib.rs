@@ -225,6 +225,20 @@ impl Db {
         tx.commit().map_err(DbError::from)
     }
 
+    /// Attach the VLM scene summary to an already-stored frame's `screen_context`
+    /// (doc 06 §5, Layer B): the enrichment lands on the row the OCR wrote, and
+    /// improves the *next* pattern cycle — it never gates the current bubble
+    /// (doc 02 Path A). Returns `false` if the row is gone (pruned / no context).
+    pub fn attach_vlm_summary(&self, event_id: i64, summary: &str) -> Result<bool, DbError> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE screen_context SET vlm_summary = ?2 WHERE event_id = ?1",
+                rusqlite::params![event_id, summary],
+            )
+            .map(|n| n > 0)
+        })
+    }
+
     /// Read one event back by id (round-trip surface for the M0 gate).
     pub fn read_event(&self, id: i64) -> Result<Event, DbError> {
         self.with_conn(|conn| {

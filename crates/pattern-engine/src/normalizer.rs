@@ -144,8 +144,10 @@ pub fn resource_class(ev: &Event) -> Option<String> {
 }
 
 /// Registrable-ish host of a URL, lowercased, `www.`-stripped. Coarse on purpose
-/// (privacy: tokens carry hosts, never full URLs — doc 08 §2).
-fn host_of(url: &str) -> Option<String> {
+/// (privacy: tokens carry hosts, never full URLs — doc 08 §2). Public so the
+/// connector lookup (trigger rule 3) can reverse a `url:<host>` consequent against
+/// a stored browser state's URL through the exact same encoding (CONN-H1).
+pub fn host_of(url: &str) -> Option<String> {
     let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
     let host = after_scheme
         .split(['/', '?', '#'])

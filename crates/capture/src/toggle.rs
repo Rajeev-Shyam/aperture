@@ -195,6 +195,12 @@ impl CaptureToggle {
 
         let this = Arc::clone(self);
         let result = race_release_sla(Duration::from_millis(TOGGLE_OFF_SLA_MS), move || {
+            // 0. FIX 2.1 FIRST: halt the extension feed the instant OFF is pressed.
+            //    This is a non-blocking flag flip + host notify, so it must run
+            //    BEFORE the potentially-blocking WGC/hook teardown below — otherwise
+            //    browser navigation/media keeps entering the store for up to the
+            //    full 3 s SLA while a stalled Close() runs (doc 05 §5, doc 13 §2).
+            this.set_extension_forwarding(false);
             // 1. stop sampler thread + drop pending debounce; 2. Close() WGC +
             //    release D3D refs (both inside Sampler::suspend).
             this.sampler.suspend();
@@ -202,9 +208,6 @@ impl CaptureToggle {
             if let Some(mut hooks) = this.hooks.lock().expect("hooks lock").take() {
                 hooks.uninstall();
             }
-            // 3b. FIX 2.1: halt extension forwarding — server-side gate closes
-            //     AND every connected host (→ extension) is told to stop.
-            this.set_extension_forwarding(false);
             // 4. sidecar kill: orchestration's step (doc 12 §6), not ours.
             // 5. indicator flip: the shell reacts to the state broadcast.
         })

@@ -24,8 +24,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::normalizer::{ExtensionUrlSource, Normalizer};
 use crate::sampler::{epoch_ms, ForegroundContext};
@@ -111,7 +111,12 @@ struct MediaTrack {
 /// coalescing, and control channels to connected hosts.
 pub struct NmBridge {
     config: NmBridgeConfig,
-    forwarding: AtomicBool,
+    /// Toggle-obeying forwarding flag. An `RwLock` (not an atomic) so a message
+    /// being processed can hold it as a READ lock across its whole check→persist→
+    /// cache body while `set_forwarding(false)` takes it as a WRITE lock — closing
+    /// the FIX 2.1 TOCTOU where a message straddling the OFF instant could persist
+    /// a row or repopulate `last_urls` after capture stopped.
+    forwarding: RwLock<bool>,
     /// brand → freshest active-tab URL (extension-primary source, ADR-027).
     last_urls: Mutex<HashMap<String, String>>,
     /// brand → connection id that owns it (cleared on that host's disconnect).
@@ -128,7 +133,7 @@ impl NmBridge {
             config,
             // Mirrors the toggle's initial Off state — the composition root
             // flips it when orchestration drives capture ON (doc 12 §6).
-            forwarding: AtomicBool::new(false),
+            forwarding: RwLock::new(false),
             last_urls: Mutex::new(HashMap::new()),
             brand_owner: Mutex::new(HashMap::new()),
             media: Mutex::new(HashMap::new()),
@@ -139,10 +144,18 @@ impl NmBridge {
 
     /// FIX 2.1: obey the capture toggle. `false` drops everything server-side
     /// and tells every connected host (which relays to the extension) to stop
-    /// forwarding; `true` restores. Sync + non-blocking — callable from the
-    /// toggle's blocking teardown step.
+    /// forwarding; `true` restores. Sync; briefly waits for one in-flight message
+    /// (the write lock, see the `forwarding` field) — called first in the toggle's
+    /// blocking teardown step so the wait is at the front of the OFF budget.
     pub fn set_forwarding(&self, on: bool) {
-        self.forwarding.store(on, Ordering::SeqCst);
+        // Hold the WRITE lock across the flag flip AND the cache clear, so an
+        // in-flight `handle_message` (holding the read lock across its whole body)
+        // can't straddle the OFF: it either fully completes first, or observes OFF
+        // and drops. This briefly waits for one in-flight message — bounded, and
+        // OFF runs this first in the teardown (toggle.rs), so it's no longer
+        // strictly non-blocking, but it is now race-free (FIX 2.1 TOCTOU).
+        let mut fwd = self.forwarding.write().expect("forwarding lock");
+        *fwd = on;
         let line = format!(
             "{}\n",
             serde_json::json!({ "type": "toggle", "capturing": on })
@@ -158,7 +171,7 @@ impl NmBridge {
     }
 
     pub fn forwarding(&self) -> bool {
-        self.forwarding.load(Ordering::SeqCst)
+        *self.forwarding.read().expect("forwarding lock")
     }
 
     /// Read-or-create the per-install token (hex uuid, 128-bit).
@@ -185,7 +198,12 @@ impl NmBridge {
         normalizer: &Normalizer,
         foreground: &Mutex<ForegroundContext>,
     ) -> usize {
-        if !self.forwarding() {
+        // Hold the READ lock across the ENTIRE body (check → persist → cache) so a
+        // concurrent `set_forwarding(false)` (write lock) cannot interleave — a
+        // message can't straddle the OFF and land a row / repopulate the cache
+        // after capture stopped (FIX 2.1 TOCTOU). Released when the fn returns.
+        let forwarding = self.forwarding.read().expect("forwarding lock");
+        if !*forwarding {
             return 0; // toggle OFF: nothing processed, nothing cached (FIX 2.1)
         }
         let now = epoch_ms();
@@ -378,6 +396,10 @@ pub fn spawn_server(
         loop {
             let server = {
                 let mut opts = tokio::net::windows::named_pipe::ServerOptions::new();
+                // Local-only, explicitly: reject any remote/SMB (`\\host\pipe\..`)
+                // client. tokio defaults this to true, but pin it so the local-only
+                // guarantee survives a dependency default change (doc 13 §2).
+                opts.reject_remote_clients(true);
                 if first {
                     opts.first_pipe_instance(true);
                 }
