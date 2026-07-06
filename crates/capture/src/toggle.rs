@@ -90,6 +90,9 @@ pub struct CaptureToggle {
     /// The durable store for the `capture_toggle` audit rows — these MUST
     /// persist (they survive Purge All 30 d, doc 03 §6/doc 13 §7).
     store: Mutex<Option<Arc<dyn EventStore>>>,
+    /// The native-messaging bridge (FIX 2.1): OFF must halt extension
+    /// forwarding within the same 3 s SLA; ON restores it.
+    nm_bridge: Mutex<Option<Arc<crate::nm_bridge::NmBridge>>>,
 }
 
 impl CaptureToggle {
@@ -107,12 +110,25 @@ impl CaptureToggle {
             hook_factory: Mutex::new(hook_factory),
             bus,
             store: Mutex::new(None),
+            nm_bridge: Mutex::new(None),
         }
     }
 
     /// Attach the durable store for audit rows (doc 13 §7). Wired by the shell.
     pub fn set_store(&self, store: Arc<dyn EventStore>) {
         *self.store.lock().expect("store lock") = Some(store);
+    }
+
+    /// Attach the native-messaging bridge so toggle transitions govern the
+    /// extension feed too (FIX 2.1). Wired by the capture facade.
+    pub fn set_nm_bridge(&self, bridge: Arc<crate::nm_bridge::NmBridge>) {
+        *self.nm_bridge.lock().expect("nm lock") = Some(bridge);
+    }
+
+    fn set_extension_forwarding(&self, on: bool) {
+        if let Some(bridge) = self.nm_bridge.lock().expect("nm lock").as_ref() {
+            bridge.set_forwarding(on);
+        }
     }
 
     /// Current observed state (doc 05 §5).
@@ -147,6 +163,9 @@ impl CaptureToggle {
             return Err(e);
         }
 
+        // Extension forwarding resumes with capture (FIX 2.1 — lazily: hosts
+        // reconnect on their own; this just re-opens the server-side gate).
+        self.set_extension_forwarding(true);
         self.emit_toggle_event(true);
         self.state.store(CaptureState::On.as_u8(), Ordering::SeqCst);
         Ok(())
@@ -183,8 +202,9 @@ impl CaptureToggle {
             if let Some(mut hooks) = this.hooks.lock().expect("hooks lock").take() {
                 hooks.uninstall();
             }
-            // 3b. [M4 slot — FIX 2.1]: signal the native-messaging host to stop
-            //     forwarding extension data (the extension is not built yet).
+            // 3b. FIX 2.1: halt extension forwarding — server-side gate closes
+            //     AND every connected host (→ extension) is told to stop.
+            this.set_extension_forwarding(false);
             // 4. sidecar kill: orchestration's step (doc 12 §6), not ours.
             // 5. indicator flip: the shell reacts to the state broadcast.
         })
@@ -236,6 +256,8 @@ impl CaptureToggle {
         if let Some(mut hooks) = self.hooks.lock().expect("hooks lock").take() {
             hooks.uninstall();
         }
+        // FIX 2.1 holds on the force path too: OFF halts extension forwarding.
+        self.set_extension_forwarding(false);
     }
 
     /// Emit the `capture_toggle` audit event (doc 05 §5 step 6; doc 12 §6):

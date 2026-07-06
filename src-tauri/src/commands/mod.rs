@@ -15,6 +15,8 @@
 //! honest `Err("not built until M<n>")` instead of `todo!()` — a stray invoke
 //! must never panic the overlay shell.
 
+use std::sync::Arc;
+
 use aperture_contracts::suggestions::SuggestionSource;
 use aperture_contracts::{BubbleSpec, ContextPayload, Intent, OpenOutcome, StructuredSuggestions};
 use tauri::State;
@@ -180,19 +182,103 @@ pub async fn list_suggestions(
         .map_err(|e| e.to_string())
 }
 
-/// Critical Path B (doc 02 §5): resolve `action_ref` -> `connector_id`, load the
-/// `connector_state` from SQLite, `reconstruct()` the artifact, `open()` it via
-/// `ShellExecuteW`/protocol handler. Target < 200 ms. Records
-/// `suggestion_clicked{outcome}`. Failure degrades honestly (doc 10 §6).
+/// Critical Path B (doc 02 §5): resolve `action_ref` (the `connector_state`
+/// uuid) → load the row from SQLite → `reconstruct()` the artifact →
+/// `open()` via `ShellExecuteW`/protocol handler. Target < 200 ms. Records
+/// `suggestion_clicked{outcome}` (SC7). Failure degrades honestly (doc 10 §6):
+/// a bad target returns `Ok(Failed{..})` so the bubble swaps to fallback copy —
+/// `Err` is reserved for malformed requests.
+///
+/// Validate-on-click (ADR-035): the button rendered optimistically; here —
+/// before any dispatch — the state's freshness is re-checked and `reconstruct`
+/// re-validates the target (e.g. the document connector re-checks the file
+/// exists). Nothing executes unvalidated, and only a connector acts.
+/// (`Connector::validate(cloud_payload)` is the *cloud*-suggestion gate — M7.)
 #[tauri::command]
 pub async fn bubble_click(
-    _id: String,
-    _action_ref: String,
-    _state: State<'_, AppState>,
+    id: String,
+    action_ref: String,
+    state: State<'_, AppState>,
 ) -> Result<OpenOutcome, String> {
-    // M4: the connector registry (doc 10) resolves + validates-on-click
-    // (ADR-035) + dispatches. No connectors exist yet.
-    Err("bubble_click: connectors are the M4 milestone (doc 16)".into())
+    let started = std::time::Instant::now();
+    if action_ref.is_empty() {
+        return Err("bubble_click: empty action_ref".into());
+    }
+    let st = state
+        .db
+        .read_connector_state(&action_ref)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("bubble_click: no connector_state row {action_ref}"))?;
+
+    // Reconstruct + dispatch on a blocking thread (ShellExecuteW + fs checks).
+    let registry = Arc::clone(&state.connectors);
+    let outcome = tokio::task::spawn_blocking(move || -> Result<OpenOutcome, String> {
+        let Some(connector) = registry.by_type(&st.connector_type) else {
+            return Err(format!("unknown connector type: {}", st.connector_type));
+        };
+        let now = crate::pipeline::epoch_ms();
+        if st.stale_after_ts.is_some_and(|t| t <= now) {
+            // The freshness factor should have zeroed this candidate long ago
+            // (doc 08 §5); if a stale row is clicked anyway, fail gracefully.
+            return Ok(OpenOutcome::Failed {
+                reason: "captured state is stale (past TTL)".into(),
+            });
+        }
+        match connector.reconstruct(&st) {
+            Ok(artifact) => match connector.open(&artifact) {
+                Ok(outcome) => Ok(outcome),
+                Err(e) => Ok(OpenOutcome::Failed { reason: e.to_string() }),
+            },
+            Err(e) => Ok(OpenOutcome::Failed { reason: e.to_string() }),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    // Record the outcome (doc 10 §6, SC7). record_feedback("clicked") — sent
+    // separately by the UI — owns state/resolved_ts; this owns `outcome`.
+    let outcome_str = match &outcome {
+        OpenOutcome::Resumed => "resumed",
+        OpenOutcome::Degraded { .. } => "degraded",
+        OpenOutcome::Failed { .. } => "failed_fallback",
+    };
+    if let Ok(row_id) = id.parse::<i64>() {
+        if let Err(e) = state.db.with_conn(|c| {
+            c.execute(
+                "UPDATE suggestions SET outcome = ?2 WHERE id = ?1",
+                rusqlite::params![row_id, outcome_str],
+            )
+            .map(|_| ())
+        }) {
+            tracing::error!(%e, "suggestion outcome update failed");
+        }
+    }
+    // The suggestion_clicked event row (doc 03 §2) — persist-then-notify.
+    let mut click_ev = aperture_contracts::Event {
+        id: 0,
+        ts: crate::pipeline::epoch_ms(),
+        r#type: aperture_contracts::EventType::SuggestionClicked,
+        app: None,
+        process: None,
+        window_title: None,
+        payload: serde_json::json!({ "suggestion_id": id, "outcome": outcome_str }),
+        connector_id: Some(action_ref),
+        session_id: None,
+        redaction_flags: 0,
+    };
+    match state.db.insert_event(&click_ev) {
+        Ok(eid) => {
+            click_ev.id = eid;
+            let _ = state.bus.publish(click_ev);
+        }
+        Err(e) => tracing::error!(%e, "suggestion_clicked persist failed"),
+    }
+
+    let elapsed = started.elapsed();
+    if elapsed > aperture_connectors::deeplinker::PATH_B_BUDGET {
+        tracing::warn!(?elapsed, "Path B exceeded its 200 ms budget (doc 02 §5)");
+    }
+    Ok(outcome)
 }
 
 /// Build + redact the Context Payload for an intent and return the EXACT wire

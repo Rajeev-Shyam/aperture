@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Aperture Capture Bridge",
+  "version": "0.1.0",
+  "description": "Forwards the active-tab URL and YouTube playback position to the local Aperture core. URLs and video position only - never page content (ADR-029).",
+  "minimum_chrome_version": "116",
+  "permissions": ["tabs", "nativeMessaging"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://www.youtube.com/*",
+        "*://youtube.com/*",
+        "*://m.youtube.com/*"
+      ],
+      "js": ["content/youtube.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "incognito": "not_allowed"
+}

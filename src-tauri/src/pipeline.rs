@@ -40,6 +40,13 @@ impl EventStore for DbEventStore {
 pub struct OcrStoreSink {
     pub db: Arc<Db>,
     pub processor: FrameProcessor,
+    /// The engine's current session id, mirrored by the pattern task (M4:
+    /// heartbeat rows bypass the bus, so they stamp the *current* session at
+    /// insert time — forward-stamping only, never retroactive (ADR-032).
+    /// `0` = no session yet ⇒ NULL). Heartbeats only fire while the user is
+    /// active (doc 05 §4), so this can lag the sessionizer by at most one
+    /// event-to-heartbeat gap — bounded, honest drift.
+    pub current_session: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl FrameSink for OcrStoreSink {
@@ -73,6 +80,9 @@ impl FrameSink for OcrStoreSink {
             self.db.attach_context(ctx.event_id, &row, embedding)
         } else {
             // Heartbeat: no event yet — write event + context + vec atomically.
+            let session = self
+                .current_session
+                .load(std::sync::atomic::Ordering::SeqCst);
             let ev = Event {
                 id: 0,
                 ts: ctx.ts,
@@ -82,11 +92,10 @@ impl FrameSink for OcrStoreSink {
                 window_title: ctx.identity.window_title.clone(),
                 payload: serde_json::json!({ "heartbeat": true }),
                 connector_id: None,
-                // TODO(M4): heartbeat rows are written here, off the bus→engine
-                // path, so the sessionizer never sees them — they stay NULL and
-                // retrieval joins them by ts range. Routing them through the
-                // bus (or sharing session state) closes this at M4.
-                session_id: None,
+                // M4: heartbeats bypass the bus, so the sessionizer never sees
+                // them — instead they carry the engine's CURRENT session,
+                // mirrored via `current_session` (forward-stamp only, ADR-032).
+                session_id: (session > 0).then_some(session),
                 redaction_flags: 0,
             };
             self.db
@@ -102,13 +111,14 @@ impl FrameSink for OcrStoreSink {
 /// Spawn the pattern-engine consumer (doc 02 §4 steps 6–8): bus → engine →
 /// pattern flush → suggestion rows → `bubble_spec` events to the overlay.
 ///
-/// The connector lookup is the doc 10 seam: **`None` until M4** — trigger rule 3
-/// (fresh resumable state) therefore keeps the live engine silent, exactly as
-/// specced (no connector, no bubble); the SC2 gate exercises the full path with
-/// the contracts fakes. `capture_rx` mirrors the toggle into the engine (rule 7);
-/// `feedback_rx` carries bubble feedback into the decay/mute ladder (doc 08 §7);
-/// `snooze_until` gates bubble EMISSION only — capture + learning continue
-/// while snoozed (ADR-040/Q95).
+/// The connector lookup (trigger rule 3, doc 08 §6) is DB-backed since M4: the
+/// freshest non-stale `connector_state` matching the consequent token's
+/// resource class, or `None` (no fresh resumable state ⇒ no bubble — stale
+/// bubbles are prevented, not apologized for, doc 08 §5). `capture_rx` mirrors
+/// the toggle into the engine (rule 7); `feedback_rx` carries bubble feedback
+/// into the decay/mute ladder (doc 08 §7); `snooze_until` gates bubble EMISSION
+/// only — capture + learning continue while snoozed (ADR-040/Q95);
+/// `current_session` mirrors the sessionizer outward for heartbeat stamping (M4).
 pub fn spawn_pattern_task(
     bus: &EventBus,
     db: Arc<Db>,
@@ -120,6 +130,7 @@ pub fn spawn_pattern_task(
         aperture_pattern_engine::FeedbackEvent,
     )>,
     snooze_until: Arc<std::sync::atomic::AtomicI64>,
+    current_session: Arc<std::sync::atomic::AtomicI64>,
     app: tauri::AppHandle,
 ) -> tokio::task::JoinHandle<()> {
     let mut events = bus.subscribe();
@@ -167,9 +178,15 @@ pub fn spawn_pattern_task(
                         }
                         Err(_) => break,
                     };
-                    // M4 seam: no connectors yet ⇒ rule 3 keeps the engine silent.
-                    let lookup = |_t: &aperture_pattern_engine::normalizer::Token| -> Option<aperture_contracts::ConnectorState> { None };
+                    // Trigger rule 3 (doc 08 §6): the freshest non-stale
+                    // connector_state for the consequent's resource class —
+                    // written by spawn_connector_task, read here. Sub-ms
+                    // indexed read (idx_conn_type_ts).
                     let now_ms = ev.ts;
+                    let lookup_db = Arc::clone(&db);
+                    let lookup = move |t: &aperture_pattern_engine::normalizer::Token| -> Option<aperture_contracts::ConnectorState> {
+                        lookup_connector_state(&lookup_db, t, now_ms)
+                    };
                     let candidates = engine.on_event(&ev, &EngineContext {
                         connector_lookup: &lookup,
                         now_ms,
@@ -181,6 +198,9 @@ pub fn spawn_pattern_task(
                     // keeps NULL session_id, unrecoverably (ADR-032).
                     if ev.id > 0 {
                         if let Some(session) = engine.last_session() {
+                            // Mirror outward for heartbeat stamping (M4).
+                            current_session
+                                .store(session, std::sync::atomic::Ordering::SeqCst);
                             if let Err(e) = db.with_conn(|c| {
                                 c.execute(
                                     "UPDATE events SET session_id = ?1 WHERE id = ?2",
@@ -202,29 +222,8 @@ pub fn spawn_pattern_task(
                         let pattern_id =
                             remap.get(&cand.pattern_id).copied().unwrap_or(cand.pattern_id);
                         // Resolve the candidate's connector_state row for
-                        // rendering (doc 03 §3; written by connectors at M4 —
-                        // with the None-lookup above, candidates cannot fire
-                        // before then, so this read is M4-ready, not dead).
-                        let state = db.with_conn(|c| {
-                            c.query_row(
-                                "SELECT id, connector_type, reconstruct_payload, payload_version, captured_ts, stale_after_ts \
-                                 FROM connector_state WHERE id = ?1",
-                                [&cand.connector_id],
-                                |row| {
-                                    let payload_text: String = row.get(2)?;
-                                    Ok(aperture_contracts::ConnectorState {
-                                        id: row.get(0)?,
-                                        connector_type: row.get(1)?,
-                                        reconstruct_payload: serde_json::from_str(&payload_text)
-                                            .unwrap_or(serde_json::Value::Null),
-                                        payload_version: row.get(3)?,
-                                        captured_ts: row.get(4)?,
-                                        stale_after_ts: row.get(5)?,
-                                    })
-                                },
-                            )
-                        });
-                        let Ok(state) = state else {
+                        // rendering (doc 03 §3).
+                        let Ok(Some(state)) = db.read_connector_state(&cand.connector_id) else {
                             tracing::warn!(connector_id = %cand.connector_id, "candidate without connector_state row");
                             continue;
                         };
@@ -263,6 +262,178 @@ pub fn spawn_pattern_task(
             }
         }
     })
+}
+
+/// Trigger rule 3's lookup (doc 08 §6): map the consequent token's resource
+/// class to a connector type, fetch the freshest non-stale states, and — for
+/// extension-scoped tokens (`doc:xlsx`, `ide:rs`) — require the payload path to
+/// match the extension. Type-level freshest-wins otherwise (`youtube`,
+/// `url:<domain>`): the bubble resumes the newest captured resource of that
+/// class, which is exactly the doc 08 §6 action_template semantics.
+fn lookup_connector_state(
+    db: &Db,
+    token: &aperture_pattern_engine::normalizer::Token,
+    now_ms: i64,
+) -> Option<aperture_contracts::ConnectorState> {
+    let resource = token.resource_class.as_deref()?;
+    let (connector_type, ext_filter): (&str, Option<&str>) = if resource == "youtube" {
+        ("youtube", None)
+    } else if let Some(ext) = resource.strip_prefix("doc:") {
+        ("document", Some(ext))
+    } else if let Some(ext) = resource.strip_prefix("ide:") {
+        ("ide", Some(ext))
+    } else if resource.starts_with("url:") {
+        ("browser", None)
+    } else {
+        return None;
+    };
+    let states = db
+        .fresh_connector_states(connector_type, now_ms, 8)
+        .unwrap_or_default();
+    states.into_iter().find(|st| match ext_filter {
+        None => true,
+        Some(ext) => st
+            .reconstruct_payload
+            .get("path")
+            .and_then(|p| p.as_str())
+            .is_some_and(|p| p.to_ascii_lowercase().ends_with(&format!(".{ext}"))),
+    })
+}
+
+/// Spawn the connector-capture consumer (Path A step 4, doc 02 §4; doc 10 §1):
+/// bus → (secondary-event derivation) → `registry.capture` → `connector_state`
+/// row (+ `events.connector_id` stamp).
+///
+/// Two responsibilities:
+/// 1. **Connector heuristics** (doc 03 §2): focus/title events of known editors
+///    derive `document_state` / `ide_state` events (path ladders, doc 10 §4-5),
+///    persisted-then-published like any event — the pattern engine then
+///    tokenizes them (`doc:xlsx`, `ide:rs`) and this same task captures them.
+/// 2. **State capture**: any event a connector claims produces a
+///    `connector_state` row. Captures of the *same resource* (natural key —
+///    e.g. the same video id) refresh the existing fresh row in place instead
+///    of piling up rows per media tick; a stale/pruned row gets a new insert.
+///
+/// Ladder work (fs existence checks, `.lnk` COM resolution, workspace walks)
+/// runs on blocking threads — the bus consumer never stalls the runtime.
+pub fn spawn_connector_task(
+    bus: &EventBus,
+    db: Arc<Db>,
+    registry: Arc<aperture_connectors::ConnectorRegistry>,
+) -> tokio::task::JoinHandle<()> {
+    let mut events = bus.subscribe();
+    let bus = bus.clone();
+    tokio::spawn(async move {
+        let deriver = Arc::new(aperture_connectors::SecondaryDeriver::new());
+        // (connector_type, natural_key) → (row_id, stale_after_ts): the
+        // coalescing map. In-memory only — a restart just starts new rows and
+        // retention prunes the old ones (doc 03 §6).
+        let mut coalesce: std::collections::HashMap<(String, String), (String, Option<i64>)> =
+            std::collections::HashMap::new();
+        loop {
+            let ev = match events.recv().await {
+                Ok(ev) => ev,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::debug!(missed = n, "connector task lagged the bus");
+                    continue;
+                }
+                Err(_) => break,
+            };
+
+            // 1. Secondary derivation (WindowFocus/WindowOpen of known editors
+            //    → document_state / ide_state). Heavy (fs/COM/sqlite) ⇒ blocking.
+            let d = Arc::clone(&deriver);
+            let src = ev.clone();
+            let derived = tokio::task::spawn_blocking(move || d.derive(&src))
+                .await
+                .ok()
+                .flatten();
+            if let Some(mut sev) = derived {
+                sev.session_id = ev.session_id; // same moment, same session
+                match db.insert_event(&sev) {
+                    Ok(id) => {
+                        sev.id = id;
+                        let _ = bus.publish(sev); // this task re-receives it below
+                    }
+                    Err(e) => tracing::error!(%e, "secondary event persist failed"),
+                }
+            }
+
+            // 2. Connector capture on THIS event (Navigation/MediaState arrive
+            //    from capture; DocumentState/IdeState from step 1's publish).
+            let reg = Arc::clone(&registry);
+            let src = ev.clone();
+            let captured = tokio::task::spawn_blocking(move || reg.capture(&src))
+                .await
+                .ok()
+                .flatten();
+            let Some(state) = captured else { continue };
+
+            let key = aperture_connectors::natural_key(
+                &state.connector_type,
+                &state.reconstruct_payload,
+            );
+            let used_id = match key {
+                Some(k) => {
+                    let map_key = (state.connector_type.clone(), k);
+                    match coalesce.get(&map_key) {
+                        // Same resource, existing row still fresh ⇒ refresh in
+                        // place (freshest position wins, doc 10 §3).
+                        Some((row_id, stale)) if stale.is_none_or(|s| s > state.captured_ts) => {
+                            match db.refresh_connector_state(
+                                row_id,
+                                &state.reconstruct_payload,
+                                state.captured_ts,
+                                state.stale_after_ts,
+                            ) {
+                                Ok(true) => {
+                                    let id = row_id.clone();
+                                    coalesce.insert(map_key, (id.clone(), state.stale_after_ts));
+                                    Some(id)
+                                }
+                                Ok(false) | Err(_) => {
+                                    insert_state(&db, &state).then(|| {
+                                        coalesce.insert(
+                                            map_key,
+                                            (state.id.clone(), state.stale_after_ts),
+                                        );
+                                        state.id.clone()
+                                    })
+                                }
+                            }
+                        }
+                        _ => insert_state(&db, &state).then(|| {
+                            if coalesce.len() >= 1024 {
+                                coalesce.clear(); // crude bound; repopulates live
+                            }
+                            coalesce.insert(map_key, (state.id.clone(), state.stale_after_ts));
+                            state.id.clone()
+                        }),
+                    }
+                }
+                None => insert_state(&db, &state).then(|| state.id.clone()),
+            };
+
+            // 3. Stamp the event row with its resumable handle (doc 03 §3).
+            if let Some(connector_id) = used_id {
+                if ev.id > 0 {
+                    if let Err(e) = db.set_event_connector(ev.id, &connector_id) {
+                        tracing::error!(%e, "event connector stamp failed");
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn insert_state(db: &Db, state: &aperture_contracts::ConnectorState) -> bool {
+    match db.insert_connector_state(state) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!(%e, "connector_state insert failed");
+            false
+        }
+    }
 }
 
 /// Flush the engine's dirty pattern rows to the `patterns` table (doc 03 §3,

@@ -212,6 +212,15 @@ fn forbidden_needle_in(line: &str) -> Option<&'static str> {
     if trimmed.starts_with("//") || trimmed.starts_with("//!") || trimmed.starts_with("*") {
         return None;
     }
+    // Windows named pipes (`tokio::net::windows::named_pipe`) are same-machine
+    // kernel IPC, not network sockets — they have no egress capability, so the
+    // two-emitter rule is not in play (doc 13 §2; ADR-028: the extension
+    // bridge's native-messaging transport is stdio + this pipe precisely so no
+    // socket exists outside the gateway). They live under `tokio::net::` only
+    // as a module-path accident; exempt them by the precise marker.
+    if line.contains("named_pipe") {
+        return None;
+    }
     // TODO(M0:): tighten this. Strip line/block comments and string literals
     // properly (or switch to a `syn`-based AST scan) so a forbidden token quoted
     // in a string isn't flagged. For a CI gate the line heuristic is acceptable;
@@ -296,11 +305,27 @@ fn run_gate(milestone: &str) -> Result<()> {
             cargo_test(&["-p", "aperture-pattern-engine", "-p", "aperture-suggestion-generator"])?;
             run_sc5()
         }
+        "m4" => {
+            println!("gate M4: US1 resume path (offline half) + extension bridge; SC5 holds (doc 16 M4)");
+            // Offline half: connectors (capture/reconstruct/validate ladders),
+            // the native-messaging bridge (pipe auth, FIX 2.1 toggle halt,
+            // FIX 2.2 exclusion-through-extension), and the US1-shaped
+            // capture→persist→lookup→render→reconstruct round trip.
+            cargo_test(&["-p", "aperture-connectors"])?;
+            cargo_test(&["-p", "aperture-capture"])?;
+            cargo_test(&["-p", "aperture-gates", "--test", "m4_us1_resume"])?;
+            // On-target half (recorded in the gate report, not fakeable here):
+            // real Chrome + unpacked extension + `aperture-nm-host install`;
+            // YouTube reopens at the right timestamp; document/IDE/browser
+            // resume on 3 real apps each (doc 16 M4).
+            println!("gate M4: on-target half = real-browser US1 run (extension install + resume) — see extension/README.md");
+            run_sc5()
+        }
         "m7" => {
             println!("gate M7: SC5 strict — zero bytes until Send, preview == wire (doc 16 M7)");
             run_sc5()
         }
-        "m4" | "m5" | "m6" | "m8" | "m9" => {
+        "m5" | "m6" | "m8" | "m9" => {
             // Honest stub: these gates' tests don't exist yet (the subsystems are
             // later milestones). Don't fake a pass.
             println!("gate {m}: no gate tests wired yet (doc 16 {})", m.to_uppercase());

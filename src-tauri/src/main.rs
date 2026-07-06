@@ -66,9 +66,12 @@ fn main() {
     ));
 
     // 5. Tier-0 pipeline: store seam + OCR sink + capture subsystem.
+    // `current_session` mirrors the pattern engine's sessionizer outward so
+    // heartbeat rows (which bypass the bus) stamp the current session (M4).
+    let current_session = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let store: Arc<dyn aperture_capture::normalizer::EventStore> =
         Arc::new(pipeline::DbEventStore { db: Arc::clone(&db) });
-    let sink = build_frame_sink(Arc::clone(&db));
+    let sink = build_frame_sink(Arc::clone(&db), Arc::clone(&current_session));
     let capture = aperture_capture::CaptureSubsystem::new(
         aperture_capture::CaptureConfig::default(),
         bus.clone(),
@@ -77,6 +80,14 @@ fn main() {
         sink,
         Some(store),
     );
+    // The browser-extension feed (ADR-027/028): named-pipe server for the
+    // native-messaging hosts. Toggle-governed (FIX 2.1) — inert until capture ON.
+    #[cfg(windows)]
+    capture.spawn_nm_server();
+
+    // The connector registry (doc 10 §1): bubble_click resolves through it;
+    // the connector task captures through it (Path A step 4).
+    let connectors = Arc::new(aperture_connectors::default_registry());
 
     // Bubble feedback channel (doc 08 §7) + global snooze deadline (ADR-040):
     // commands write, the pattern task reads.
@@ -85,8 +96,16 @@ fn main() {
 
     // The capture driver + pattern task spawn inside Tauri's setup — both need
     // the AppHandle (indicator events / bubble_spec events).
-    let state = AppState::new(bus, db, capture, orchestration, feedback_tx, snooze_until);
-    run_tauri(state, feedback_rx, &rt);
+    let state = AppState::new(
+        bus,
+        db,
+        capture,
+        orchestration,
+        feedback_tx,
+        snooze_until,
+        connectors,
+    );
+    run_tauri(state, feedback_rx, current_session, &rt);
 }
 
 /// Local-only structured logging (doc 13). Never logs payload contents or wire
@@ -101,7 +120,10 @@ fn init_tracing() {
 /// HashEmbedder dev path, as does a failed model load).
 /// If no OCR engine is constructible (missing language packs), degrade to
 /// event-only capture (doc 06 §6) with a one-time notice.
-fn build_frame_sink(db: Arc<aperture_db::Db>) -> Arc<dyn aperture_capture::sampler::FrameSink> {
+fn build_frame_sink(
+    db: Arc<aperture_db::Db>,
+    current_session: Arc<std::sync::atomic::AtomicI64>,
+) -> Arc<dyn aperture_capture::sampler::FrameSink> {
     #[cfg(feature = "nomic")]
     let embedder: Arc<dyn aperture_embedding::Embedder> = {
         let models_dir = std::path::PathBuf::from("models");
@@ -122,6 +144,7 @@ fn build_frame_sink(db: Arc<aperture_db::Db>) -> Arc<dyn aperture_capture::sampl
         Ok(engine) => Arc::new(pipeline::OcrStoreSink {
             db,
             processor: aperture_vision_ocr::FrameProcessor::new(Box::new(engine), embedder),
+            current_session,
         }),
         Err(e) => {
             tracing::error!(%e, "OCR engine unavailable — event-only capture (doc 06 §6)");
@@ -199,6 +222,7 @@ fn run_tauri(
         i64,
         aperture_pattern_engine::FeedbackEvent,
     )>,
+    current_session: Arc<std::sync::atomic::AtomicI64>,
     _rt: &tokio::runtime::Runtime,
 ) {
     let setup_state = state.clone();
@@ -252,7 +276,15 @@ fn run_tauri(
                 engine_rx,
                 feedback_rx,
                 Arc::clone(&setup_state.snooze_until),
+                Arc::clone(&current_session),
                 app.handle().clone(),
+            );
+            // Connector capture (Path A step 4, doc 02 §4) — bus consumer, no
+            // AppHandle needed, but spawned here with its siblings.
+            pipeline::spawn_connector_task(
+                &setup_state.bus,
+                std::sync::Arc::clone(&setup_state.db),
+                Arc::clone(&setup_state.connectors),
             );
             Ok(())
         })
