@@ -19,7 +19,7 @@
 //!   reopened at the right timestamp; document/IDE/browser resume on 3 real
 //!   apps each.
 
-use aperture_connectors::{default_registry, natural_key, Connector, ResumeArtifact};
+use aperture_connectors::{default_registry, natural_key, ResumeArtifact};
 use aperture_contracts::event::{Event, EventType};
 use aperture_db::Db;
 

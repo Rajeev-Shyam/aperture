@@ -263,6 +263,7 @@ dependencies = [
  "aperture-connectors",
  "aperture-contracts",
  "aperture-db",
+ "aperture-orchestration",
  "aperture-suggestion-generator",
  "rusqlite",
  "serde_json",
@@ -274,6 +275,8 @@ version = "0.1.0"
 dependencies = [
  "aperture-contracts",
  "async-trait",
+ "reqwest 0.12.28",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -357,6 +360,7 @@ version = "0.1.0"
 dependencies = [
  "aperture-contracts",
  "aperture-embedding",
+ "async-trait",
  "image",
  "serde",
  "serde_json",
@@ -373,6 +377,7 @@ dependencies = [
  "anyhow",
  "aperture-contracts",
  "axum",
+ "base64 0.22.1",
  "clap",
  "reqwest 0.12.28",
  "serde",

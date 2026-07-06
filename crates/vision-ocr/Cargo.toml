@@ -27,3 +27,8 @@ windows = { version = "0.58", features = [
 ] } # [VERIFY resolved — M2: feature set compiles + covers the buffer path
 # Frame downscale + grayscale pre-processing (doc 06 §2/§3).
 image = "0.25" # [VERIFY]
+
+[dev-dependencies]
+# The VlmLayer tests wire a fake GpuScheduler (the contract-4 trait is async).
+async-trait = { workspace = true }
+tokio = { workspace = true }

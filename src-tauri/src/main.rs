@@ -65,13 +65,21 @@ fn main() {
         ),
     ));
 
+    // Idle-unload sweep (doc 04 §5): kill sidecars idle > 60 s so their VRAM
+    // returns to the budget. Inert until sidecars actually load (capture ON).
+    spawn_idle_sweep(Arc::clone(&orchestration));
+
     // 5. Tier-0 pipeline: store seam + OCR sink + capture subsystem.
     // `current_session` mirrors the pattern engine's sessionizer outward so
     // heartbeat rows (which bypass the bus) stamp the current session (M4).
     let current_session = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let store: Arc<dyn aperture_capture::normalizer::EventStore> =
         Arc::new(pipeline::DbEventStore { db: Arc::clone(&db) });
-    let sink = build_frame_sink(Arc::clone(&db), Arc::clone(&current_session));
+    let sink = build_frame_sink(
+        Arc::clone(&db),
+        Arc::clone(&current_session),
+        Arc::clone(&orchestration),
+    );
     let capture = aperture_capture::CaptureSubsystem::new(
         aperture_capture::CaptureConfig::default(),
         bus.clone(),
@@ -123,6 +131,7 @@ fn init_tracing() {
 fn build_frame_sink(
     db: Arc<aperture_db::Db>,
     current_session: Arc<std::sync::atomic::AtomicI64>,
+    orchestration: Arc<tokio::sync::Mutex<aperture_orchestration::OrchestratedSystem>>,
 ) -> Arc<dyn aperture_capture::sampler::FrameSink> {
     #[cfg(feature = "nomic")]
     let embedder: Arc<dyn aperture_embedding::Embedder> = {
@@ -145,6 +154,7 @@ fn build_frame_sink(
             db,
             processor: aperture_vision_ocr::FrameProcessor::new(Box::new(engine), embedder),
             current_session,
+            orchestration: Some(orchestration),
         }),
         Err(e) => {
             tracing::error!(%e, "OCR engine unavailable — event-only capture (doc 06 §6)");
@@ -192,6 +202,24 @@ fn spawn_capture_driver(
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(_) => break,
             }
+        }
+    });
+}
+
+/// Idle-unload sweep timer (doc 04 §5): every 15 s, unload any sidecar idle for
+/// more than `IDLE_UNLOAD` (60 s), returning its VRAM to the budget so the next
+/// admission projects against the freed headroom. Warm-kept sidecars (M6 PTT pin)
+/// are honored inside `idle_sweep`. Grabs the lifecycle handle once, then holds
+/// only the lifecycle mutex per tick — never the whole orchestration facade.
+fn spawn_idle_sweep(
+    orchestration: Arc<tokio::sync::Mutex<aperture_orchestration::OrchestratedSystem>>,
+) {
+    tokio::spawn(async move {
+        let lifecycle = orchestration.lock().await.lifecycle();
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+        loop {
+            tick.tick().await;
+            lifecycle.lock().await.idle_sweep(pipeline::epoch_ms()).await;
         }
     });
 }

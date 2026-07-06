@@ -11,8 +11,14 @@ use aperture_capture::wgc::EphemeralFrame;
 use aperture_contracts::{Event, EventType};
 use aperture_db::{Db, ScreenContextInsert};
 use aperture_event_bus::EventBus;
+use aperture_orchestration::tier_router::{
+    OcrSignal, WakeDecision, LOW_TEXT_DENSITY, WEAK_OCR_CONFIDENCE,
+};
+use aperture_orchestration::toggle_owner::CaptureState;
+use aperture_orchestration::OrchestratedSystem;
 use aperture_pattern_engine::{EngineContext, PatternEngine};
-use aperture_vision_ocr::FrameProcessor;
+use aperture_vision_ocr::vlm_layer::prepare_image;
+use aperture_vision_ocr::{FrameProcessor, VlmLayer};
 
 /// [`EventStore`] over the encrypted history DB (doc 15 §1: "SQLite is the
 /// durable form"). Failures degrade to notify-only with a log — capture keeps
@@ -47,6 +53,11 @@ pub struct OcrStoreSink {
     /// active (doc 05 §4), so this can lag the sessionizer by at most one
     /// event-to-heartbeat gap — bounded, honest drift.
     pub current_session: Arc<std::sync::atomic::AtomicI64>,
+    /// The orchestration handle for the M5 VLM enrichment path (doc 06 §3/§5):
+    /// the wake gate + single GPU scheduler live here. `None` degrades the sink
+    /// to OCR-only (doc 06 §6) — never the case in production, where `main`
+    /// always wires it.
+    pub orchestration: Option<Arc<tokio::sync::Mutex<OrchestratedSystem>>>,
 }
 
 impl FrameSink for OcrStoreSink {
@@ -64,6 +75,35 @@ impl FrameSink for OcrStoreSink {
                 return;
             }
         };
+
+        // M5 VLM enrichment gate (doc 06 §4 branch (b), doc 02 Path A). A *cheap*
+        // local pre-filter decides if this frame could earn a VLM wake — "rich
+        // frame, weak OCR" is the only proactive-path trigger a frame sink can see
+        // (pattern/user triggers arrive via other paths). We encode the single
+        // image HERE, before the frame drops (downscale ≤1024 px, JPEG q85 —
+        // doc 06 §3), and only for a candidate: the common strong-OCR frame pays
+        // nothing. The authoritative stateful gate (per-app debounce + hourly
+        // ceiling + budget, ADR-032) runs off the bubble path in maybe_enrich_vlm.
+        let ocr = &processed.ocr;
+        // Thresholds come from `tier_router` — the SAME source the authoritative
+        // gate reads (they were duplicated in `vlm_gating`; a single source keeps
+        // the pre-filter and the gate from silently diverging at M5 tuning).
+        let vlm_jpeg = (self.orchestration.is_some()
+            && ocr.mean_confidence < WEAK_OCR_CONFIDENCE
+            && ocr.text_density() as f32 > LOW_TEXT_DENSITY)
+            .then(|| prepare_image(frame.bgra(), frame.width, frame.height).ok())
+            .flatten();
+        let vlm_signal = OcrSignal {
+            confidence: ocr.mean_confidence,
+            text_density: ocr.text_density() as f32,
+        };
+        let app_key = ctx
+            .identity
+            .app
+            .clone()
+            .or_else(|| ctx.identity.process.clone())
+            .unwrap_or_default();
+
         drop(frame); // explicit: the raw frame dies here (doc 05 §2)
 
         let row = ScreenContextInsert {
@@ -75,9 +115,17 @@ impl FrameSink for OcrStoreSink {
         };
         let embedding = processed.embedding.as_deref();
 
-        let result = if ctx.event_id > 0 {
+        // Store, capturing the row's event_id — the VLM summary attaches to it
+        // once the (async, off-path) job returns (doc 06 §5 Layer B).
+        let event_id: Option<i64> = if ctx.event_id > 0 {
             // Trigger-sampled: the event row already exists (persist-then-notify).
-            self.db.attach_context(ctx.event_id, &row, embedding)
+            match self.db.attach_context(ctx.event_id, &row, embedding) {
+                Ok(()) => Some(ctx.event_id),
+                Err(e) => {
+                    tracing::error!(%e, "screen_context store failed");
+                    None
+                }
+            }
         } else {
             // Heartbeat: no event yet — write event + context + vec atomically.
             let session = self
@@ -98,13 +146,110 @@ impl FrameSink for OcrStoreSink {
                 session_id: (session > 0).then_some(session),
                 redaction_flags: 0,
             };
-            self.db
-                .insert_event_with_context(&ev, Some(&row), embedding)
-                .map(|_| ())
+            match self.db.insert_event_with_context(&ev, Some(&row), embedding) {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    tracing::error!(%e, "screen_context store failed");
+                    None
+                }
+            }
         };
-        if let Err(e) = result {
-            tracing::error!(%e, "screen_context store failed");
+
+        // Off the bubble path (doc 02 Path A: the VLM NEVER gates a bubble). Only
+        // when a candidate frame encoded, its row landed, and orchestration is
+        // wired — otherwise this frame stays OCR-only (doc 06 §6).
+        if let (Some(jpeg), Some(event_id), Some(orch)) =
+            (vlm_jpeg, event_id, self.orchestration.clone())
+        {
+            let db = Arc::clone(&self.db);
+            tokio::spawn(maybe_enrich_vlm(
+                orch, db, event_id, jpeg, app_key, vlm_signal, ctx.ts,
+            ));
         }
+    }
+}
+
+/// Off-the-bubble-path VLM enrichment (doc 06 §3/§5 Layer B; doc 02 Path A). Runs
+/// the authoritative stateful wake gate (per-app debounce + adaptive 3–10/h
+/// ceiling that protects voice, ADR-032) and, on a `Wake`, enqueues one `prio:50`
+/// pattern-VLM job through the single GPU mutex, attaching the structured scene
+/// JSON to the frame's `screen_context` row. Every failure is **soft** — the
+/// bubble already fired on OCR; this only improves the *next* pattern cycle.
+async fn maybe_enrich_vlm(
+    orch: Arc<tokio::sync::Mutex<OrchestratedSystem>>,
+    db: Arc<Db>,
+    event_id: i64,
+    jpeg: Vec<u8>,
+    app_key: String,
+    signal: OcrSignal,
+    now_ms: i64,
+) {
+    // Run the gate + grab the scheduler under ONE short lock, then release before
+    // the GPU wait — the orchestration mutex serializes the toggle + lifecycle,
+    // it must never be held across a job (doc 12).
+    let scheduler = {
+        let mut orch = orch.lock().await;
+        // The AUTHORITATIVE capture state, read under the lock. `turn_off` holds
+        // this same mutex through sidecar teardown (doc 12 §6), so a task that
+        // queued on this lock while an OFF was in flight observes OFF and skips.
+        // A hardcoded `true` would let the enqueue below re-spawn vlm-host and
+        // reload ~5–6 GB into VRAM *after* the user asked to stop — an SC6 breach
+        // (doc 05 §5). The gate maps `!capture_on` to Skip(CaptureOff).
+        let capture_on = orch.toggle().state() == CaptureState::On;
+        let mutex_free = orch.mutex_likely_free();
+        // The gate reads only app/process off the event (its debounce key); a
+        // minimal event carries exactly that.
+        let ev = Event {
+            id: 0,
+            ts: now_ms,
+            r#type: EventType::WindowFocus,
+            app: (!app_key.is_empty()).then_some(app_key),
+            process: None,
+            window_title: None,
+            payload: serde_json::json!({}),
+            connector_id: None,
+            session_id: None,
+            redaction_flags: 0,
+        };
+        let decision = orch.wake_gate().should_wake_vlm(
+            &ev,
+            signal,
+            now_ms,
+            capture_on, // read under the lock above — never assume ON
+            mutex_free,
+            false, // pattern_requested: doc-08 disambiguation arrives on another path
+            false, // user_explicit: enrichment requests come from the UI, not here
+            true, // budget_projection_ok: advisory — the scheduler's enqueue
+                  // projection is the final word on the 7.0 GB ceiling (doc 06 §4)
+        );
+        match decision {
+            WakeDecision::Wake(_) => {
+                // Telemetry feeds the M5 adaptive 3–10/h band assertion (ADR-032).
+                orch.record_vlm_wake(now_ms);
+                orch.scheduler()
+            }
+            WakeDecision::Skip(reason) => {
+                tracing::trace!(?reason, "vlm wake skipped (doc 06 §4)");
+                return;
+            }
+        }
+    };
+
+    // Wake committed: the prio:50 job runs through the mutex; the scheduler's R1
+    // projection is what actually protects the ceiling (doc 12 §4).
+    match VlmLayer::new(scheduler).understand(jpeg).await {
+        Ok(scene) => match serde_json::to_string(&scene) {
+            // doc 06 §1/§5: vlm_summary is the structured scene JSON.
+            Ok(summary) => match db.attach_vlm_summary(event_id, &summary) {
+                Ok(true) => tracing::debug!(event_id, "vlm scene summary attached"),
+                Ok(false) => tracing::debug!(event_id, "vlm summary target row gone (pruned)"),
+                Err(e) => tracing::error!(%e, "vlm summary attach failed"),
+            },
+            Err(e) => tracing::error!(%e, "vlm scene serialize failed"),
+        },
+        // BudgetRefused / Deadline / SidecarDown are all soft (already logged in
+        // VlmLayer::understand): the frame stays OCR-only (doc 06 §6).
+        Err(_) => {}
     }
 }
 
@@ -162,8 +307,15 @@ pub fn spawn_pattern_task(
                 }
                 fb = feedback_rx.recv() => {
                     let Some((pattern_id, fb)) = fb else { break }; // shell gone
-                    // Decay / reinforce / mute (doc 08 §7); flush so the ladder
-                    // survives restarts (dismiss_decay is a patterns column).
+                    // Decay / reinforce / mute (doc 08 §7); flush persists the
+                    // ladder into the patterns column.
+                    // TODO(CONN-M2): the engine does NOT re-hydrate persisted
+                    // support/confidence/dismiss_decay at startup, so after a
+                    // restart it re-mines cold (dismiss_decay = 1.0) and the next
+                    // flush overwrites the saved value — the decay/mute ladder does
+                    // not actually survive a restart yet (re-nags a dismissed
+                    // suggestion). Fix = seed the engine cache by `signature` at
+                    // boot (needs a pattern-engine hydrate method, doc 08 §7).
                     engine.apply_feedback(pattern_id, fb, epoch_ms());
                     flush_patterns(&db, &mut engine);
                 }
@@ -276,27 +428,50 @@ fn lookup_connector_state(
     now_ms: i64,
 ) -> Option<aperture_contracts::ConnectorState> {
     let resource = token.resource_class.as_deref()?;
-    let (connector_type, ext_filter): (&str, Option<&str>) = if resource == "youtube" {
-        ("youtube", None)
+    // Map the consequent token's resource class → (connector type, match filter).
+    // youtube is type-level (the token carries no video id). doc/ide match by
+    // extension. url matches by HOST: a `url:docs.rs` consequent must resume a
+    // docs.rs tab, not merely the newest browser tab of any site (CONN-H1).
+    #[derive(Clone, Copy)]
+    enum Filter<'a> {
+        None,
+        Ext(&'a str),
+        Host(&'a str),
+    }
+    let (connector_type, filter): (&str, Filter) = if resource == "youtube" {
+        ("youtube", Filter::None)
     } else if let Some(ext) = resource.strip_prefix("doc:") {
-        ("document", Some(ext))
+        ("document", Filter::Ext(ext))
     } else if let Some(ext) = resource.strip_prefix("ide:") {
-        ("ide", Some(ext))
-    } else if resource.starts_with("url:") {
-        ("browser", None)
+        ("ide", Filter::Ext(ext))
+    } else if let Some(host) = resource.strip_prefix("url:") {
+        ("browser", Filter::Host(host))
     } else {
         return None;
     };
+    // Filtered lookups match in Rust after the DB's freshest-N fetch, so pull a
+    // generous window — a matching state just past the newest few must not be
+    // missed (CONN-M3). Type-level (youtube) only ever needs the newest row.
+    let limit = if matches!(filter, Filter::None) { 1 } else { 32 };
     let states = db
-        .fresh_connector_states(connector_type, now_ms, 8)
+        .fresh_connector_states(connector_type, now_ms, limit)
         .unwrap_or_default();
-    states.into_iter().find(|st| match ext_filter {
-        None => true,
-        Some(ext) => st
+    states.into_iter().find(|st| match filter {
+        Filter::None => true,
+        Filter::Ext(ext) => st
             .reconstruct_payload
             .get("path")
             .and_then(|p| p.as_str())
             .is_some_and(|p| p.to_ascii_lowercase().ends_with(&format!(".{ext}"))),
+        // CONN-H1: reverse the `url:<host>` token through the tokenizer's own
+        // `host_of`, so a stored URL's host is normalized (lowercased, `www.`-
+        // stripped) identically to the token before comparison.
+        Filter::Host(host) => st
+            .reconstruct_payload
+            .get("url")
+            .and_then(|u| u.as_str())
+            .and_then(aperture_pattern_engine::normalizer::host_of)
+            .is_some_and(|h| h.as_str() == host),
     })
 }
 
@@ -379,6 +554,14 @@ pub fn spawn_connector_task(
                     match coalesce.get(&map_key) {
                         // Same resource, existing row still fresh ⇒ refresh in
                         // place (freshest position wins, doc 10 §3).
+                        // TODO(CONN-M1): this guard only checks the existing row is
+                        // still fresh, not that the NEW capture is newer or carries
+                        // an equal/better position source. A later position-less
+                        // navigation (same video_id, position = null) can clobber a
+                        // known media_state timestamp → "resume from start" instead
+                        // of the real position (defeats ADR-027's source hierarchy).
+                        // Fix = store captured_ts + a position-source rank in the
+                        // coalesce value and refresh only when the new capture wins.
                         Some((row_id, stale)) if stale.is_none_or(|s| s > state.captured_ts) => {
                             match db.refresh_connector_state(
                                 row_id,

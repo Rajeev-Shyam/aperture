@@ -10,8 +10,15 @@ aperture-contracts = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+serde_json = { workspace = true }
 # Required: `impl aperture_contracts::GpuScheduler` is `#[async_trait::async_trait]` (lib.rs).
 async-trait = { workspace = true }
+
+# Loopback HTTP to the LOCAL sidecars (vlm-host /infer, /health) + health polling
+# (doc 12 §5). 127.0.0.1 only — never reaches the public internet; orchestration
+# is a lint-emitters SANCTIONED crate (doc 13 §2). rustls avoids an OpenSSL build
+# dep on Windows MSVC.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }  # [VERIFY]
 
 # --- platform / third-party (pinned; [VERIFY] at build time, doc 00 conventions) ---
 # Win32 TerminateProcess escalation when a sidecar kill fails (zombie escalation,

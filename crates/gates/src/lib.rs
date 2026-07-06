@@ -11,6 +11,10 @@
 //! | File                      | Gate | Milestone | Invariant guarded |
 //! |---------------------------|------|-----------|-------------------|
 //! | `tests/m0_schema_roundtrip.rs` | schema round-trips every `EventType`; fakes compile | M0 | data-model fidelity (doc 03) |
+//! | `tests/m4_us1_resume.rs`       | US1 resume (offline half): capture → `connector_state` → freshest-lookup → render | M4 | one-click state resumption (doc 10, US1) |
+//! | `tests/m5_budget_ceiling.rs`   | no admission ever projects over 7.0 GB; STT is the swap victim | M5 | the 8 GB VRAM ceiling (doc 04 R1, ADR-030) |
+//! | `tests/m5_wake_band.rs`        | VLM wakes never cross the ~10/h hard ceiling; the window slides | M5 | voice is never starved by enrichment (ADR-032) |
+//! | `tests/m5_load_times.rs`       | (on-target) SC3 cold-load SLAs + measured co-resident VRAM ≤ 7.0 GB | M5 (RTX target) | SC3 load times + ADR-030 on real numbers |
 //! | `tests/sc5_network_monitor.rs` | zero egress on the proactive path; bytes only after Send | M1→ (strict at M7) | the two-emitter transparency gate (doc 13 §2) |
 //! | `tests/sc6_vram_release.rs`    | toggle OFF → VRAM ~0 in < 3 s, sidecars dead, idle CPU < 2 % | M1 (RTX target) | the capture toggle (doc 04 §, doc 05 §5) |
 //!

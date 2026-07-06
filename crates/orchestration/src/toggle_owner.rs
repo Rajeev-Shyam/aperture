@@ -8,9 +8,14 @@
 //! ON reverses *lazily*: hooks + sampler come up immediately, but sidecars stay
 //! down until the first job demands one (doc 12 §6).
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex as TokioMutex};
+
+use crate::gpu_scheduler::GpuScheduler;
+use crate::model_lifecycle::ModelLifecycle;
+use crate::telemetry::Telemetry;
 
 /// The 3 s end-to-end release SLA for toggle-OFF (doc 12 §6, SC6 / doc 16 M1).
 pub const OFF_SLA: Duration = Duration::from_secs(3);
@@ -34,20 +39,43 @@ pub struct ToggleOwner {
     state: CaptureState,
     /// Readers subscribe here (doc 02 §7: Capture, UI indicator, sidecars).
     state_tx: broadcast::Sender<CaptureState>,
-    // scheduler: Arc<GpuScheduler>,        // for step 3 (cancel + grace)
-    // lifecycle: Arc<Mutex<ModelLifecycle>>, // for step 4 (kill both)
-    // telemetry: Arc<Telemetry>,           // step 6 SLA-breach counter
+    /// Step 3 (cancel queued + running-job grace) and step 4 (kill both sidecars)
+    /// of the OFF sequence (doc 12 §6). `None` in bare test harnesses; wired by
+    /// [`crate::OrchestratedSystem::new`].
+    scheduler: Option<Arc<GpuScheduler>>,
+    lifecycle: Option<Arc<TokioMutex<ModelLifecycle>>>,
+    /// Step 6 SLA-breach counter (doc 12 §6).
+    telemetry: Option<Arc<Telemetry>>,
 }
 
 impl ToggleOwner {
     /// Construct in the given initial state (first-run consent decides ON/OFF,
-    /// doc 13). Capture defaults OFF until consent (doc 13).
+    /// doc 13). Capture defaults OFF until consent (doc 13). GPU resources are
+    /// wired separately via [`Self::wire_resources`] (the scheduler + lifecycle
+    /// are built alongside this owner in [`crate::OrchestratedSystem::new`]).
     pub fn new(initial: CaptureState) -> Self {
         let (state_tx, _) = broadcast::channel(16);
         Self {
             state: initial,
             state_tx,
+            scheduler: None,
+            lifecycle: None,
+            telemetry: None,
         }
+    }
+
+    /// Wire the GPU resources the OFF sequence must release (doc 12 §6 steps 3-4,
+    /// 6). Called once by [`crate::OrchestratedSystem::new`] after the scheduler +
+    /// lifecycle exist.
+    pub fn wire_resources(
+        &mut self,
+        scheduler: Arc<GpuScheduler>,
+        lifecycle: Arc<TokioMutex<ModelLifecycle>>,
+        telemetry: Arc<Telemetry>,
+    ) {
+        self.scheduler = Some(scheduler);
+        self.lifecycle = Some(lifecycle);
+        self.telemetry = Some(telemetry);
     }
 
     /// The current capture state (readers may poll; most subscribe instead).
@@ -77,28 +105,48 @@ impl ToggleOwner {
     ///
     /// Step map: (1) flip + broadcast here (single writer); (2) the capture
     /// subsystem reacts with its release steps incl. the `capture_toggle{off}`
-    /// audit row (doc 05 §5); (3) scheduler cancel + (4) sidecar kill are wired
-    /// when the GPU stack exists (M5 — no sidecar can be resident before then,
-    /// so "sidecars dead" holds vacuously at M1); (5) the indicator is the
-    /// shell's reaction to this broadcast; (6) the on-target VRAM watchdog
-    /// lands with the M5 telemetry.
+    /// audit row (doc 05 §5); (3) scheduler cancels queued jobs + gives a running
+    /// job `RUNNING_JOB_GRACE` to exit; (4) the lifecycle kills **both** sidecars
+    /// — process death is the guaranteed VRAM-release primitive (invariant 3,
+    /// doc 02 §2); (5) the indicator is the shell's reaction to this broadcast;
+    /// (6) an OFF that overran the SLA increments the breach counter (surfaced
+    /// once). Steps 3-4 run in parallel with the capture-side release.
     pub async fn turn_off(&mut self) {
         if self.state == CaptureState::Off {
             return; // idempotent
         }
+        let started = tokio::time::Instant::now();
         self.state = CaptureState::Off;
         let _ = self.state_tx.send(CaptureState::Off);
-        // TODO(M5): scheduler.cancel_all_for_off() with RUNNING_JOB_GRACE, then
-        //   lifecycle.kill_all_sidecars() (process death = guaranteed VRAM
-        //   release, invariant 3) + the telemetry SLA watchdog (doc 12 §6).
+
+        // (3) cancel queued + running-job grace; (4) kill both sidecars.
+        if let Some(scheduler) = &self.scheduler {
+            scheduler.cancel_all_for_off(RUNNING_JOB_GRACE).await;
+        }
+        if let Some(lifecycle) = &self.lifecycle {
+            if let Err(e) = lifecycle.lock().await.kill_all_sidecars().await {
+                tracing::error!(%e, "sidecar kill failed on OFF (doc 12 §6 step 4)");
+            }
+        }
+
+        // (6) SLA watchdog: an OFF that overran 3 s is a breach (surfaced once).
+        if started.elapsed() > OFF_SLA {
+            if let Some(telemetry) = &self.telemetry {
+                telemetry.record_toggle_sla_breach();
+            }
+            tracing::error!("toggle OFF exceeded {OFF_SLA:?} SLA (doc 12 §6)");
+        }
     }
 
-    /// L1<->L2 settings flip mid-session: treated as "unload all -> admit the
-    /// next job under the new loadout's rules" (doc 12 §7). Does **not** change
-    /// the ON/OFF capture state.
-    pub async fn apply_loadout_change(&mut self) {
-        // TODO(M5:) lifecycle.kill_all_sidecars(); the next enqueue re-admits
-        //   under the new L1/L2 rules (doc 12 §7).
-        todo!("M5: loadout flip = unload all, re-admit next under new rules (doc 12 §7)")
+    /// L1<->L2 settings flip mid-session: "unload all -> admit the next job under
+    /// the new loadout's rules" (doc 12 §7). Does **not** change the ON/OFF state.
+    pub async fn apply_loadout_change(&mut self, loadout: crate::Loadout) {
+        if let Some(scheduler) = &self.scheduler {
+            scheduler.set_loadout(loadout);
+        }
+        if let Some(lifecycle) = &self.lifecycle {
+            // Unload all; the next enqueue re-admits under the new L1/L2 rules.
+            let _ = lifecycle.lock().await.kill_all_sidecars().await;
+        }
     }
 }
