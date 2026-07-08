@@ -293,6 +293,48 @@ pub fn spawn_pattern_task(
             })
             .unwrap_or(1);
         let mut engine = PatternEngine::with_next_session_id(next_session);
+
+        // CONN-M2: hydrate the decay/mute ladder from the persisted `patterns`
+        // table so a dismissed/muted suggestion stays suppressed across a restart
+        // (doc 08 §7). Without this the engine re-mines every signature cold
+        // (dismiss_decay = 1.0, mute lost) and re-nags. Read-once, before the loop.
+        let hydrated = db.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, signature, support, confidence, last_seen, dismiss_decay, \
+                        muted_until, recent_dismissals \
+                 FROM patterns WHERE signature IS NOT NULL",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    let recent_json: Option<String> = r.get(7)?;
+                    let recent_dismissals = recent_json
+                        .and_then(|s| serde_json::from_str::<Vec<i64>>(&s).ok())
+                        .unwrap_or_default();
+                    Ok(aperture_pattern_engine::PersistedPattern {
+                        pattern_id: r.get(0)?,
+                        signature: r.get(1)?,
+                        support: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                        confidence: r.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+                        last_seen: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                        dismiss_decay: r.get::<_, Option<f64>>(5)?.unwrap_or(1.0),
+                        muted_until: r.get(6)?,
+                        recent_dismissals,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        });
+        match hydrated {
+            Ok(rows) => {
+                let n = rows.len();
+                engine.hydrate(rows);
+                if n > 0 {
+                    tracing::info!(patterns = n, "hydrated decay/mute ladder from disk (CONN-M2)");
+                }
+            }
+            Err(e) => tracing::error!(%e, "pattern hydrate read failed; engine starts cold"),
+        }
+
         loop {
             tokio::select! {
                 state = capture_rx.recv() => {
@@ -308,14 +350,10 @@ pub fn spawn_pattern_task(
                 fb = feedback_rx.recv() => {
                     let Some((pattern_id, fb)) = fb else { break }; // shell gone
                     // Decay / reinforce / mute (doc 08 §7); flush persists the
-                    // ladder into the patterns column.
-                    // TODO(CONN-M2): the engine does NOT re-hydrate persisted
-                    // support/confidence/dismiss_decay at startup, so after a
-                    // restart it re-mines cold (dismiss_decay = 1.0) and the next
-                    // flush overwrites the saved value — the decay/mute ladder does
-                    // not actually survive a restart yet (re-nags a dismissed
-                    // suggestion). Fix = seed the engine cache by `signature` at
-                    // boot (needs a pattern-engine hydrate method, doc 08 §7).
+                    // ladder (incl. mute state, migration 0002) into the patterns
+                    // table, and the startup hydrate above restores it after a
+                    // restart — so a dismissed/muted suggestion stays suppressed
+                    // rather than re-nagging (CONN-M2, resolved).
                     engine.apply_feedback(pattern_id, fb, epoch_ms());
                     flush_patterns(&db, &mut engine);
                 }
@@ -630,13 +668,20 @@ fn flush_patterns(
     engine: &mut PatternEngine,
 ) -> std::collections::HashMap<i64, i64> {
     // Collect owned copies first — dirty_rows() borrows the engine.
-    let dirty: Vec<(String, i64, i64, i64, f64, i64, f64)> = engine
+    // Row tuple: (sig, local_id, n, support, confidence, last_seen, decay,
+    //             muted_until, recent_dismissals_json).
+    let dirty: Vec<(String, i64, i64, i64, f64, i64, f64, Option<i64>, String)> = engine
         .dirty_rows()
         .into_iter()
         .map(|(sig, row)| {
             // Signature shape: "a | b ⇒ c" — antecedent joined by " | ",
             // so n = antecedent count + 1 (gram length, doc 08 §4).
             let n = sig.split(" | ").count() as i64 + 1;
+            // CONN-M2: persist the mute half of the ladder so hydrate can restore
+            // it. recent_dismissals → a JSON i64 array (empty list on the rare
+            // serialize failure — never poison the whole flush).
+            let recent = serde_json::to_string(&row.mute.recent_dismissals)
+                .unwrap_or_else(|_| "[]".to_string());
             (
                 sig.to_string(),
                 row.pattern_id,
@@ -645,21 +690,25 @@ fn flush_patterns(
                 row.stats.confidence(),
                 row.stats.last_updated_ms,
                 row.stats.dismiss_decay,
+                row.mute.muted_until,
+                recent,
             )
         })
         .collect();
 
     let mut remap = std::collections::HashMap::new();
-    for (sig, local_id, n, support, confidence, last_seen, decay) in dirty {
+    for (sig, local_id, n, support, confidence, last_seen, decay, muted_until, recent) in dirty {
         let flushed = db.with_conn(|c| {
             c.query_row(
-                "INSERT INTO patterns (signature, n, support, confidence, last_seen, dismiss_decay) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                "INSERT INTO patterns \
+                   (signature, n, support, confidence, last_seen, dismiss_decay, muted_until, recent_dismissals) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
                  ON CONFLICT(signature) DO UPDATE SET \
                    support = excluded.support, confidence = excluded.confidence, \
-                   last_seen = excluded.last_seen, dismiss_decay = excluded.dismiss_decay \
+                   last_seen = excluded.last_seen, dismiss_decay = excluded.dismiss_decay, \
+                   muted_until = excluded.muted_until, recent_dismissals = excluded.recent_dismissals \
                  RETURNING id",
-                rusqlite::params![sig, n, support, confidence, last_seen, decay],
+                rusqlite::params![sig, n, support, confidence, last_seen, decay, muted_until, recent],
                 |r| r.get::<_, i64>(0),
             )
         });

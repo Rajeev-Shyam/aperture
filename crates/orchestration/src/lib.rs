@@ -23,6 +23,7 @@ pub mod telemetry;
 pub mod tier_router;
 pub mod toggle_owner;
 pub mod vram_table;
+pub mod warm_keep;
 
 use std::sync::Arc;
 

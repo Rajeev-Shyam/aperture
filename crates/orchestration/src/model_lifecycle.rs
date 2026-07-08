@@ -73,6 +73,19 @@ pub enum SidecarHealth {
     Down,
 }
 
+/// Outcome of an L2 [`ModelLifecycle::l2_swap_to_stt`] (doc 12 §3/§7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwapOutcome {
+    /// The resident VLM was evicted to free the slot for an STT arrival.
+    /// `thrash_risk` is true when it had been resident less than
+    /// [`L2_MIN_RESIDENCY`]: voice still wins (STT is never cancelled, doc 12 §3),
+    /// but a *recurring* thrash-risk swap is the signal to recommend L1 to the
+    /// user (doc 12 §7 [ASSUMPTION]).
+    Swapped { thrash_risk: bool },
+    /// The VLM slot was already free — nothing to evict; the STT loads directly.
+    SlotAlreadyFree,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LifecycleError {
     #[error("failed to spawn sidecar: {0}")]
@@ -116,9 +129,8 @@ struct LoadedSidecar {
     process: Box<dyn SidecarProcess>,
     model: ModelId,
     /// Load-time stamp (epoch ms, the caller's clock) for the `L2_MIN_RESIDENCY`
-    /// swap debounce (doc 12 §7). Its only reader is `l2_swap_to_stt`, which lands
-    /// at M6 — stamped now so the swap has the datum it needs the day it's wired.
-    #[allow(dead_code)] // M6: read by l2_swap_to_stt (todo! below)
+    /// swap debounce (doc 12 §7). Read by `l2_swap_to_stt` to flag a thrash-risk
+    /// swap — a VLM evicted while still inside its min-residency window.
     loaded_at_ms: i64,
     /// For `IDLE_UNLOAD` (doc 04 §5).
     last_job_at_ms: i64,
@@ -293,11 +305,26 @@ impl ModelLifecycle {
         }
     }
 
-    /// L2 only: unload the resident 7B and load Whisper for an STT arrival
-    /// (residency is exclusive in L2, doc 04 §3/§4). Debounced by
-    /// `L2_MIN_RESIDENCY` to avoid load thrash (doc 12 §7). M6 wires the STT job.
-    pub async fn l2_swap_to_stt(&mut self, _now_ms: i64) -> Result<(), LifecycleError> {
-        todo!("M6: L2 swap 7B->whisper with 20 s min-residency debounce (doc 12 §7)")
+    /// L2 only: evict the resident VLM so an arriving STT job can load into the
+    /// (exclusive, doc 04 §3/§4) GPU. Voice is **never cancelled or delayed** for
+    /// anti-thrash reasons (doc 12 §3: "an STT arrival additionally triggers the
+    /// unload(7B)→load(whisper) swap; the swap time is charged to the STT job's
+    /// thinking UI"), so the eviction is unconditional. The `L2_MIN_RESIDENCY`
+    /// window (doc 12 §7 [ASSUMPTION]) is therefore reported as a *thrash-risk
+    /// flag* on the outcome — not a block — so the caller can surface the
+    /// "prefer L1" notice if swaps keep landing inside it. Process death frees the
+    /// VLM's VRAM (doc 12 §5), so the STT load that follows fits under 7.0 GB
+    /// (ADR-030). The caller then loads STT via [`ensure_loaded`](Self::ensure_loaded).
+    pub async fn l2_swap_to_stt(&mut self, now_ms: i64) -> Result<SwapOutcome, LifecycleError> {
+        let thrash_risk = match self.slots.get(&SidecarKind::VlmHost) {
+            Some(slot) => {
+                let resident_ms = now_ms.saturating_sub(slot.loaded_at_ms);
+                resident_ms < L2_MIN_RESIDENCY.as_millis() as i64
+            }
+            None => return Ok(SwapOutcome::SlotAlreadyFree),
+        };
+        self.kill_sidecar(SidecarKind::VlmHost).await?;
+        Ok(SwapOutcome::Swapped { thrash_risk })
     }
 }
 
@@ -607,6 +634,44 @@ mod tests {
                 .await;
         }
         assert_eq!(health, SidecarHealth::Degraded(Fallback::OcrOnly));
+    }
+
+    #[tokio::test]
+    async fn l2_swap_to_stt_evicts_a_resident_vlm_and_frees_the_slot() {
+        let spawner = Arc::new(FakeSpawner::default());
+        let mut life = ModelLifecycle::new(Box::new(SpawnerHandle(Arc::clone(&spawner))));
+        // A 7B resident well past the min-residency window.
+        life.ensure_loaded(ModelId::Vlm7b, 0).await.unwrap();
+        let now = L2_MIN_RESIDENCY.as_millis() as i64 + 1_000;
+        let outcome = life.l2_swap_to_stt(now).await.unwrap();
+        assert_eq!(
+            outcome,
+            SwapOutcome::Swapped { thrash_risk: false },
+            "a long-resident VLM is evicted with no thrash flag"
+        );
+        assert!(spawner.vlm_killed.load(Ordering::SeqCst), "the VLM is evicted");
+        assert!(life.loaded_models().is_empty(), "the slot is free for the STT load");
+    }
+
+    #[tokio::test]
+    async fn l2_swap_flags_thrash_risk_but_still_evicts_within_min_residency() {
+        let spawner = Arc::new(FakeSpawner::default());
+        let mut life = ModelLifecycle::new(Box::new(SpawnerHandle(Arc::clone(&spawner))));
+        life.ensure_loaded(ModelId::Vlm7b, 0).await.unwrap();
+        // Only 1 s resident — inside the 20 s debounce window. Voice still wins
+        // (doc 12 §3); the swap is flagged, not blocked.
+        let outcome = life.l2_swap_to_stt(1_000).await.unwrap();
+        assert_eq!(outcome, SwapOutcome::Swapped { thrash_risk: true });
+        assert!(spawner.vlm_killed.load(Ordering::SeqCst), "voice is never delayed for anti-thrash");
+    }
+
+    #[tokio::test]
+    async fn l2_swap_is_a_noop_when_the_slot_is_already_free() {
+        let spawner = Arc::new(FakeSpawner::default());
+        let mut life = ModelLifecycle::new(Box::new(SpawnerHandle(Arc::clone(&spawner))));
+        let outcome = life.l2_swap_to_stt(50_000).await.unwrap();
+        assert_eq!(outcome, SwapOutcome::SlotAlreadyFree);
+        assert!(!spawner.vlm_killed.load(Ordering::SeqCst));
     }
 
     /// Adapts an `Arc<FakeSpawner>` to the `Spawner` trait (tests share the

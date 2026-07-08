@@ -3,38 +3,41 @@
 //!
 //! Aperture initiates: spawn the headless CLI and parse its JSON result.
 //! Spawning a child process is a privileged capability — this file is one of the
-//! few code paths in the crate the two-emitter rule (doc 13 §2) permits to do it.
+//! few code paths in the crate the two-emitter rule (doc 13 §2) permits it.
 //!
 //! ```text
 //! claude -p <prompt> --output-format json
 //! ```
-//! // TODO(M7: [VERIFY] exact flags, headless invocation, and JSON shape against
-//! //          the installed CLI version before shipping — doc 09 §3 marks these [VERIFY].)
 //!
 //! Parses the headless result envelope `{ result, total_cost_usd, session_id }`
 //! (doc 09 §3). `result` carries the model's text, from which we extract the
-//! strict-JSON [`StructuredSuggestions`] (doc 09 §4); `total_cost_usd` feeds
-//! cost telemetry.
+//! strict-JSON [`StructuredSuggestions`] (doc 09 §4); `total_cost_usd` feeds cost
+//! telemetry.
 //!
 //! ## stdin caveats (doc 09 §3) — keep payloads compact
-//! Documented headless behavior: empty output on large stdin (~7 000 chars on
-//! some versions) and a hard ~10 MB stdin cap. Policy: keep the prompt compact
-//! (OCR text, not screenshots — doc 09 §5) and, past the small-stdin threshold,
-//! pass long context via a **temp-file path** if the CLI version supports it
-//! rather than piping it through stdin. The preview's > 50 KB warning and the
-//! per-transport hard-stop (doc 09 §6) guard this.
-
-// TODO(M7:) spawn + parse + temp-file-for-large-context land in M7.
+//! Documented headless behavior: empty output on large stdin (~7 000 chars on some
+//! versions) and a hard ~10 MB cap. Policy: keep the prompt compact (OCR text, not
+//! screenshots — doc 09 §5); the preview's > 50 KB warning + the per-transport
+//! hard-stop guard this.
+//!
+//! ## Status (M7, best-effort)
+//! Real `tokio::process` spawn + parse; **UNVERIFIED** — not exercised against an
+//! installed CLI in CI. [VERIFY] exact flags, the headless auth check, the JSON
+//! shape, and the large-input mechanism against the installed CLI version.
 
 use async_trait::async_trait;
+use tokio::process::Command;
 
 use aperture_contracts::{
     ContextPayload, Health, ReasoningTransport, StructuredSuggestions, TransportError, TransportId,
 };
 
-/// Below this prompt length we pipe via stdin; at/above it we spill to a temp
-/// file to dodge the documented small-stdin empty-output caveat (~7k chars,
-/// doc 09 §3). // [VERIFY] the real threshold for the installed CLI version.
+use crate::suggestion_validator::parse_response;
+use crate::transports::{extract_json, render_prompt, SYSTEM_FRAMING};
+
+/// Below this prompt length we pass via `-p`; at/above it, large-context spill to a
+/// temp file is the intended mechanism (~7k-char small-stdin caveat, doc 09 §3).
+/// // [VERIFY] the real threshold + spill flag for the installed CLI version.
 pub const CLI_STDIN_COMPACT_CHARS: usize = 7_000;
 
 /// The CLI's hard stdin cap (~10 MB, doc 09 §3). The payload builder hard-stops
@@ -56,16 +59,21 @@ pub struct CliResult {
 
 /// Push transport over the Claude Code CLI (doc 09 §3).
 pub struct CliTransport {
-    /// Path to the `claude` executable (settings, not hard-coded). // TODO(M7:)
-    _exe_path: String,
+    /// Path to the `claude` executable (settings, not hard-coded).
+    exe_path: String,
 }
 
 impl CliTransport {
     /// Construct from the configured CLI executable path (settings).
     pub fn new(exe_path: impl Into<String>) -> Self {
-        Self {
-            _exe_path: exe_path.into(),
-        }
+        Self { exe_path: exe_path.into() }
+    }
+
+    /// The exact prompt string transmitted via `-p` — the system framing (shared
+    /// with the API path, doc 09 §4) + the rendered payload + the schema
+    /// instruction. Single source of truth for both `send` and `wire_bytes`.
+    fn build_prompt(&self, payload: &ContextPayload) -> String {
+        format!("{SYSTEM_FRAMING}\n\n{}", render_prompt(payload))
     }
 }
 
@@ -76,27 +84,76 @@ impl ReasoningTransport for CliTransport {
     }
 
     async fn health(&self) -> Health {
-        // TODO(M7:) probe `claude --version` (or equivalent) for installed + authenticated;
-        //           map to Ready / NeedsSetup / Unavailable. // [VERIFY] the auth check.
-        todo!("M7: detect the CLI is installed, on PATH, and authenticated")
+        // `--version` succeeding ⇒ installed + on PATH. It does NOT prove login;
+        // a real send surfaces an auth failure. [VERIFY] a cheap auth check.
+        match Command::new(&self.exe_path).arg("--version").output().await {
+            Ok(o) if o.status.success() => Health::Ready,
+            Ok(o) => Health::NeedsSetup(format!("`claude --version` exited {}", o.status)),
+            Err(e) => Health::Unavailable(format!("claude CLI not found: {e}")),
+        }
+    }
+
+    fn supports_push(&self) -> bool {
+        true
+    }
+
+    /// The exact prompt bytes that egress as the `-p` argument — audited by the
+    /// gateway (doc 13 §3).
+    fn wire_bytes(&self, payload: &ContextPayload) -> Vec<u8> {
+        self.build_prompt(payload).into_bytes()
     }
 
     async fn send(
         &self,
-        _payload: &ContextPayload,
+        payload: &ContextPayload,
     ) -> Result<StructuredSuggestions, TransportError> {
-        // INVARIANT (doc 13 §2): only reached for an already-approved payload; the
-        // gateway re-checks `user_approved` before calling any transport.
-        // TODO(M7:)
-        //   1. render the approved payload into a compact strict-JSON prompt (doc 09 §4 schema).
-        //   2. if prompt.len() < CLI_STDIN_COMPACT_CHARS -> pass via -p/stdin;
-        //      else spill to a temp file and pass its path (doc 09 §3) — and clean it up.
-        //   3. tokio::process::Command: `claude -p <prompt> --output-format json` (doc 09 §3 [VERIFY]).
-        //   4. parse CliResult; extract StructuredSuggestions from `result`
-        //      (suggestion_validator::parse_response). On malformed JSON, render `result`
-        //      as prose (answer_text) — no CLI repair round-trip (doc 09 §6).
-        //   5. mid-call cancel => kill the child; store nothing partial (doc 09 §6).
-        let _ = (CLI_STDIN_COMPACT_CHARS, CLI_STDIN_MAX_BYTES);
-        todo!("M7: spawn `claude -p ... --output-format json`, parse CliResult, extract suggestions")
+        // INVARIANT (doc 13 §2): the egress primitive self-guards — never spawn the
+        // CLI for an unapproved payload, even if a caller bypasses the gateway.
+        if !payload.user_approved {
+            return Err(TransportError::Other(
+                "refusing to spawn the CLI for an unapproved payload (two-emitter rule, doc 13 §2)".into(),
+            ));
+        }
+        let prompt = self.build_prompt(payload);
+        if prompt.len() >= CLI_STDIN_MAX_BYTES {
+            return Err(TransportError::PayloadTooLarge(format!(
+                "{} B exceeds the CLI cap of {} B",
+                prompt.len(),
+                CLI_STDIN_MAX_BYTES
+            )));
+        }
+        if prompt.len() >= CLI_STDIN_COMPACT_CHARS {
+            tracing::warn!(
+                len = prompt.len(),
+                "prompt exceeds the compact threshold; large-context temp-file spill is [VERIFY] on this CLI"
+            );
+        }
+
+        let output = Command::new(&self.exe_path)
+            .arg("-p")
+            .arg(&prompt)
+            .arg("--output-format")
+            .arg("json")
+            .output()
+            .await
+            .map_err(|e| TransportError::Other(e.to_string()))?;
+        if !output.status.success() {
+            return Err(TransportError::Unhealthy(format!("claude CLI exited {}", output.status)));
+        }
+
+        let envelope: CliResult =
+            serde_json::from_slice(&output.stdout).map_err(|_| TransportError::MalformedResponse)?;
+        if let Some(cost) = envelope.total_cost_usd {
+            tracing::info!(cost_usd = cost, session = ?envelope.session_id, "claude CLI call");
+        }
+        // Extract strict JSON from `result`; on failure render it as prose — NO CLI
+        // repair round-trip (doc 09 §6).
+        match extract_json(&envelope.result).and_then(|j| parse_response(j).ok()) {
+            Some(suggestions) => Ok(suggestions),
+            None => Ok(StructuredSuggestions {
+                suggestions: Vec::new(),
+                answer_text: Some(envelope.result),
+            }),
+        }
     }
 }

@@ -33,7 +33,7 @@ use tokio::sync::{broadcast, oneshot, watch, Mutex as TokioMutex, Notify};
 use tokio::time::Instant;
 
 use crate::budget_enforcer::{Admission, BudgetEnforcer, LoadRequest};
-use crate::model_lifecycle::{ModelLifecycle, SidecarKind};
+use crate::model_lifecycle::{ModelLifecycle, SidecarHealth, SidecarKind, SwapOutcome};
 use crate::telemetry::Telemetry;
 use crate::vram_table::ModelId;
 use crate::Loadout;
@@ -296,10 +296,36 @@ impl Inner {
         // 1. Admission (R1 + R3 ladder). Co-resident set = currently loaded.
         let loaded = self.lifecycle.lock().await.loaded_models();
         let req = self.load_request(job, &loaded);
-        let admission = {
+        let mut admission = {
             let enforcer = self.enforcer.lock().expect("enforcer");
             enforcer.admit(req, &loaded)
         };
+
+        // L2 voice swap (doc 12 §3): an STT arrival refused because the exclusive
+        // VLM is resident must EVICT it — voice is never starved. `l2_swap_to_stt`
+        // frees the VLM slot; re-admit against the freed co-resident set. Without
+        // this the held PTT would surface as BudgetRefused (the orphaned-swap bug).
+        if matches!(admission, Admission::Refused { .. })
+            && matches!(job.kind, GpuJobKind::Stt { .. })
+        {
+            // Scope the lifecycle guard so it is released BEFORE the arms re-lock it
+            // (the `match` scrutinee's temporary otherwise lives across all arms —
+            // a self-deadlock on the non-reentrant lock).
+            let swap = { self.lifecycle.lock().await.l2_swap_to_stt(now_epoch_ms()).await };
+            match swap {
+                Ok(SwapOutcome::Swapped { thrash_risk }) => {
+                    if thrash_risk {
+                        tracing::warn!("L2 STT swap inside the 20 s min-residency (thrash risk); recommend L1 (doc 12 §7)");
+                    }
+                    let loaded = self.lifecycle.lock().await.loaded_models();
+                    admission = self.enforcer.lock().expect("enforcer").admit(req, &loaded);
+                }
+                // Nothing resident to evict — the refusal stands (not an L2 swap case).
+                Ok(SwapOutcome::SlotAlreadyFree) => {}
+                Err(e) => tracing::error!(%e, "l2_swap_to_stt failed; STT admission stays refused"),
+            }
+        }
+
         let plan = match admission {
             Admission::Refused { projection_gb } => {
                 self.telemetry.record_refused();
@@ -434,6 +460,44 @@ fn now_epoch_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Acquire the loopback endpoint for `model`, routing a cold-load failure through
+/// the crash-restart ladder (doc 12 §5) rather than reporting a flat
+/// [`JobError::SidecarDown`] on the first stumble (ORCH-3).
+///
+/// One respawn attempt per job — **never a retry loop** (doc 12 §3: expiry/failure
+/// "cancels + logs, never retries in a loop"). [`ModelLifecycle::handle_crash`]
+/// does one exponential backoff + respawn and advances the 3-strike counter, which
+/// **persists across jobs** in the lifecycle: consecutive failures accumulate
+/// toward `Degraded(OcrOnly/CpuWhisper)`, and any success resets it. So a transient
+/// crash self-heals here, while a genuinely dead sidecar degrades over the next few
+/// jobs instead of hammering a full cold-load timeout on every one.
+///
+/// A job that can't get an endpoint returns `SidecarDown` — a **soft** degrade: the
+/// caller (Layer B) proceeds on OCR-only (doc 06 §6). This is a resilience path, not
+/// a safety one; the VRAM ceiling and toggle invariants are untouched by it.
+async fn acquire_endpoint(
+    lifecycle: &Arc<TokioMutex<ModelLifecycle>>,
+    model: ModelId,
+    now_ms: i64,
+) -> Result<String, JobError> {
+    let mut life = lifecycle.lock().await;
+    if let Ok(endpoint) = life.ensure_loaded(model, now_ms).await {
+        return Ok(endpoint);
+    }
+    let kind = SidecarKind::of(model);
+    match life.handle_crash(kind, model, now_ms).await {
+        // The backoff+respawn recovered: the slot now holds a ready `model`, so
+        // `ensure_loaded` reuses it (no second spawn) and hands back the endpoint.
+        SidecarHealth::Ready => life
+            .ensure_loaded(model, now_ms)
+            .await
+            .map_err(|_| JobError::SidecarDown),
+        // Still Restarting / now Degraded / Loading / Down: this job gives up and
+        // the caller degrades. The ladder state persists for the next job.
+        _ => Err(JobError::SidecarDown),
+    }
+}
+
 #[async_trait::async_trait]
 impl JobRunner for SidecarRunner {
     async fn run(
@@ -447,20 +511,7 @@ impl JobRunner for SidecarRunner {
         // monotonic `Instant` can't be shared across the two separate tasks; every
         // other lifetime in the system (retention TTLs, decay, sessions) is epoch-ms.
         let now_ms = now_epoch_ms();
-        let endpoint = {
-            let mut life = lifecycle.lock().await;
-            // TODO(M6): route a load/exec failure through `ModelLifecycle::handle_crash`
-            // (exponential backoff + 3-strike cap + Degraded→OcrOnly/CpuWhisper
-            // fallback, doc 12 §5) instead of a flat `SidecarDown`. As written, a
-            // sidecar that crashes on load is re-cold-loaded (paying the full timeout)
-            // on every job with no backoff or health surfacing. The job outcome is
-            // already soft (the caller degrades to OCR-only), so this is a resilience
-            // gap, not a safety one — `handle_crash` is implemented + tested, just
-            // not yet wired into this production run path.
-            life.ensure_loaded(model, now_ms)
-                .await
-                .map_err(|_| JobError::SidecarDown)?
-        };
+        let endpoint = acquire_endpoint(&lifecycle, model, now_ms).await?;
         match &job.kind {
             GpuJobKind::Vlm { image_jpeg, prompt } => {
                 let body = serde_json::json!({
@@ -713,6 +764,99 @@ mod tests {
         assert!(
             matches!(out, Err(JobError::BudgetRefused { .. })),
             "an over-ceiling projection must refuse, never run (M5 invariant)"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_endpoint_recovers_a_first_load_crash_via_the_ladder() {
+        // A spawner that fails its first spawn, then succeeds. `ensure_loaded`
+        // fails; `handle_crash`'s single backoff+respawn recovers it and
+        // `acquire_endpoint` hands back the endpoint (ORCH-3, doc 12 §5).
+        use crate::model_lifecycle::{LifecycleError, SidecarProcess, Spawner};
+        struct FlakySpawner {
+            fails_left: AtomicU32,
+        }
+        #[async_trait::async_trait]
+        impl Spawner for FlakySpawner {
+            async fn spawn(&self, _m: ModelId) -> Result<Box<dyn SidecarProcess>, LifecycleError> {
+                if self.fails_left.load(AtomicOrdering::SeqCst) > 0 {
+                    self.fails_left.fetch_sub(1, AtomicOrdering::SeqCst);
+                    return Err(LifecycleError::Spawn("cold-load crash".into()));
+                }
+                struct P;
+                #[async_trait::async_trait]
+                impl SidecarProcess for P {
+                    fn endpoint(&self) -> &str {
+                        "http://127.0.0.1:1"
+                    }
+                    async fn is_ready(&self) -> bool {
+                        true
+                    }
+                    async fn kill(&mut self) -> Result<(), LifecycleError> {
+                        Ok(())
+                    }
+                }
+                Ok(Box::new(P))
+            }
+        }
+        let life = Arc::new(TokioMutex::new(ModelLifecycle::new(Box::new(FlakySpawner {
+            fails_left: AtomicU32::new(1),
+        }))));
+        assert!(
+            acquire_endpoint(&life, ModelId::Vlm3b, 0).await.is_ok(),
+            "the crash ladder's respawn recovers a transient first-load crash"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_endpoint_soft_degrades_when_the_respawn_also_fails() {
+        // A spawner that always fails: `ensure_loaded` fails, `handle_crash`'s
+        // respawn also fails (Restarting), so this job soft-degrades to
+        // SidecarDown — the caller falls back to OCR-only (doc 06 §6). The 3-strike
+        // counter persists in the lifecycle for the next job.
+        use crate::model_lifecycle::{LifecycleError, SidecarProcess, Spawner};
+        struct DeadSpawner;
+        #[async_trait::async_trait]
+        impl Spawner for DeadSpawner {
+            async fn spawn(&self, _m: ModelId) -> Result<Box<dyn SidecarProcess>, LifecycleError> {
+                Err(LifecycleError::Spawn("always down".into()))
+            }
+        }
+        let life = Arc::new(TokioMutex::new(ModelLifecycle::new(Box::new(DeadSpawner))));
+        assert!(matches!(
+            acquire_endpoint(&life, ModelId::Vlm3b, 0).await,
+            Err(JobError::SidecarDown)
+        ));
+    }
+
+    #[tokio::test]
+    async fn l2_stt_swaps_out_the_resident_7b_instead_of_refusing() {
+        // A lifecycle holding the exclusive L2 7B (STT + resident 7B blows 7.0 GB).
+        let lifecycle = fake_lifecycle();
+        lifecycle.lock().await.ensure_loaded(ModelId::Vlm7b, 0).await.unwrap();
+        let (runner, _) = FakeRunner::new(Duration::from_millis(10));
+        let sched = GpuScheduler::new(
+            BudgetEnforcer::new(VramTable::seeded()),
+            Arc::clone(&lifecycle),
+            runner,
+            Arc::new(Telemetry::new()),
+            Loadout::L2,
+        );
+        let out = sched
+            .enqueue(GpuJob {
+                kind: GpuJobKind::Stt { wav: vec![0u8; 4] },
+                priority: priority::STT_VOICE,
+                deadline: Duration::from_secs(5),
+            })
+            .await;
+        // Voice is admitted (not BudgetRefused) because the scheduler evicts the 7B.
+        assert!(
+            out.is_ok(),
+            "L2 STT must swap out the 7B and admit, never refuse (doc 12 §3); got {out:?}"
+        );
+        assert!(
+            !lifecycle.lock().await.loaded_models().contains(&ModelId::Vlm7b),
+            "the resident 7B was evicted by the L2 swap"
         );
     }
 }

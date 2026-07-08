@@ -27,3 +27,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # `sha2` to compute the SHA-256 of the wire bytes for the `cloud_send` audit row
 # (doc 13 §3, doc 09 §5). [VERIFY] at build time.
 sha2 = "0.10"  # [VERIFY]
+# `uuid` to stamp each assembled ContextPayload with its payload_id (contract 2).
+uuid = { workspace = true }
+
+[dev-dependencies]
+# The `fakes` feature gives the gateway tests a `FakeTransport` (canned health +
+# response) to exercise fall-through + the egress chokepoint fully offline.
+aperture-contracts = { workspace = true, features = ["fakes"] }

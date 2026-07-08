@@ -6,7 +6,11 @@
 //!
 //! The gateway holds an ordered transport list from settings, picks the first
 //! healthy one, and is the **only** crate permitted to open network sockets or
-//! spawn the Claude CLI (doc 13 §2, the two-emitter rule, CI-lint enforced).
+//! spawn the Claude CLI (doc 13 §2, the two-emitter rule). That boundary is
+//! enforced today by dependency direction (only this crate pulls `reqwest` /
+//! process-spawn) + the permanent SC5 egress gate; a scoped CI lint (remote-egress
+//! APIs denied outside this crate, loopback allow-listed) is planned — see the
+//! `reasoning-gateway` crate TODO.
 
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +52,24 @@ pub trait ReasoningTransport: Send + Sync {
         &self,
         payload: &ContextPayload,
     ) -> Result<StructuredSuggestions, TransportError>;
+
+    /// Whether Aperture can **push** a Send to this transport. Pull transports
+    /// (MCP: Claude Desktop initiates via tool calls, doc 09 §3) return `false`, so
+    /// the gateway's push `send_with_preview` skips them — they serve the pull
+    /// handoff, not the push path. Default `true` (CLI/API are push).
+    fn supports_push(&self) -> bool {
+        true
+    }
+
+    /// The **exact bytes this transport transmits** for `payload` — the user-data
+    /// that leaves the machine, hashed for the `cloud_send` audit row (doc 13 §3,
+    /// "preview == wire"). The default is the canonical payload serialization; a
+    /// transport that wraps the payload in a request body (API JSON, CLI prompt)
+    /// overrides this to return that body verbatim, so the audit hash matches real
+    /// egress rather than a re-serialization of the payload.
+    fn wire_bytes(&self, payload: &ContextPayload) -> Vec<u8> {
+        serde_json::to_vec(payload).unwrap_or_default()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

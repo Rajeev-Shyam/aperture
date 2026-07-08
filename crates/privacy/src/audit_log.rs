@@ -91,10 +91,39 @@ impl AuditLog {
 }
 
 /// Compute the lowercase-hex SHA-256 of the exact wire bytes (doc 13 §3). The
-/// caller (gateway) passes the same serialization it transmits.
-pub fn sha256_hex(_wire_bytes: &[u8]) -> String {
-    // TODO(M9): sha2::Sha256 over wire_bytes; hex-encode lowercase (64 chars).
-    todo!("M9: sha256 of wire bytes (doc 13 §3)")
+/// caller (gateway) passes the same serialization it transmits — this is the hash
+/// the SC5 gate checks equals `sha256(previewed bytes)` ("preview == wire").
+///
+/// Implemented at M7 (the gateway/SC5 needs it); the audit-row DB *persistence*
+/// ([`AuditLog::record_cloud_send`]) remains the M9 privacy-milestone piece.
+pub fn sha256_hex(wire_bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(wire_bytes);
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha256_hex_matches_the_known_empty_and_abc_vectors() {
+        // NIST/standard test vectors.
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(sha256_hex(b"abc").len(), 64, "lowercase hex is 64 chars");
+    }
 }
 
 /// Map an audit record to its [`EventType`] — the column the retention pruner

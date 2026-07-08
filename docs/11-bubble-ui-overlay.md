@@ -57,4 +57,15 @@ The overlay subscribes to `gpu_busy` (mutex held — Doc 12). While true: glass 
 | Click-through misconfiguration | Watchdog: if hit-test region exists with no visible bubble, reset to full click-through |
 
 ---
+## Implementation status (2026-07-08) — M8 (software)
+
+Overlay + surfaces in `ui/` + `src-tauri/src/overlay.rs`:
+- Per-monitor overlays via `overlay::create_overlays` (primary reuses the config `overlay` window; others cloned + hardened click-through/capture-excluded). §2 click-through + `WDA_EXCLUDEFROMCAPTURE` are wired; DPI re-anchor (§7) is on-hardware.
+- **§3 bubble overflow menu** is portalled to `<body>` (the `contain:strict` bubble was clipping it — the three actions were unreachable) and rendered as opaque chrome; it gained Escape-to-close + focus.
+- **§4 Context-Preview panel** now backs its `aria-modal` with the real modal contract: focus-in on open, focus restored to the opener on close, Tab trap, Escape → Cancel (the zero-residue path).
+- **§5 voice confirm chip** ("Did you say…?") is no longer a dead-end: Dismiss + Escape clear it and it takes focus on appear (Run's re-issue awaits a core command).
+- Bubble concurrency cap + the glass budget are settings-driven (`ui.max_concurrent_bubbles`, `ui.max_glass_surfaces`).
+
+Full session detail: `docs/handoff/session-bridge-2026-07-08-m6-m8.md`.
+
 > **R2 amendments applied** (see docs/19–21): ADR-026, ADR-039, ADR-040 · Q42, Q49, Q65, Q66, Q71, Q81.

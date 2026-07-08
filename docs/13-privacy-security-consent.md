@@ -66,4 +66,14 @@ Every cloud send is approved — either individually **or** under a **scoped all
 | Broad extension host access (RK14) | Broad permission, **narrow use** (URLs + position only); exclusions/incognito gating; install-time disclosure; `url_pattern` + "exclude this domain"; residual exposure **accepted** (Q61) |
 
 ---
+## Implementation status (2026-07-08) — redaction + audit pulled forward to M7
+
+- **Redaction pipeline implemented (§5)** — ahead of the M9 privacy milestone, because the gateway structurally needs redaction-**before**-preview (doc 09 §5). `redaction::Redactor` runs the ordered rules (secret / payment-card-with-Luhn / IBAN / email / phone / user-terms) over every text-bearing payload item — including recursive JSON **strings and numeric values** — replacing hits with `⟨noun#n⟩` and recording the per-rule counts the preview shows. Phone matches require a formatting separator, so a bare long digit run is left for the Luhn card rule + the human (never falsely scrubbed).
+- **Audit hash (§3).** `audit_log::sha256_hex` is implemented; the gateway records the `cloud_send` hash over the transport's **actual wire bytes**, **after** a successful send (never a phantom row on a failed send), tagged with the transport that actually egressed.
+- **Two-emitter rule (§2).** The CLI-spawn / HTTPS egress primitives now **self-guard** on `user_approved` in addition to the gateway chokepoint. Enforcement today = dependency direction + the SC5 gate; the scoped CI lint is still a TODO (the contracts comment was softened from "CI-lint enforced" to match).
+- **Still M9:** consent UI + first-run sequence, DPAPI key manager, audit-row **DB persistence** (`AuditLog::record_cloud_send` — the hash is computed now, the write lands at M9), the exclusion manager, and Purge All.
+
+Full session detail: `docs/handoff/session-bridge-2026-07-08-m6-m8.md`.
+
+---
 > **R2 amendments applied** (see docs/19–21): ADR-029 (honest minimization reframe; extension URL-only use; empty default exclusions), ADR-036 (precise emitter rule; diagnostics; updater carve-out), ADR-028 (loopback-fallback scoping + SC5 whitelist), ADR-026 (scoped-allow transparency), ADR-037 (gated `aperture_search_history`), ADR-040 (`url_pattern`, first-run sequence, Activity & Privacy view, global snooze, cold-start note), ADR-038 (optional Argon2id recovery passphrase). Redaction rules (Q21) and 30 d audit survival (Q18) unchanged.
