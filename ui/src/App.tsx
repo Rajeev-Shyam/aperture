@@ -75,6 +75,13 @@ export default function App() {
       <VoiceSurfaces
         event={voice}
         onAskClaude={(actionRef) => void openPreview("answer_query", actionRef)}
+        onDismiss={() => setVoice({ surface: "hidden" })}
+        onRun={(_transcript) => {
+          // TODO(M6-followup): a `voice_run_transcript` core command re-issues the
+          // confirmed transcript through the query path. For now, confirming clears
+          // the chip so the low-confidence surface is never a stuck dead-end (review #8).
+          setVoice({ surface: "hidden" });
+        }}
       />
 
       {/* Capture state + activity pulse; OFF reflects VRAM->~0 (<3s). */}

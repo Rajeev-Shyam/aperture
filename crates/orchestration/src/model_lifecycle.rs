@@ -73,6 +73,19 @@ pub enum SidecarHealth {
     Down,
 }
 
+/// Outcome of an L2 [`ModelLifecycle::l2_swap_to_stt`] (doc 12 §3/§7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwapOutcome {
+    /// The resident VLM was evicted to free the slot for an STT arrival.
+    /// `thrash_risk` is true when it had been resident less than
+    /// [`L2_MIN_RESIDENCY`]: voice still wins (STT is never cancelled, doc 12 §3),
+    /// but a *recurring* thrash-risk swap is the signal to recommend L1 to the
+    /// user (doc 12 §7 [ASSUMPTION]).
+    Swapped { thrash_risk: bool },
+    /// The VLM slot was already free — nothing to evict; the STT loads directly.
+    SlotAlreadyFree,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LifecycleError {
     #[error("failed to spawn sidecar: {0}")]
@@ -116,6 +129,8 @@ struct LoadedSidecar {
     process: Box<dyn SidecarProcess>,
     model: ModelId,
     /// Load-time stamp (epoch ms, the caller's clock) for the `L2_MIN_RESIDENCY`
+    /// swap debounce (doc 12 §7). Read by `l2_swap_to_stt` to flag a thrash-risk
+    /// swap — a VLM evicted while still inside its min-residency window.
     /// swap debounce (doc 12 §7). Its only reader is `l2_swap_to_stt`, which lands
     /// at M6 — stamped now so the swap has the datum it needs the day it's wired.
     #[allow(dead_code)] // M6: read by l2_swap_to_stt (todo! below)
@@ -293,6 +308,210 @@ impl ModelLifecycle {
         }
     }
 
+    /// L2 only: evict the resident VLM so an arriving STT job can load into the
+    /// (exclusive, doc 04 §3/§4) GPU. Voice is **never cancelled or delayed** for
+    /// anti-thrash reasons (doc 12 §3: "an STT arrival additionally triggers the
+    /// unload(7B)→load(whisper) swap; the swap time is charged to the STT job's
+    /// thinking UI"), so the eviction is unconditional. The `L2_MIN_RESIDENCY`
+    /// window (doc 12 §7 [ASSUMPTION]) is therefore reported as a *thrash-risk
+    /// flag* on the outcome — not a block — so the caller can surface the
+    /// "prefer L1" notice if swaps keep landing inside it. Process death frees the
+    /// VLM's VRAM (doc 12 §5), so the STT load that follows fits under 7.0 GB
+    /// (ADR-030). The caller then loads STT via [`ensure_loaded`](Self::ensure_loaded).
+    pub async fn l2_swap_to_stt(&mut self, now_ms: i64) -> Result<SwapOutcome, LifecycleError> {
+        let thrash_risk = match self.slots.get(&SidecarKind::VlmHost) {
+            Some(slot) => {
+                let resident_ms = now_ms.saturating_sub(slot.loaded_at_ms);
+                resident_ms < L2_MIN_RESIDENCY.as_millis() as i64
+            }
+            None => return Ok(SwapOutcome::SlotAlreadyFree),
+        };
+        self.kill_sidecar(SidecarKind::VlmHost).await?;
+        Ok(SwapOutcome::Swapped { thrash_risk })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The production spawner: OS process + loopback health poll.
+// ---------------------------------------------------------------------------
+
+/// Where the sidecar binaries + model weights live (from settings; [VERIFY] on
+/// the real target — the GGUF weights are a metered download, deferred).
+#[derive(Debug, Clone)]
+pub struct SidecarConfig {
+    /// `aperture-vlm-host` executable (spawns llama.cpp; doc 02 §2).
+    pub vlm_host_bin: std::path::PathBuf,
+    /// Qwen2.5-VL GGUF weights (3B default / 7B opt-in, doc 04 §3).
+    pub vlm_model_gguf: std::path::PathBuf,
+    /// Vision projector (mmproj, FP16, doc 04 §2).
+    pub vlm_mmproj_gguf: std::path::PathBuf,
+    /// `aperture-stt-host` executable (M6).
+    pub stt_host_bin: std::path::PathBuf,
+    /// Context cap handed to the VLM sidecar (doc 04 R2).
+    pub vlm_ctx: u32,
+    /// Cold-load readiness deadline (doc 04 §5).
+    pub cold_load_timeout: Duration,
+}
+
+impl Default for SidecarConfig {
+    fn default() -> Self {
+        Self {
+            vlm_host_bin: std::path::PathBuf::from("aperture-vlm-host"),
+            vlm_model_gguf: std::path::PathBuf::from("models/qwen2.5-vl-3b-q4_k_m.gguf"),
+            vlm_mmproj_gguf: std::path::PathBuf::from("models/qwen2.5-vl-3b-mmproj-f16.gguf"),
+            stt_host_bin: std::path::PathBuf::from("aperture-stt-host"),
+            vlm_ctx: 4096,
+            cold_load_timeout: Duration::from_secs(15),
+        }
+    }
+}
+
+/// Real spawner: launches `aperture-vlm-host` (the sanctioned `Command`, doc 13
+/// §2) on a pinned loopback port and polls its `/health` until ready.
+pub struct OsSpawner {
+    config: SidecarConfig,
+    /// Loopback port allocator (each spawn pins a distinct 127.0.0.1 port).
+    next_port: std::sync::atomic::AtomicU16,
+}
+
+impl OsSpawner {
+    /// Base of the pinned loopback port range for sidecars ([VERIFY] no clash).
+    pub const PORT_BASE: u16 = 51_733;
+
+    pub fn new(config: SidecarConfig) -> Self {
+        Self {
+            config,
+            next_port: std::sync::atomic::AtomicU16::new(Self::PORT_BASE),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Spawner for OsSpawner {
+    async fn spawn(&self, model: ModelId) -> Result<Box<dyn SidecarProcess>, LifecycleError> {
+        #[cfg(windows)]
+        {
+            os_spawn::spawn(&self.config, model, &self.next_port).await
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = model;
+            Err(LifecycleError::Spawn(
+                "sidecars are Windows-only".to_string(),
+            ))
+        }
+    }
+}
+
+#[cfg(windows)]
+mod os_spawn {
+    use super::*;
+    use std::sync::atomic::{AtomicU16, Ordering};
+
+    /// A running sidecar child + its loopback endpoint. Killing it reaps the
+    /// transitive llama.cpp child (kill_on_drop), returning VRAM to the driver.
+    pub(super) struct OsSidecar {
+        child: tokio::process::Child,
+        base_url: String,
+        client: reqwest::Client,
+    }
+
+    #[async_trait::async_trait]
+    impl SidecarProcess for OsSidecar {
+        fn endpoint(&self) -> &str {
+            &self.base_url
+        }
+
+        async fn is_ready(&self) -> bool {
+            let url = format!("{}/health", self.base_url);
+            match self.client.get(&url).send().await {
+                Ok(resp) => resp
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|v| v.get("ready").and_then(|r| r.as_bool()))
+                    .unwrap_or(false),
+                Err(_) => false,
+            }
+        }
+
+        async fn kill(&mut self) -> Result<(), LifecycleError> {
+            // Graceful child.kill() first; kill_on_drop is the belt-and-braces.
+            if self.child.kill().await.is_ok() {
+                return Ok(());
+            }
+            // Escalate to TerminateProcess on the raw handle (doc 12 §7).
+            if let Some(pid) = self.child.id() {
+                terminate_process(pid)?;
+            }
+            Ok(())
+        }
+    }
+
+    pub(super) async fn spawn(
+        config: &SidecarConfig,
+        model: ModelId,
+        next_port: &AtomicU16,
+    ) -> Result<Box<dyn SidecarProcess>, LifecycleError> {
+        if SidecarKind::of(model) == SidecarKind::SttHost {
+            return Err(LifecycleError::Spawn("stt-host is the M6 milestone".into()));
+        }
+        let port = next_port.fetch_add(1, Ordering::Relaxed);
+        let child_port = port.wrapping_add(1000);
+        // The ONLY sanctioned std::process::Command outside the gateway (doc 13
+        // §2): a local model host, loopback only, no network reach.
+        let child = tokio::process::Command::new(&config.vlm_host_bin)
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--model")
+            .arg(&config.vlm_model_gguf)
+            .arg("--mmproj")
+            .arg(&config.vlm_mmproj_gguf)
+            .arg("--ctx")
+            .arg(config.vlm_ctx.to_string())
+            .arg("--child-port")
+            .arg(child_port.to_string())
+            .kill_on_drop(true) // invariant 3: kill => VRAM release
+            .spawn()
+            .map_err(|e| LifecycleError::Spawn(e.to_string()))?;
+
+        let base_url = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .map_err(|e| LifecycleError::Spawn(e.to_string()))?;
+        let mut sidecar = OsSidecar {
+            child,
+            base_url,
+            client,
+        };
+
+        // Poll /health until ready within the cold-load SLA (doc 04 §5).
+        let deadline = tokio::time::Instant::now() + config.cold_load_timeout;
+        while tokio::time::Instant::now() < deadline {
+            if sidecar.is_ready().await {
+                return Ok(Box::new(sidecar));
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        let _ = sidecar.kill().await;
+        Err(LifecycleError::HealthTimeout)
+    }
+
+    /// Win32 `OpenProcess` + `TerminateProcess` escalation (doc 12 §7). The
+    /// guaranteed-release backstop when `child.kill()` doesn't reap the tree.
+    fn terminate_process(pid: u32) -> Result<(), LifecycleError> {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::{
+            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+        };
+        unsafe {
+            let handle = OpenProcess(PROCESS_TERMINATE, false, pid)
+                .map_err(|e| LifecycleError::KillEscalated(e.to_string()))?;
+            let result = TerminateProcess(handle, 1);
+            let _ = CloseHandle(handle);
+            result.map_err(|e| LifecycleError::KillEscalated(e.to_string()))
+        }
     /// L2 only: unload the resident 7B and load Whisper for an STT arrival
     /// (residency is exclusive in L2, doc 04 §3/§4). Debounced by
     /// `L2_MIN_RESIDENCY` to avoid load thrash (doc 12 §7). M6 wires the STT job.
@@ -607,6 +826,44 @@ mod tests {
                 .await;
         }
         assert_eq!(health, SidecarHealth::Degraded(Fallback::OcrOnly));
+    }
+
+    #[tokio::test]
+    async fn l2_swap_to_stt_evicts_a_resident_vlm_and_frees_the_slot() {
+        let spawner = Arc::new(FakeSpawner::default());
+        let mut life = ModelLifecycle::new(Box::new(SpawnerHandle(Arc::clone(&spawner))));
+        // A 7B resident well past the min-residency window.
+        life.ensure_loaded(ModelId::Vlm7b, 0).await.unwrap();
+        let now = L2_MIN_RESIDENCY.as_millis() as i64 + 1_000;
+        let outcome = life.l2_swap_to_stt(now).await.unwrap();
+        assert_eq!(
+            outcome,
+            SwapOutcome::Swapped { thrash_risk: false },
+            "a long-resident VLM is evicted with no thrash flag"
+        );
+        assert!(spawner.vlm_killed.load(Ordering::SeqCst), "the VLM is evicted");
+        assert!(life.loaded_models().is_empty(), "the slot is free for the STT load");
+    }
+
+    #[tokio::test]
+    async fn l2_swap_flags_thrash_risk_but_still_evicts_within_min_residency() {
+        let spawner = Arc::new(FakeSpawner::default());
+        let mut life = ModelLifecycle::new(Box::new(SpawnerHandle(Arc::clone(&spawner))));
+        life.ensure_loaded(ModelId::Vlm7b, 0).await.unwrap();
+        // Only 1 s resident — inside the 20 s debounce window. Voice still wins
+        // (doc 12 §3); the swap is flagged, not blocked.
+        let outcome = life.l2_swap_to_stt(1_000).await.unwrap();
+        assert_eq!(outcome, SwapOutcome::Swapped { thrash_risk: true });
+        assert!(spawner.vlm_killed.load(Ordering::SeqCst), "voice is never delayed for anti-thrash");
+    }
+
+    #[tokio::test]
+    async fn l2_swap_is_a_noop_when_the_slot_is_already_free() {
+        let spawner = Arc::new(FakeSpawner::default());
+        let mut life = ModelLifecycle::new(Box::new(SpawnerHandle(Arc::clone(&spawner))));
+        let outcome = life.l2_swap_to_stt(50_000).await.unwrap();
+        assert_eq!(outcome, SwapOutcome::SlotAlreadyFree);
+        assert!(!spawner.vlm_killed.load(Ordering::SeqCst));
     }
 
     /// Adapts an `Arc<FakeSpawner>` to the `Spawner` trait (tests share the

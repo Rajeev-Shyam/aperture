@@ -11,6 +11,8 @@
 //  can be summoned by mouse. Nothing here bypasses the preview->Send gate: the
 //  answer bubble's "Ask Claude" opens the Context-Preview panel (doc 07 §5).
 
+import { useEffect, useRef } from "react";
+
 import {
   bubbleClick,
   voicePttDown,
@@ -22,9 +24,20 @@ interface Props {
   event: VoiceSurfaceEvent;
   /** Open the Context-Preview panel for the answer's resumable hit (gated). */
   onAskClaude: (actionRef: string) => void;
+  /** Dismiss the current surface (Dismiss / Escape on the confirm chip). */
+  onDismiss: () => void;
+  /** Run the confirmed transcript as a history query (confirm-chip "Run"). */
+  onRun: (transcript: string) => void;
 }
 
-export function VoiceSurfaces({ event, onAskClaude }: Props) {
+export function VoiceSurfaces({ event, onAskClaude, onDismiss, onRun }: Props) {
+  // Move focus to the confirm chip when it appears (role="alertdialog" requires
+  // it) so keyboard users land on the trust surface and Escape can dismiss it.
+  const chipRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (event.surface === "transcript") chipRef.current?.focus();
+  }, [event.surface]);
+
   switch (event.surface) {
     case "hidden":
       return null;
@@ -56,19 +69,33 @@ export function VoiceSurfaces({ event, onAskClaude }: Props) {
         </div>
       );
 
-    case "transcript":
-      // Confidence < 0.6 => never act on a guess; confirm first (doc 07 §4).
+    case "transcript": {
+      // Confidence < 0.6 => never act on a guess; confirm first (doc 07 §4.4).
+      const transcript = event.text;
       return (
-        <div className="voice voice--chip surface-glass surface-interactive" role="alertdialog">
+        <div
+          className="voice voice--chip surface-glass surface-interactive"
+          role="alertdialog"
+          aria-label="Confirm what you said"
+          tabIndex={-1}
+          ref={chipRef}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") onDismiss();
+          }}
+        >
           <span className="voice__chip-q">Did you say:</span>
-          <span className="voice__chip-text">“{event.text}”</span>
+          <span className="voice__chip-text">“{transcript}”</span>
           <div className="voice__chip-actions">
-            {/* TODO(M6:) Run re-issues the confirmed transcript as a query. */}
-            <button className="btn btn--primary">Run</button>
-            <button className="btn">Dismiss</button>
+            <button className="btn btn--primary" onClick={() => onRun(transcript)}>
+              Run
+            </button>
+            <button className="btn" onClick={onDismiss}>
+              Dismiss
+            </button>
           </div>
         </div>
       );
+    }
 
     case "answer":
       return (

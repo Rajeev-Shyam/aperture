@@ -9,7 +9,10 @@ use crate::DbError;
 
 /// Migrations embedded at compile time, applied in order. `schema_migrations`
 /// records the highest applied `version`.
-pub const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../migrations/0001_init.sql"))];
+pub const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../migrations/0001_init.sql")),
+    (2, include_str!("../migrations/0002_pattern_mute_persist.sql")),
+];
 
 /// Apply every migration whose version is newer than `schema_migrations.MAX(version)`.
 ///

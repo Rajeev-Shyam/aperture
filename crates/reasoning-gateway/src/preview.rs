@@ -88,3 +88,47 @@ impl PreviewSession {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aperture_contracts::{Intent, PayloadItem, TransportTarget};
+
+    fn unapproved() -> ContextPayload {
+        ContextPayload {
+            payload_id: uuid::Uuid::nil(),
+            created_ts: 0,
+            intent: Intent::SummarizeCurrent,
+            items: vec![PayloadItem::UserAddition { text: "hi".into() }],
+            redactions: vec![],
+            enrichment_offered: false,
+            transport_target: TransportTarget::MessagesApi,
+            user_approved: false,
+        }
+    }
+
+    #[test]
+    fn send_is_the_only_thing_that_approves() {
+        let session = PreviewSession::new(unapproved());
+        assert!(!session.payload().user_approved, "starts unapproved");
+        let approved = session.approve(PreviewDecision::Send).expect("Send yields the payload");
+        assert!(approved.user_approved, "Send is the sole gate that flips the flag (doc 13 §2/§3)");
+    }
+
+    #[test]
+    fn cancel_yields_nothing_zero_residue() {
+        let session = PreviewSession::new(unapproved());
+        assert!(session.approve(PreviewDecision::Cancel).is_none(), "Cancel drops the only copy");
+    }
+
+    #[test]
+    fn edits_apply_before_approval() {
+        let mut session = PreviewSession::new(unapproved());
+        session
+            .payload_mut()
+            .items
+            .push(PayloadItem::UserAddition { text: "one more thing".into() });
+        let approved = session.approve(PreviewDecision::Send).unwrap();
+        assert_eq!(approved.items.len(), 2, "the edited object is exactly what ships (preview == wire)");
+    }
+}

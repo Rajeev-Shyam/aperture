@@ -13,6 +13,7 @@
 //  animated. Under `gpu_busy` the CSS strips blur + collapses motion to fades.
 
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 
 import type { BubbleLifecycleState } from "../lib/ipc";
 import { DEFAULTS, DwellTimer, type BubbleInstance } from "../state/bubbleLifecycle";
@@ -45,7 +46,26 @@ export function Bubble({
 }: Props) {
   const { spec, state } = instance;
   const [overflowOpen, setOverflowOpen] = useState(false);
+  // The overflow menu is PORTALLED to <body>: `.bubble` sets `contain: strict`
+  // (bound rasterization, doc 14 §3), which clips any absolutely-positioned
+  // descendant — so an in-tree menu never paints. We render it fixed-positioned
+  // against the trigger's rect instead (review #1). It is opaque chrome, so it
+  // never counts toward the ≤2-glass budget (review #21, ADR-039).
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const [menuPos, setMenuPos] = useState<{ right: number; bottom: number } | null>(null);
   const dwellRef = useRef<DwellTimer | null>(null);
+
+  function toggleOverflow() {
+    setOverflowOpen((open) => {
+      const next = !open;
+      if (next && triggerRef.current) {
+        const r = triggerRef.current.getBoundingClientRect();
+        // Anchor above the ⋯ trigger, right-aligned (the stack sits bottom-right).
+        setMenuPos({ right: window.innerWidth - r.right, bottom: window.innerHeight - r.top + 6 });
+      }
+      return next;
+    });
+  }
 
   // entering -> idle after the 180ms enter animation, then start the dwell.
   useEffect(() => {
@@ -125,49 +145,61 @@ export function Bubble({
           ×
         </button>
         <button
+          ref={triggerRef}
           className="btn btn--icon"
           aria-label="More actions"
           aria-haspopup="menu"
           aria-expanded={overflowOpen}
-          onClick={() => setOverflowOpen((v) => !v)}
+          onClick={toggleOverflow}
         >
           ⋯
         </button>
       </div>
 
-      {overflowOpen && (
-        <div className="bubble__overflow surface-glass" role="menu">
-          <button
-            role="menuitem"
-            onClick={() => {
-              setOverflowOpen(false);
-              onAskClaude();
+      {overflowOpen &&
+        menuPos &&
+        createPortal(
+          <div
+            className="bubble__overflow surface-opaque surface-interactive"
+            role="menu"
+            style={{ position: "fixed", right: menuPos.right, bottom: menuPos.bottom }}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") setOverflowOpen(false);
             }}
           >
-            Ask Claude about this
-          </button>
-          <button
-            role="menuitem"
-            onClick={() => {
-              setOverflowOpen(false);
-              // TODO(M3:) invoke a mute-pattern command (feedback -> doc 08 §7).
-              onDismiss();
-            }}
-          >
-            Mute this pattern
-          </button>
-          <button
-            role="menuitem"
-            onClick={() => {
-              setOverflowOpen(false);
-              // TODO(M9:) invoke an exclude-app command (-> exclusion list, doc 13 §4).
-              onDismiss();
-            }}
-          >
-            Exclude this app
-          </button>
-        </div>
-      )}
+            <button
+              role="menuitem"
+              autoFocus
+              onClick={() => {
+                setOverflowOpen(false);
+                onAskClaude();
+              }}
+            >
+              Ask Claude about this
+            </button>
+            <button
+              role="menuitem"
+              onClick={() => {
+                setOverflowOpen(false);
+                // TODO(M3:) invoke a mute-pattern command (feedback -> doc 08 §7).
+                onDismiss();
+              }}
+            >
+              Mute this pattern
+            </button>
+            <button
+              role="menuitem"
+              onClick={() => {
+                setOverflowOpen(false);
+                // TODO(M9:) invoke an exclude-app command (-> exclusion list, doc 13 §4).
+                onDismiss();
+              }}
+            >
+              Exclude this app
+            </button>
+          </div>,
+          document.body,
+        )}
     </div>
   );
 }

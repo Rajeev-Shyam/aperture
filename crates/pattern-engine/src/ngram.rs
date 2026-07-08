@@ -51,6 +51,19 @@ impl NGram {
     }
 }
 
+/// Parse a persisted `signature` back into the `(antecedent_key, consequent)`
+/// pair a hydrate needs (CONN-M2) — the partial inverse of [`NGram::signature`].
+/// The antecedent key (`"… ⇒ *"`) re-links the row into the sibling index for
+/// candidate generation, and the decoded consequent token lets the hydrated row
+/// form a candidate without waiting to be re-mined. Returns `None` for a
+/// malformed signature (missing separator or an unparseable consequent), which
+/// the caller skips rather than aborting the whole load.
+pub fn parse_signature(signature: &str) -> Option<(String, Token)> {
+    let (antecedent, consequent) = signature.split_once(" ⇒ ")?;
+    let consequent = Token::decode(consequent)?;
+    Some((format!("{antecedent} ⇒ *"), consequent))
+}
+
 /// A session-local ring of recent tokens; produces the current matching tail and
 /// all closing n-grams as each new token arrives (doc 08 §4-§5).
 #[derive(Debug, Default)]
@@ -133,6 +146,24 @@ mod tests {
         assert_eq!(g4.len(), 3, "n=2,3,4 all close");
         let g5 = w.push(tok("e"));
         assert_eq!(g5.len(), 3, "window trimmed to MAX_N; still n=2..4");
+    }
+
+    #[test]
+    fn parse_signature_round_trips_the_consequent_and_antecedent_key() {
+        let mut w = NGramWindow::new();
+        w.push(tok("a"));
+        w.push(tok("b"));
+        let g = &w.push(tok("c"))[0]; // "a | b ⇒ c" (3-gram) or "b ⇒ c"
+        let sig = g.signature();
+        let (ant_key, consequent) = parse_signature(&sig).expect("well-formed signature parses");
+        assert_eq!(ant_key, g.antecedent_key(), "antecedent key is reconstructed");
+        assert_eq!(consequent, g.consequent, "consequent decodes back to the same token");
+    }
+
+    #[test]
+    fn parse_signature_rejects_malformed_input() {
+        assert!(parse_signature("no-arrow-here").is_none());
+        assert!(parse_signature("a ⇒ too:many:colons:here").is_none());
     }
 
     #[test]
