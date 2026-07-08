@@ -52,15 +52,4 @@ Chrome and liquid glass as a **documented system**: a dark canvas world where su
 - **Verification (M8 gate):** PresentMon shows no overlay frame drops while a VLM job runs; glass↔fallback swap is visually clean; the M8 test also **sets the final glass-surface cap.** [VERIFY]
 
 ---
-## Implementation status (2026-07-08) — M8 (software)
-
-Built in `ui/` + `src-tauri/src/overlay.rs`:
-- **Glass-surface budget** (`ui/src/state/glassBudget.ts`): `isOpaqueForBudget(index, cap)` — the first `cap` visible bubbles render glass, the rest opaque; `cap` now comes from `ui.max_glass_surfaces` (default 2), not a hardcoded 2. §5's ≤2-glass + opaque-3rd holds.
-- **Degrade-under-load** (§5): `gpuBusy.ts` toggles `body.gpu-busy`; the CSS swaps `.surface-glass` → opaque (no blur, fades) — so under a VLM/STT job every surface is opaque. `prefers-reduced-motion` now also strips glass with `!important` (it previously lost to component CSS by source order).
-- **Multi-monitor** (doc 11 §2): `overlay::plan_overlays` (pure, tested) + `create_overlays` (best-effort per-monitor + `harden`); DPI re-anchor is on-hardware.
-- The bubble **overflow menu** is now portalled out of the `contain:strict` bubble (it was clipped/unreachable) and renders as **opaque chrome**, so it never pushes the live glass count past the cap.
-- **Flags:** the **PresentMon frame-drop gate + the final glass cap are `#[ignore]`/on-hardware** (§5). The liquid-refraction tier remains deferred post-v1 (ADR-039).
-
-Full session detail: `docs/handoff/session-bridge-2026-07-08-m6-m8.md`.
-
 > **R2 amendments applied** (see docs/19–21): ADR-039 · Q68, Q80.

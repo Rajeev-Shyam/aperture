@@ -38,25 +38,6 @@ impl Token {
             None => format!("{}:{}:∅", clean(&self.app_class), clean(&self.action)),
         }
     }
-
-    /// Inverse of [`encode`](Self::encode): parse one encoded token back into a
-    /// [`Token`]. Fields split on `:`; a `∅` resource decodes to `None`. Because
-    /// `encode` folds any `:`/`⇒` inside a class to `_`, the three coarse fields
-    /// never contain the separator, so the split is unambiguous — the round-trip
-    /// is stable for every class the miner produces. Returns `None` for a string
-    /// that isn't the expected `app:action:resource` shape (a corrupt persisted
-    /// signature, skipped by the hydrate rather than crashing it — CONN-M2).
-    pub fn decode(encoded: &str) -> Option<Token> {
-        let parts: Vec<&str> = encoded.split(':').collect();
-        if parts.len() != 3 {
-            return None;
-        }
-        Some(Token {
-            app_class: parts[0].to_string(),
-            action: parts[1].to_string(),
-            resource_class: (parts[2] != "∅").then(|| parts[2].to_string()),
-        })
-    }
 }
 
 /// Map a raw process name to its coarse `app_class` via the alias table (doc 08 §2).

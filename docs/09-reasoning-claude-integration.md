@@ -49,14 +49,4 @@ Validation: schema-check on receipt; the bubble's action button **shows optimist
 | Cloud suggests an unresumable action | Connector validation fails ⇒ shown as text-only advice, no action button |
 
 ---
-## Implementation status (2026-07-08) — M7 (software)
-
-Built + CPU-tested in `crates/reasoning-gateway`:
-- `payload_builder`: gather → **redact-before-preview** → cap `event_trail` at 50 → truncate-oldest-first-to-fit → `cloud_send` hash. `Gateway::send_with_preview` is the single egress chokepoint: re-checks `user_approved`, picks the first **healthy push** transport, transmits, **then** audits (after a successful send) over the transport's **real wire bytes**, then re-validates each suggestion per-connector (cloud suggests, only connectors act). The `preview` module is the sole setter of `user_approved`.
-- Transports: `api` (HTTPS Messages) + `cli` (`claude -p … --output-format json`) are push; `mcp` is **pull** (`supports_push()==false`, so the push picker skips it — a registered MCP no longer dead-ends the default MCP-primary order). MCP `register`/`health`/`submit` + the config-merge are done; the stdio JSON-RPC server + `aperture_get_context` payload-store gate are deferred.
-- SC5 CPU-half proven here (preview==wire by hash; **zero egress until an approved send**; the audit hashes the transport's actual bytes, and each egress primitive self-guards on `user_approved`). The ETW/mitmproxy byte-monitor half stays `#[ignore]`.
-- **Decisions/flags:** the two-emitter rule is enforced by dependency direction + SC5 (a scoped CI lint is still a TODO — contract comment softened accordingly). `api`/`cli` egress bodies are **UNVERIFIED** (no live key/CLI in CI). **Deferred:** the gated `aperture_search_history` tool (ADR-037 — **gated-search UX still an open question**, rides on the MCP server) and the gateway's composition-root wiring.
-
-Full session detail: `docs/handoff/session-bridge-2026-07-08-m6-m8.md`.
-
 > **R2 amendments applied** (see docs/19–21): ADR-025 (MCP-primary transport), ADR-035 (validate-on-click), ADR-036 (diagnostics via gateway), ADR-037 (gated `aperture_search_history`); Q83 (fallback UX), Q84 (cache layout).

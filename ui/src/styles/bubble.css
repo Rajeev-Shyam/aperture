@@ -146,17 +146,17 @@
   outline-offset: 1px;
 }
 
-/*
- * Overflow menu (⋯). PORTALLED to <body> and positioned `fixed` inline against
- * the trigger rect (Bubble.tsx) — `.bubble`'s `contain: strict` clips in-tree
- * descendants, so the menu cannot live inside the bubble box (review #1). It
- * wears `.surface-opaque` (opaque chrome, no blur), so this transient menu never
- * pushes the live glass-surface count past the ≤2 cap (review #21, ADR-039).
- * Position + `position: fixed` come from the inline style; keep only the look here.
- */
+/* Overflow menu (⋯) — itself a small glass surface; counts toward the cap. */
 .bubble__overflow {
+  position: absolute;
+  top: 100%;
+  right: 8px;
+  margin-top: 6px;
   min-width: 200px;
-  z-index: 20;
+  z-index: 2;
+  background: var(--glass-2);
+  -webkit-backdrop-filter: blur(var(--blur-12)) saturate(var(--saturate));
+  backdrop-filter: blur(var(--blur-12)) saturate(var(--saturate));
   border: 1px solid var(--border-hairline);
   border-radius: var(--radius-12);
   box-shadow: var(--shadow-elev), var(--lens-lip);

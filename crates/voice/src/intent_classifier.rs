@@ -70,19 +70,14 @@ impl IntentResult {
 pub fn classify(transcript: &str, confidence: f32) -> IntentResult {
     let normalized = transcript.trim().to_lowercase();
 
-    // (2) Escalation prefix wins over the generic verb match (doc 07 §4.2). Require
-    // a word boundary after the prefix so "ask claudes plan" is NOT an escalation —
-    // only a bare "ask claude" or "ask claude <ws>…" is.
+    // (2) Escalation prefix wins over the generic verb match (doc 07 §4.2).
     if let Some(rest) = normalized.strip_prefix(ESCALATION_PREFIX) {
-        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
-            let query = rest.trim();
-            return IntentResult {
-                intent: Intent::Escalation,
-                confidence,
-                escalation_query: (!query.is_empty()).then(|| query.to_string()),
-            };
-        }
-        // else: falls through to the verb/interrogative match below.
+        let query = rest.trim();
+        return IntentResult {
+            intent: Intent::Escalation,
+            confidence,
+            escalation_query: (!query.is_empty()).then(|| query.to_string()),
+        };
     }
 
     // (1) Leading-verb / interrogative match ⇒ query (doc 07 §4.1).
@@ -122,22 +117,6 @@ mod tests {
         let r = classify("ask claude to summarize this thread", 0.9);
         assert_eq!(r.intent, Intent::Escalation);
         assert_eq!(r.escalation_query.as_deref(), Some("to summarize this thread"));
-    }
-
-    #[test]
-    fn bare_ask_claude_is_escalation_with_no_query() {
-        let r = classify("ask claude", 0.9);
-        assert_eq!(r.intent, Intent::Escalation);
-        assert_eq!(r.escalation_query, None);
-    }
-
-    #[test]
-    fn ask_claude_requires_a_word_boundary() {
-        // "ask claudes plan" must NOT strip to escalation "s plan"; it falls through
-        // to the leading-verb match ("ask" is a command verb) → Query.
-        let r = classify("ask claudes plan for the week", 0.9);
-        assert_eq!(r.intent, Intent::Query);
-        assert_eq!(r.escalation_query, None);
     }
 
     #[test]

@@ -272,16 +272,13 @@ fn run_tauri(
         ])
         .setup(move |app| {
             use tauri::Manager;
-            // Overlay setup (doc 11 §2, M8): one click-through, capture-excluded
-            // window per monitor (the primary reuses the config `overlay` window).
-            // A failure here degrades to the primary staying up — never fatal.
-            match overlay::create_overlays(app.handle()) {
-                Ok(windows) => tracing::info!(count = windows.len(), "overlays created (per-monitor)"),
-                Err(e) => {
-                    tracing::error!(%e, "per-monitor overlay fan-out failed; hardening the primary only");
-                    if let Some(window) = app.get_webview_window(overlay::OVERLAY_LABEL) {
-                        overlay::harden(&window);
-                    }
+            // Overlay hardening (doc 11 §2): click-through + capture-exclusion.
+            if let Some(window) = app.get_webview_window(overlay::OVERLAY_LABEL) {
+                if let Err(e) = overlay::make_click_through(&window) {
+                    tracing::error!(%e, "overlay click-through failed (doc 11 §2)");
+                }
+                if let Err(e) = overlay::exclude_from_capture(&window) {
+                    tracing::error!(%e, "overlay capture-exclusion failed (doc 05 §2)");
                 }
             }
             // Capture starts OFF (doc 13 §8) — the indicator must say so.

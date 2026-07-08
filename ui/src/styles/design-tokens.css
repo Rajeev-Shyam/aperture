@@ -109,13 +109,10 @@ body.gpu-busy .surface-glass {
 
 /* prefers-reduced-motion => same fallback class + minimal motion (doc 14 §5). */
 @media (prefers-reduced-motion: reduce) {
-  /* !important so this beats the components' own `backdrop-filter` (declared at
-   * equal specificity in bubble.css, which loads AFTER this file) — matching how
-   * `.gpu-busy` and `.surface-opaque` win their swaps (review #20, doc 14 §5). */
   .surface-glass {
-    background: var(--fallback-opaque) !important;
-    -webkit-backdrop-filter: none !important;
-    backdrop-filter: none !important;
+    background: var(--fallback-opaque);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
   }
   *,
   *::before,

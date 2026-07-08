@@ -73,12 +73,6 @@ pub struct KnnHit {
     pub payload: serde_json::Value,
     pub connector_type: Option<String>,
     pub reconstruct_payload: Option<serde_json::Value>,
-    /// The event's `connector_id` (the Resume-action ref for the voice answer
-    /// bubble, doc 07 §5); `None` when the event has no connector.
-    pub connector_id: Option<String>,
-    /// The joined connector's TTL (doc 10). `Some(ts)` past which it is stale;
-    /// `None` = never stale. Lets retrieval offer Resume only on a *fresh* state.
-    pub stale_after_ts: Option<i64>,
     pub distance: f64,
 }
 
@@ -382,12 +376,6 @@ impl Db {
         if !self.vec_loaded {
             return Err(DbError::Sqlite("sqlite-vec is not loaded".into()));
         }
-        // sqlite-vec's `MATCH … AND k = N` truncates to the N globally-nearest
-        // BEFORE the `e.ts >= floor` join filter, so a time-scoped query could lose
-        // most/all of its k to out-of-window neighbours (a recall cliff). Oversample
-        // the vector search, then apply the floor and LIMIT to the requested k — the
-        // returned k are the nearest *within* the window (doc 03 §5).
-        let oversample = k.saturating_mul(8).clamp(k, 512);
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "WITH knn AS ( \
@@ -395,17 +383,15 @@ impl Db {
                    WHERE embedding MATCH ?1 AND k = ?2 \
                  ) \
                  SELECT e.id, e.ts, e.type, e.window_title, e.payload, \
-                        cs.connector_type, cs.reconstruct_payload, knn.distance, \
-                        e.connector_id, cs.stale_after_ts \
+                        cs.connector_type, cs.reconstruct_payload, knn.distance \
                  FROM knn \
                  JOIN events e ON e.id = knn.event_id \
                  LEFT JOIN connector_state cs ON cs.id = e.connector_id \
                  WHERE e.ts >= ?3 \
-                 ORDER BY knn.distance ASC \
-                 LIMIT ?4",
+                 ORDER BY knn.distance ASC",
             )?;
             let rows = stmt.query_map(
-                rusqlite::params![vec_to_blob(query_vec), oversample, recency_floor_ms, k],
+                rusqlite::params![vec_to_blob(query_vec), k, recency_floor_ms],
                 |row| {
                     let payload_text: String = row.get(4)?;
                     let reconstruct_text: Option<String> = row.get(6)?;
@@ -419,8 +405,6 @@ impl Db {
                         connector_type: row.get(5)?,
                         reconstruct_payload: reconstruct_text
                             .and_then(|t| serde_json::from_str(&t).ok()),
-                        connector_id: row.get(8)?,
-                        stale_after_ts: row.get(9)?,
                         distance: row.get(7)?,
                     })
                 },
@@ -617,46 +601,5 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].event_id, id1, "nearest neighbour is the matching event");
         assert!(hits[0].distance <= hits[1].distance);
-    }
-
-    #[test]
-    fn knn_recency_floor_does_not_starve_in_window_hits() {
-        // Regression (review #7): the recency floor must not be applied only AFTER
-        // vec-truncation, or out-of-window near-neighbours crowd out the in-window
-        // hit. Two OLD events sit exactly on the query (distance 0); one RECENT
-        // event is slightly farther. With k=2 and a floor between them, the naive
-        // "k-nearest then filter" would return nothing; oversampling must surface
-        // the in-window hit.
-        let db = Db::open_in_memory().expect("open");
-        let at = |ts: i64| {
-            let mut e = sample_event(EventType::WindowFocus);
-            e.ts = ts;
-            e
-        };
-        let mut on_query = vec![0.0f32; 768];
-        on_query[0] = 1.0; // distance 0 to the query
-        let mut slightly_off = vec![0.0f32; 768];
-        slightly_off[0] = 0.8;
-        slightly_off[1] = 0.6; // unit, but farther from the query
-
-        // Two nearest-but-OLD, one farther-but-RECENT.
-        db.insert_event_with_context(&at(1_000), None, Some(&on_query)).unwrap();
-        db.insert_event_with_context(&at(2_000), None, Some(&on_query)).unwrap();
-        let recent_id = db
-            .insert_event_with_context(&at(9_000_000), None, Some(&slightly_off))
-            .unwrap();
-
-        let mut q = vec![0.0f32; 768];
-        q[0] = 1.0;
-        let hits = db.knn(&q, 2, 5_000_000).expect("knn");
-        assert!(
-            hits.iter().any(|h| h.event_id == recent_id),
-            "the in-window hit must survive the recency floor (got {} hits)",
-            hits.len()
-        );
-        assert!(
-            hits.iter().all(|h| h.ts >= 5_000_000),
-            "no out-of-window (old) event may be returned"
-        );
     }
 }

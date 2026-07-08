@@ -61,13 +61,4 @@ ON reverses lazily: hooks + sampler immediately; sidecars stay down until first 
 | Settings flip L1→L2 mid-session | Treated as: unload all → admit next job under the new loadout's rules |
 
 ---
-## Implementation status (2026-07-08) — M6 orchestration wiring
-
-- **L2 STT swap wired end-to-end (§3).** `ModelLifecycle::l2_swap_to_stt` evicts the exclusive VLM and returns `SwapOutcome::Swapped { thrash_risk }` (flags an eviction inside the 20 s min-residency). The **scheduler now invokes it**: `admit_and_run`, on an STT job refused because the 7B is resident, evicts + re-admits so **voice is never starved**. Proven by `m6_l2_swap` (enforcer isolation) **and** a scheduler-level test (eviction + admission) — the latter was added after review found the swap was implemented but orphaned.
-- **Crash-restart ladder wired (§5).** `gpu_scheduler::acquire_endpoint` routes a cold-load failure through `handle_crash` (backoff + 3-strike + Degraded→OcrOnly/CpuWhisper); one respawn per job, the 3-strike counter persists across jobs.
-- **Warm-keep (§7 / ADR-030).** `warm_keep::PttWarmKeep` (≥2 PTT/5 min) computes the pin; the idle sweep honors `set_warm_kept`. Driving it from the PTT path is composition-root wiring (pending).
-
-Full session detail: `docs/handoff/session-bridge-2026-07-08-m6-m8.md`.
-
----
 > **R2 amendments applied** (see docs/19–21): ADR-031 (four-tier priorities: STT 100 > user-VLM 80 > enrichment-VLM 70 > pattern-VLM 50; deadlines measured at M5/M6), ADR-030 (7.0 GB cap + co_resident_weights in the projection; STT swap victim; warm-kept-STT protection rule), ADR-036/Q89 (diagnostics via the gateway only, opt-in/aggregate/audited), ADR-040/Q93 (reduced-mode notice + health in the Activity & Privacy view), ADR-027/FIX 2.1 (toggle-OFF halts extension forwarding). Min-residency 20 s unchanged (Q37).

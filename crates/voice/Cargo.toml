@@ -20,9 +20,3 @@ serde_json = { workspace = true }
 global-hotkey = "0.6"                                                          # [VERIFY]
 # WASAPI shared-mode default-mic capture; resampled to 16 kHz mono PCM (doc 07 §2).
 cpal = "0.15"                                                                  # [VERIFY]
-
-[dev-dependencies]
-# The `fakes` feature exposes `FakeScheduler` so the per-utterance pipeline can be
-# tested end-to-end with a canned STT output (no GPU). Test-only — the fakes are
-# never compiled into the shipping subsystem.
-aperture-contracts = { workspace = true, features = ["fakes"] }

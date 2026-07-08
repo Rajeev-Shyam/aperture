@@ -31,7 +31,6 @@ import {
   type UnlistenFn,
 } from "../lib/ipc";
 import { admit, type BubbleInstance } from "../state/bubbleLifecycle";
-import { DEFAULT_GLASS_CAP, isOpaqueForBudget } from "../state/glassBudget";
 import { Bubble } from "./Bubble";
 
 interface Props {
@@ -43,8 +42,6 @@ export function BubbleContainer({ onAskClaude }: Props) {
   const [bubbles, setBubbles] = useState<BubbleInstance[]>([]);
   // doc 11 §3 / doc 14 §5 hard cap; refreshed from settings on mount.
   const maxVisibleRef = useRef(3);
-  // ADR-039 glass-surface cap; from `ui.max_glass_surfaces`, default 2 (doc 14 §5).
-  const glassCapRef = useRef(DEFAULT_GLASS_CAP);
 
   useEffect(() => {
     const unlisteners: UnlistenFn[] = [];
@@ -54,8 +51,6 @@ export function BubbleContainer({ onAskClaude }: Props) {
     void getSettings().then((s) => {
       const n = s.ui?.max_concurrent_bubbles;
       if (typeof n === "number" && n > 0) maxVisibleRef.current = n;
-      const g = s.ui?.max_glass_surfaces;
-      if (typeof g === "number" && g >= 0) glassCapRef.current = g;
     });
 
     // Restore any queued suggestions surviving in SQLite (doc 11 §7).
@@ -135,9 +130,8 @@ export function BubbleContainer({ onAskClaude }: Props) {
         <Bubble
           key={b.id}
           instance={b}
-          // ADR-039/C4 (R2): the glass-surface budget; the 3rd+ visible renders
-          // opaque (cap from ui.max_glass_surfaces, default 2 — doc 14 §5).
-          opaque={isOpaqueForBudget(i, glassCapRef.current)}
+          // ADR-039/C4 (R2): ≤2 glass surfaces; the 3rd+ visible renders opaque.
+          opaque={i >= 2}
           onResume={() => onResume(b)}
           onDismiss={() => {
             // User-driven: persist + teach the ladder (doc 08 §7) so the

@@ -158,12 +158,4 @@ ORDER BY knn.distance ASC;
 One-click **Purge All** truncates every table and VACUUMs. `capture_toggle` and `cloud_send` audit rows survive purge for 30 days [ASSUMPTION: user accountability], then expire. Opt-in **diagnostics sends** are audited on the same footing (ADR-036) and surfaced in the Activity & Privacy view.
 
 ---
-## Implementation status (2026-07-08) — M6/M7 schema deltas
-
-- **Migration `0002_pattern_mute_persist.sql`** adds `patterns.muted_until` + `patterns.recent_dismissals` (JSON) so the decay/**mute** ladder survives a restart (CONN-M2 fix): `PatternEngine::hydrate` reloads them at boot and the flush persists them, so a dismissed/muted suggestion no longer re-nags after a restart.
-- **KNN retrieval (§5)** now returns `connector_id` + `stale_after_ts` (the voice answer bubble's Resume ref + freshness gate) and **oversamples the vector search before the recency floor** so a time-scoped query keeps its k in-window hits (the floor was previously applied only after vec-truncation — a recall cliff). Same SQL still backs the gated `aperture_search_history` (ADR-037).
-- Voice utterances persist as `voice_utterance` events + `ctx_vec` embeddings via one atomic single-writer transaction (doc 07 store step).
-
-Full session detail: `docs/handoff/session-bridge-2026-07-08-m6-m8.md`.
-
 > **R2 amendments applied** (see docs/19–21): ADR-040/Q81 (`suggestions.useful_rating`), ADR-040 (`exclusion_list` `url_pattern`), ADR-032/Q72 (`thumb_phash` near-duplicate-frame gate), ADR-037 (retrieval SQL reused by gated `aperture_search_history`), ADR-040/Q71 (`event_trail` user-adjustable within the 50 cap), ADR-036 (diagnostics audited). Retention TTLs and 768-dim `ctx_vec` confirmed unchanged (Q73, Q2). Mirrored in `crates/db/migrations/0001_init.sql`.

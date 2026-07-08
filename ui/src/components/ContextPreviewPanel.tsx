@@ -21,7 +21,7 @@
 //  Contract law (doc 15 §2): only THIS panel sets `user_approved` (via
 //  `preview_set_approved`); only the gateway consumes an approved payload.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 
 import {
   previewSend,
@@ -68,39 +68,6 @@ export function ContextPreviewPanel({ payload, onChange, onClose }: Props) {
   const [sending, setSending] = useState(false);
   const [freeText, setFreeText] = useState("");
   const [historyMinutes, setHistoryMinutes] = useState(0);
-  const panelRef = useRef<HTMLDivElement>(null);
-
-  // `aria-modal` must be backed by the real modal contract (this is the ONE gate
-  // where the user reviews exactly what egresses): move focus in on open, restore
-  // it to the opener on close, trap Tab, and map Escape to Cancel — the
-  // zero-residue safe path (doc 13 §3).
-  useEffect(() => {
-    const opener = document.activeElement as HTMLElement | null;
-    panelRef.current?.focus();
-    return () => opener?.focus?.();
-  }, []);
-
-  function onKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      onClose(); // Cancel — drop everything, zero residue (doc 13 §3).
-      return;
-    }
-    if (e.key !== "Tab") return;
-    const focusables = panelRef.current?.querySelectorAll<HTMLElement>(
-      'button:not([disabled]), [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
-    );
-    if (!focusables || focusables.length === 0) return;
-    const first = focusables[0];
-    const last = focusables[focusables.length - 1];
-    if (e.shiftKey && document.activeElement === first) {
-      e.preventDefault();
-      last.focus();
-    } else if (!e.shiftKey && document.activeElement === last) {
-      e.preventDefault();
-      first.focus();
-    }
-  }
 
   // Size/token estimate over the EXACT wire serialization (doc 09 §5). We strip
   // nothing — JSON.stringify here matches what `preview_send` ships (modulo the
@@ -179,9 +146,6 @@ export function ContextPreviewPanel({ payload, onChange, onClose }: Props) {
       role="dialog"
       aria-modal="true"
       aria-label="Context preview — review exactly what will be sent"
-      ref={panelRef}
-      tabIndex={-1}
-      onKeyDown={onKeyDown}
     >
       {/* 1. Intent (editable preset) */}
       <header className="preview__head">

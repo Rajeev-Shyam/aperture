@@ -46,15 +46,4 @@ transcript ─► embed ─► retrieval SQL (Doc 03 §5, temporal phrases set t
 | 7B-mode swap latency | UI "thinking" state; past a **user-configurable swap threshold** (default 6 s [ASSUMPTION]), fall back to CPU automatically |
 
 ---
-## Implementation status (2026-07-08) — M6 (software)
-
-Built + CPU-tested in `crates/voice` + `crates/stt-host`:
-- `VoiceSubsystem::process_utterance`: VAD trim → priority-100 STT `GpuJob` → **unconditional** `voice_utterance` store+embed → deterministic intent → query(retrieval) / escalation(preview draft, never auto-sent) / telemetry branch, with the `<0.6` confirm chip. End-to-end tested against a fake scheduler + in-memory DB.
-- Intent: the `ask claude` escalation prefix now requires a following word boundary ("ask claudes plan" classifies as a query, not an escalation).
-- **Decision — VAD backend:** M6 ships a deterministic **energy-gate** trim (RMS, tested) behind the `frame_is_speech` seam; **Silero VAD (ONNX, §2) is the on-hardware quality upgrade**, not yet wired.
-- **Flags (UNVERIFIED, best-effort — compile against the real crate APIs, not run without a mic/GPU):** cpal WASAPI capture, `global-hotkey` PTT, the `stt-host` whisper.cpp child. **SC4 latency is `#[ignore]`** pending the RTX 5060.
-- **Deferred:** the confirm-chip **Run** action needs a `voice_run_transcript` core command (Dismiss + Escape work today); composition-root wiring (PTT hotkey thread, capture-toggle→enable/disable, warm-keep→`set_warm_kept`) is not yet constructed in the shell.
-
-Full session detail: `docs/handoff/session-bridge-2026-07-08-m6-m8.md`.
-
 > **R2 amendments applied** (see docs/19–21): Q49 (click-to-toggle PTT), ADR-024 (faster-whisper GPU / whisper.cpp CPU), ADR-034 (embedding-head intent + lexicon fast-path), Q52 (configurable CPU-fallback threshold).

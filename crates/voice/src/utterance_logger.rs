@@ -14,9 +14,9 @@
 //! not background telemetry).
 //!
 //! Writes go through the Tier-0 single-writer (doc 03 §1) — this crate hands the
-//! [`Event`] + its 768-d embedding to `aperture_db` in one atomic transaction; it
-//! never opens the DB itself. The `Db` + `Embedder` are injected, so the path is
-//! unit-testable with the in-memory DB + `HashEmbedder` (no model, no GPU).
+//! [`Event`] to `aperture_db`, it does not open the DB itself.
+//!
+//! TODO(M2/M6:) embedding lands in M2; the store+embed wiring lands in M6.
 
 use aperture_contracts::event::{Event, EventType};
 use aperture_contracts::Intent as PayloadIntent;
@@ -102,29 +102,15 @@ pub enum LoggerError {
 /// Store the `voice_utterance` event **and** its embedding — unconditionally
 /// (locked decision B, doc 07 §3). Returns the DB-assigned `event_id` so the
 /// embedding row in `ctx_vec` (doc 03 §3) keys to the same event.
-pub async fn store_and_embed(
-    db: &aperture_db::Db,
-    embedder: &dyn aperture_embedding::Embedder,
-    record: &UtteranceRecord,
-    now_ms: i64,
-) -> Result<i64, LoggerError> {
-    let ev = record.to_event(now_ms);
-    // Embed the transcript as a stored document (doc 03 §5; the embedder applies
-    // the DOC task prefix). A blank transcript embeds nothing but still stores the
-    // event — the telemetry role is unconditional (locked decision B, doc 07 §3).
-    let embedding = if record.transcript.trim().is_empty() {
-        None
-    } else {
-        Some(
-            embedder
-                .embed(&record.transcript)
-                .map_err(|e| LoggerError::Embed(e.to_string()))?,
-        )
-    };
-    // One atomic single-writer transaction: the event row and its `ctx_vec`
-    // embedding commit together (doc 03 §1). Returns the DB-assigned event_id.
-    db.insert_event_with_context(&ev, None, embedding.as_deref())
-        .map_err(|e| LoggerError::Store(e.to_string()))
+pub async fn store_and_embed(_record: &UtteranceRecord) -> Result<i64, LoggerError> {
+    // TODO(M6:) pipeline (single-writer, doc 03 §1):
+    //   1. ev = record.to_event(now_ms);
+    //   2. event_id = aperture_db: insert ev into `events`.
+    //   3. vec = aperture_embedding::embed(&record.transcript)   // 768-d, doc 03 §5
+    //   4. aperture_db: insert (event_id, vec) into `ctx_vec`.
+    //   5. return event_id.
+    // This MUST run before any intent branch in ptt_up (telemetry is unconditional).
+    todo!("M6: insert voice_utterance event + embed transcript into ctx_vec")
 }
 
 /// Map the §4 intent to the [`ContextPayload`](aperture_contracts::ContextPayload)
@@ -132,55 +118,4 @@ pub async fn store_and_embed(
 /// is [`PayloadIntent::AnswerQuery`]. Helper for the facade's escalation branch.
 pub fn escalation_payload_intent() -> PayloadIntent {
     PayloadIntent::AnswerQuery
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use aperture_db::Db;
-    use aperture_embedding::{Embedder, HashEmbedder};
-
-    fn record(transcript: &str, confidence: f32) -> UtteranceRecord {
-        UtteranceRecord {
-            transcript: transcript.into(),
-            duration_ms: 1_200,
-            stt_model: DEFAULT_STT_MODEL.into(),
-            confidence,
-            intent: LoggedIntent::Telemetry,
-        }
-    }
-
-    #[tokio::test]
-    async fn store_and_embed_persists_event_and_indexes_the_transcript() {
-        let db = Db::open_in_memory().expect("in-memory db");
-        let embedder = HashEmbedder;
-        let id = store_and_embed(&db, &embedder, &record("note to self buy milk", 0.92), 5_000)
-            .await
-            .expect("stored");
-        assert!(id > 0);
-        // The event persisted as a voice utterance with its payload fields.
-        let ev = db.read_event(id).expect("event row");
-        assert_eq!(ev.r#type, EventType::VoiceUtterance);
-        assert_eq!(ev.payload["transcript"], "note to self buy milk");
-        assert_eq!(ev.payload["intent"], "telemetry");
-        // The embedding landed in ctx_vec — a KNN by the same text finds it.
-        let q = embedder.embed("note to self buy milk").unwrap();
-        let hits = db.knn(&q, 5, 0).expect("knn");
-        assert!(
-            hits.iter().any(|h| h.event_id == id),
-            "the utterance transcript is retrievable from ctx_vec"
-        );
-    }
-
-    #[tokio::test]
-    async fn blank_transcript_still_stores_the_event() {
-        let db = Db::open_in_memory().expect("in-memory db");
-        let embedder = HashEmbedder;
-        // A sub-300 ms tap is discarded upstream; but a genuine empty transcription
-        // must still record the utterance event (telemetry is unconditional).
-        let id = store_and_embed(&db, &embedder, &record("   ", 0.4), 1)
-            .await
-            .expect("stored");
-        assert!(db.read_event(id).is_ok(), "blank transcript still stores the event");
-    }
 }
