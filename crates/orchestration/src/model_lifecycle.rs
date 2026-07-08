@@ -131,6 +131,9 @@ struct LoadedSidecar {
     /// Load-time stamp (epoch ms, the caller's clock) for the `L2_MIN_RESIDENCY`
     /// swap debounce (doc 12 §7). Read by `l2_swap_to_stt` to flag a thrash-risk
     /// swap — a VLM evicted while still inside its min-residency window.
+    /// swap debounce (doc 12 §7). Its only reader is `l2_swap_to_stt`, which lands
+    /// at M6 — stamped now so the swap has the datum it needs the day it's wired.
+    #[allow(dead_code)] // M6: read by l2_swap_to_stt (todo! below)
     loaded_at_ms: i64,
     /// For `IDLE_UNLOAD` (doc 04 §5).
     last_job_at_ms: i64,
@@ -325,6 +328,195 @@ impl ModelLifecycle {
         };
         self.kill_sidecar(SidecarKind::VlmHost).await?;
         Ok(SwapOutcome::Swapped { thrash_risk })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The production spawner: OS process + loopback health poll.
+// ---------------------------------------------------------------------------
+
+/// Where the sidecar binaries + model weights live (from settings; [VERIFY] on
+/// the real target — the GGUF weights are a metered download, deferred).
+#[derive(Debug, Clone)]
+pub struct SidecarConfig {
+    /// `aperture-vlm-host` executable (spawns llama.cpp; doc 02 §2).
+    pub vlm_host_bin: std::path::PathBuf,
+    /// Qwen2.5-VL GGUF weights (3B default / 7B opt-in, doc 04 §3).
+    pub vlm_model_gguf: std::path::PathBuf,
+    /// Vision projector (mmproj, FP16, doc 04 §2).
+    pub vlm_mmproj_gguf: std::path::PathBuf,
+    /// `aperture-stt-host` executable (M6).
+    pub stt_host_bin: std::path::PathBuf,
+    /// Context cap handed to the VLM sidecar (doc 04 R2).
+    pub vlm_ctx: u32,
+    /// Cold-load readiness deadline (doc 04 §5).
+    pub cold_load_timeout: Duration,
+}
+
+impl Default for SidecarConfig {
+    fn default() -> Self {
+        Self {
+            vlm_host_bin: std::path::PathBuf::from("aperture-vlm-host"),
+            vlm_model_gguf: std::path::PathBuf::from("models/qwen2.5-vl-3b-q4_k_m.gguf"),
+            vlm_mmproj_gguf: std::path::PathBuf::from("models/qwen2.5-vl-3b-mmproj-f16.gguf"),
+            stt_host_bin: std::path::PathBuf::from("aperture-stt-host"),
+            vlm_ctx: 4096,
+            cold_load_timeout: Duration::from_secs(15),
+        }
+    }
+}
+
+/// Real spawner: launches `aperture-vlm-host` (the sanctioned `Command`, doc 13
+/// §2) on a pinned loopback port and polls its `/health` until ready.
+pub struct OsSpawner {
+    config: SidecarConfig,
+    /// Loopback port allocator (each spawn pins a distinct 127.0.0.1 port).
+    next_port: std::sync::atomic::AtomicU16,
+}
+
+impl OsSpawner {
+    /// Base of the pinned loopback port range for sidecars ([VERIFY] no clash).
+    pub const PORT_BASE: u16 = 51_733;
+
+    pub fn new(config: SidecarConfig) -> Self {
+        Self {
+            config,
+            next_port: std::sync::atomic::AtomicU16::new(Self::PORT_BASE),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Spawner for OsSpawner {
+    async fn spawn(&self, model: ModelId) -> Result<Box<dyn SidecarProcess>, LifecycleError> {
+        #[cfg(windows)]
+        {
+            os_spawn::spawn(&self.config, model, &self.next_port).await
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = model;
+            Err(LifecycleError::Spawn(
+                "sidecars are Windows-only".to_string(),
+            ))
+        }
+    }
+}
+
+#[cfg(windows)]
+mod os_spawn {
+    use super::*;
+    use std::sync::atomic::{AtomicU16, Ordering};
+
+    /// A running sidecar child + its loopback endpoint. Killing it reaps the
+    /// transitive llama.cpp child (kill_on_drop), returning VRAM to the driver.
+    pub(super) struct OsSidecar {
+        child: tokio::process::Child,
+        base_url: String,
+        client: reqwest::Client,
+    }
+
+    #[async_trait::async_trait]
+    impl SidecarProcess for OsSidecar {
+        fn endpoint(&self) -> &str {
+            &self.base_url
+        }
+
+        async fn is_ready(&self) -> bool {
+            let url = format!("{}/health", self.base_url);
+            match self.client.get(&url).send().await {
+                Ok(resp) => resp
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|v| v.get("ready").and_then(|r| r.as_bool()))
+                    .unwrap_or(false),
+                Err(_) => false,
+            }
+        }
+
+        async fn kill(&mut self) -> Result<(), LifecycleError> {
+            // Graceful child.kill() first; kill_on_drop is the belt-and-braces.
+            if self.child.kill().await.is_ok() {
+                return Ok(());
+            }
+            // Escalate to TerminateProcess on the raw handle (doc 12 §7).
+            if let Some(pid) = self.child.id() {
+                terminate_process(pid)?;
+            }
+            Ok(())
+        }
+    }
+
+    pub(super) async fn spawn(
+        config: &SidecarConfig,
+        model: ModelId,
+        next_port: &AtomicU16,
+    ) -> Result<Box<dyn SidecarProcess>, LifecycleError> {
+        if SidecarKind::of(model) == SidecarKind::SttHost {
+            return Err(LifecycleError::Spawn("stt-host is the M6 milestone".into()));
+        }
+        let port = next_port.fetch_add(1, Ordering::Relaxed);
+        let child_port = port.wrapping_add(1000);
+        // The ONLY sanctioned std::process::Command outside the gateway (doc 13
+        // §2): a local model host, loopback only, no network reach.
+        let child = tokio::process::Command::new(&config.vlm_host_bin)
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--model")
+            .arg(&config.vlm_model_gguf)
+            .arg("--mmproj")
+            .arg(&config.vlm_mmproj_gguf)
+            .arg("--ctx")
+            .arg(config.vlm_ctx.to_string())
+            .arg("--child-port")
+            .arg(child_port.to_string())
+            .kill_on_drop(true) // invariant 3: kill => VRAM release
+            .spawn()
+            .map_err(|e| LifecycleError::Spawn(e.to_string()))?;
+
+        let base_url = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .map_err(|e| LifecycleError::Spawn(e.to_string()))?;
+        let mut sidecar = OsSidecar {
+            child,
+            base_url,
+            client,
+        };
+
+        // Poll /health until ready within the cold-load SLA (doc 04 §5).
+        let deadline = tokio::time::Instant::now() + config.cold_load_timeout;
+        while tokio::time::Instant::now() < deadline {
+            if sidecar.is_ready().await {
+                return Ok(Box::new(sidecar));
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        let _ = sidecar.kill().await;
+        Err(LifecycleError::HealthTimeout)
+    }
+
+    /// Win32 `OpenProcess` + `TerminateProcess` escalation (doc 12 §7). The
+    /// guaranteed-release backstop when `child.kill()` doesn't reap the tree.
+    fn terminate_process(pid: u32) -> Result<(), LifecycleError> {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::{
+            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+        };
+        unsafe {
+            let handle = OpenProcess(PROCESS_TERMINATE, false, pid)
+                .map_err(|e| LifecycleError::KillEscalated(e.to_string()))?;
+            let result = TerminateProcess(handle, 1);
+            let _ = CloseHandle(handle);
+            result.map_err(|e| LifecycleError::KillEscalated(e.to_string()))
+        }
+    /// L2 only: unload the resident 7B and load Whisper for an STT arrival
+    /// (residency is exclusive in L2, doc 04 §3/§4). Debounced by
+    /// `L2_MIN_RESIDENCY` to avoid load thrash (doc 12 §7). M6 wires the STT job.
+    pub async fn l2_swap_to_stt(&mut self, _now_ms: i64) -> Result<(), LifecycleError> {
+        todo!("M6: L2 swap 7B->whisper with 20 s min-residency debounce (doc 12 §7)")
     }
 }
 

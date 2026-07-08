@@ -39,6 +39,18 @@ Every milestone has a **validation gate**: a measured/proven condition on the re
 - **On-hardware gates** — SC4 (STT latency), SC3/measured-VRAM (M5), PresentMon (M8), the SC5 byte-monitor, and validating every UNVERIFIED body (mic/whisper/hotkey/cloud transports/multi-monitor) on the RTX 5060.
 - **Seed-table note:** under the conservative doc 04 §2 seeds, 7B (L2) projects 7.03 GB at minimum and is inadmissible until remeasured — L1 (3B) is the only admitted VLM loadout pre-hardware-gate (staged rec #2).
 - **RESOLVED this session:** CONN-M2 (decay/mute ladder now survives restart — migration `0002` + `PatternEngine::hydrate`); the L2 swap, crash-ladder, and warm-keep deferrals above.
+## Implementation status (as of 2026-07-06)
+
+**M0–M4 landed** (code + gates): contracts/schema/shell, capture + toggle, OCR/embed/store, pattern engine + overlay, the four connectors + the browser extension + native-messaging bridge. Gates live under `crates/gates/tests/` (`m0_*`, `m4_us1_resume`, plus the permanent `sc5_*`/`sc6_*`).
+
+**M5 landed in software.** The orchestration resource manager (`GpuScheduler` single-mutex/priority/preempt/deadline, `BudgetEnforcer` R1+R3 ladder, `ModelLifecycle` spawn/kill/health/idle-sweep, `TierRouter` wake gate, `Telemetry`) and the on-demand VLM enrichment path (`VlmLayer` → `vlm-host` → `screen_context.vlm_summary`, wired off the bubble path in the shell). The two **software-checkable** M5 exit criteria pass in CI: `m5_budget_ceiling` (no admission ever projects > 7.0 GB; STT is the swap victim, ADR-030) and `m5_wake_band` (the ~3–10/h hard ceiling protects voice, ADR-032). The **on-target** criteria — measured co-resident VRAM replacing the seed table, and SC3 cold-load SLAs — are `#[ignore]`-gated in `m5_load_times` pending the RTX 5060.
+
+**M5→M6 carry-forward** (deferred, tracked in `docs/handoff/` bridge; each has an in-code `TODO`):
+- **L2 STT swap + 20 s min-residency** — `ModelLifecycle::l2_swap_to_stt` is a `todo!("M6")`; `loaded_at_ms` is stamped ready for it.
+- **Crash-restart ladder** — `handle_crash` (backoff + 3-strike + Degraded fallback) is implemented + tested but not yet wired into the production runner (a load failure currently maps flat to `SidecarDown`; safe soft-degrade, not resilient).
+- **Decay ladder does not survive restart** (CONN-M2) — the pattern engine re-mines cold on boot and the flush clobbers persisted `dismiss_decay`; needs engine hydration by `signature`.
+- **Connector coalesce monotonicity** (CONN-M1) — a later position-less navigation can clobber a known media position ("resume from start").
+- **Seed-table note:** under the conservative doc 04 §2 seeds, 7B (L2) projects 7.03 GB at minimum and is therefore inadmissible until remeasured on hardware — L1 (3B) is the only admitted VLM loadout pre-M5-hardware-gate (consistent with staged rec #2).
 
 ## Gate-failure protocol
 A failed gate stops forward progress on that path; the fix lands, the gate re-runs, and the affected doc is amended (the docs are living: measured numbers replace estimates).

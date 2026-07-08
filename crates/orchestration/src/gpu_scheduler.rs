@@ -34,6 +34,7 @@ use tokio::time::Instant;
 
 use crate::budget_enforcer::{Admission, BudgetEnforcer, LoadRequest};
 use crate::model_lifecycle::{ModelLifecycle, SidecarHealth, SidecarKind, SwapOutcome};
+use crate::model_lifecycle::{ModelLifecycle, SidecarKind};
 use crate::telemetry::Telemetry;
 use crate::vram_table::ModelId;
 use crate::Loadout;
@@ -163,6 +164,33 @@ impl GpuScheduler {
     /// Subscribe to the `gpu_busy` signal (doc 11 §6, doc 14 §5).
     pub fn subscribe_busy(&self) -> broadcast::Receiver<bool> {
         self.inner.gpu_busy_tx.subscribe()
+    }
+
+    /// Switch the active loadout (L1<->L2). Affects model selection for the next
+    /// admitted job (doc 12 §7); resident sidecars are unloaded by the toggle
+    /// owner's `apply_loadout_change`.
+    pub fn set_loadout(&self, loadout: Loadout) {
+        self.inner
+            .loadout
+            .store(matches!(loadout, Loadout::L2) as u8, AtomicOrdering::SeqCst);
+    }
+
+    /// Admit + run a job (contract 4, doc 15 §4): project budget (R1) walking the
+    /// R3 ladder, enqueue by priority, run under the deadline in the single slot,
+    /// preempting a cancellable lower job if outranked.
+    pub async fn enqueue(&self, job: GpuJob) -> Result<JobOutput, JobError> {
+        self.inner.enqueue(job).await
+    }
+
+    /// Cancel every *queued* job and give a running job up to
+    /// [`crate::toggle_owner::RUNNING_JOB_GRACE`] to hit its cancel point — step 3
+    /// of the toggle-OFF sequence (doc 12 §6). A running STT is uncancellable, so
+    /// OFF proceeds to the sidecar kill (step 4) regardless. Returns once the slot
+    /// is idle or the grace elapses.
+    pub async fn cancel_all_for_off(&self, grace: Duration) {
+        self.inner.cancel_all_for_off(grace).await;
+    }
+
     }
 
     /// Switch the active loadout (L1<->L2). Affects model selection for the next
@@ -326,6 +354,10 @@ impl Inner {
             }
         }
 
+        let admission = {
+            let enforcer = self.enforcer.lock().expect("enforcer");
+            enforcer.admit(req, &loaded)
+        };
         let plan = match admission {
             Admission::Refused { projection_gb } => {
                 self.telemetry.record_refused();
@@ -443,6 +475,33 @@ impl SidecarRunner {
     }
 }
 
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The production runner: loopback HTTP to the vlm-host sidecar.
+// ---------------------------------------------------------------------------
+
+/// Runs jobs by talking to the `vlm-host` sidecar over loopback (doc 06 §3, doc
+/// 12 §5). Ensures the model is loaded (spawning the sidecar on demand), POSTs
+/// `/infer`, and parses the structured scene JSON.
+pub struct SidecarRunner {
+    client: reqwest::Client,
+}
+
+impl SidecarRunner {
+    pub fn new() -> Self {
+        Self {
+            // The deadline is enforced by the scheduler's select; keep the client
+            // timeout generous so a slow-but-alive infer isn't double-cut.
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("reqwest client"),
+        }
+    }
+}
+
 impl Default for SidecarRunner {
     fn default() -> Self {
         Self::new()
@@ -512,6 +571,20 @@ impl JobRunner for SidecarRunner {
         // other lifetime in the system (retention TTLs, decay, sessions) is epoch-ms.
         let now_ms = now_epoch_ms();
         let endpoint = acquire_endpoint(&lifecycle, model, now_ms).await?;
+        let endpoint = {
+            let mut life = lifecycle.lock().await;
+            // TODO(M6): route a load/exec failure through `ModelLifecycle::handle_crash`
+            // (exponential backoff + 3-strike cap + Degraded→OcrOnly/CpuWhisper
+            // fallback, doc 12 §5) instead of a flat `SidecarDown`. As written, a
+            // sidecar that crashes on load is re-cold-loaded (paying the full timeout)
+            // on every job with no backoff or health surfacing. The job outcome is
+            // already soft (the caller degrades to OCR-only), so this is a resilience
+            // gap, not a safety one — `handle_crash` is implemented + tested, just
+            // not yet wired into this production run path.
+            life.ensure_loaded(model, now_ms)
+                .await
+                .map_err(|_| JobError::SidecarDown)?
+        };
         match &job.kind {
             GpuJobKind::Vlm { image_jpeg, prompt } => {
                 let body = serde_json::json!({

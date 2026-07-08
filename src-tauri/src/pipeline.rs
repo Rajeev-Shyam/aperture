@@ -253,6 +253,90 @@ async fn maybe_enrich_vlm(
     }
 }
 
+/// Off-the-bubble-path VLM enrichment (doc 06 §3/§5 Layer B; doc 02 Path A). Runs
+/// the authoritative stateful wake gate (per-app debounce + adaptive 3–10/h
+/// ceiling that protects voice, ADR-032) and, on a `Wake`, enqueues one `prio:50`
+/// pattern-VLM job through the single GPU mutex, attaching the structured scene
+/// JSON to the frame's `screen_context` row. Every failure is **soft** — the
+/// bubble already fired on OCR; this only improves the *next* pattern cycle.
+async fn maybe_enrich_vlm(
+    orch: Arc<tokio::sync::Mutex<OrchestratedSystem>>,
+    db: Arc<Db>,
+    event_id: i64,
+    jpeg: Vec<u8>,
+    app_key: String,
+    signal: OcrSignal,
+    now_ms: i64,
+) {
+    // Run the gate + grab the scheduler under ONE short lock, then release before
+    // the GPU wait — the orchestration mutex serializes the toggle + lifecycle,
+    // it must never be held across a job (doc 12).
+    let scheduler = {
+        let mut orch = orch.lock().await;
+        // The AUTHORITATIVE capture state, read under the lock. `turn_off` holds
+        // this same mutex through sidecar teardown (doc 12 §6), so a task that
+        // queued on this lock while an OFF was in flight observes OFF and skips.
+        // A hardcoded `true` would let the enqueue below re-spawn vlm-host and
+        // reload ~5–6 GB into VRAM *after* the user asked to stop — an SC6 breach
+        // (doc 05 §5). The gate maps `!capture_on` to Skip(CaptureOff).
+        let capture_on = orch.toggle().state() == CaptureState::On;
+        let mutex_free = orch.mutex_likely_free();
+        // The gate reads only app/process off the event (its debounce key); a
+        // minimal event carries exactly that.
+        let ev = Event {
+            id: 0,
+            ts: now_ms,
+            r#type: EventType::WindowFocus,
+            app: (!app_key.is_empty()).then_some(app_key),
+            process: None,
+            window_title: None,
+            payload: serde_json::json!({}),
+            connector_id: None,
+            session_id: None,
+            redaction_flags: 0,
+        };
+        let decision = orch.wake_gate().should_wake_vlm(
+            &ev,
+            signal,
+            now_ms,
+            capture_on, // read under the lock above — never assume ON
+            mutex_free,
+            false, // pattern_requested: doc-08 disambiguation arrives on another path
+            false, // user_explicit: enrichment requests come from the UI, not here
+            true, // budget_projection_ok: advisory — the scheduler's enqueue
+                  // projection is the final word on the 7.0 GB ceiling (doc 06 §4)
+        );
+        match decision {
+            WakeDecision::Wake(_) => {
+                // Telemetry feeds the M5 adaptive 3–10/h band assertion (ADR-032).
+                orch.record_vlm_wake(now_ms);
+                orch.scheduler()
+            }
+            WakeDecision::Skip(reason) => {
+                tracing::trace!(?reason, "vlm wake skipped (doc 06 §4)");
+                return;
+            }
+        }
+    };
+
+    // Wake committed: the prio:50 job runs through the mutex; the scheduler's R1
+    // projection is what actually protects the ceiling (doc 12 §4).
+    match VlmLayer::new(scheduler).understand(jpeg).await {
+        Ok(scene) => match serde_json::to_string(&scene) {
+            // doc 06 §1/§5: vlm_summary is the structured scene JSON.
+            Ok(summary) => match db.attach_vlm_summary(event_id, &summary) {
+                Ok(true) => tracing::debug!(event_id, "vlm scene summary attached"),
+                Ok(false) => tracing::debug!(event_id, "vlm summary target row gone (pruned)"),
+                Err(e) => tracing::error!(%e, "vlm summary attach failed"),
+            },
+            Err(e) => tracing::error!(%e, "vlm scene serialize failed"),
+        },
+        // BudgetRefused / Deadline / SidecarDown are all soft (already logged in
+        // VlmLayer::understand): the frame stays OCR-only (doc 06 §6).
+        Err(_) => {}
+    }
+}
+
 /// Spawn the pattern-engine consumer (doc 02 §4 steps 6–8): bus → engine →
 /// pattern flush → suggestion rows → `bubble_spec` events to the overlay.
 ///
@@ -354,6 +438,14 @@ pub fn spawn_pattern_task(
                     // table, and the startup hydrate above restores it after a
                     // restart — so a dismissed/muted suggestion stays suppressed
                     // rather than re-nagging (CONN-M2, resolved).
+                    // ladder into the patterns column.
+                    // TODO(CONN-M2): the engine does NOT re-hydrate persisted
+                    // support/confidence/dismiss_decay at startup, so after a
+                    // restart it re-mines cold (dismiss_decay = 1.0) and the next
+                    // flush overwrites the saved value — the decay/mute ladder does
+                    // not actually survive a restart yet (re-nags a dismissed
+                    // suggestion). Fix = seed the engine cache by `signature` at
+                    // boot (needs a pattern-engine hydrate method, doc 08 §7).
                     engine.apply_feedback(pattern_id, fb, epoch_ms());
                     flush_patterns(&db, &mut engine);
                 }
