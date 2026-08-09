@@ -266,6 +266,14 @@ impl CaptureToggle {
     /// Emit the `capture_toggle` audit event (doc 05 §5 step 6; doc 12 §6):
     /// persisted first (the audit row survives Purge All 30 d, doc 03 §6),
     /// then notified on the bus.
+    ///
+    /// **Payload schema is shared with `aperture_privacy::audit_log`** (M9),
+    /// which writes the *decision* row while this writes the *mechanism* row —
+    /// what the user chose vs. what actually started. Both are on the trail on
+    /// purpose: a decision with no matching mechanism row means capture was
+    /// asked for and never actually ran. They MUST agree on the key names, or
+    /// the Activity & Privacy view mis-renders one of them (it reads `enabled`);
+    /// `source` is what tells them apart.
     fn emit_toggle_event(&self, on: bool) {
         let mut ev = Event {
             id: 0,
@@ -274,7 +282,11 @@ impl CaptureToggle {
             app: None,
             process: None,
             window_title: None,
-            payload: serde_json::json!({ "on": on, "reason": "user_action" }),
+            payload: serde_json::json!({
+                "enabled": on,
+                "reason": "user_action",
+                "source": "capture",
+            }),
             connector_id: None,
             session_id: None,
             redaction_flags: 0,
@@ -332,7 +344,10 @@ mod tests {
         assert_eq!(t.state(), CaptureState::Off);
         let ev = rx.try_recv().expect("audit event");
         assert_eq!(ev.r#type, EventType::CaptureToggle);
-        assert_eq!(ev.payload["on"], serde_json::json!(false));
+        // Key name is load-bearing: the privacy audit view reads `enabled`, and
+        // `aperture_privacy::audit_log` writes the same key (M9).
+        assert_eq!(ev.payload["enabled"], serde_json::json!(false));
+        assert_eq!(ev.payload["source"], serde_json::json!("capture"));
     }
 
     /// The SLA race must be real: a teardown that outlives the SLA is reported

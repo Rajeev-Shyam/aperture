@@ -61,6 +61,11 @@ pub struct AppState {
     /// (Path B resolve → reconstruct → open) and the connector-capture task.
     /// Only connectors act (ADR-035) — commands never dispatch directly.
     pub connectors: Arc<aperture_connectors::ConnectorRegistry>,
+
+    /// Consent state (doc 13 §8, M9): the source of truth for whether capture
+    /// may run, and the writer of the `capture_toggle` audit trail. A tokio
+    /// Mutex because every mutation persists to the encrypted DB.
+    pub consent: Arc<tokio::sync::Mutex<aperture_privacy::consent::ConsentManager>>,
     // gateway: wired at M7 (doc 09) — the ONLY field that may reach the network.
 }
 
@@ -79,7 +84,8 @@ impl AppState {
         )>,
         snooze_until: Arc<std::sync::atomic::AtomicI64>,
         connectors: Arc<aperture_connectors::ConnectorRegistry>,
+        consent: Arc<tokio::sync::Mutex<aperture_privacy::consent::ConsentManager>>,
     ) -> Self {
-        Self { bus, db, capture, orchestration, feedback_tx, snooze_until, connectors }
+        Self { bus, db, capture, orchestration, feedback_tx, snooze_until, connectors, consent }
     }
 }

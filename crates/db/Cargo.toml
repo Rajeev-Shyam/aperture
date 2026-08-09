@@ -15,8 +15,19 @@ tracing = { workspace = true }
 # crates.io `sqlite-vec` crate (C extension built via cc, registered via
 # sqlite3_auto_extension before connections open); libsqlite3-sys is pinned to
 # rusqlite's bundled copy so the extension links against the same SQLite.
-# SQLCipher-style encryption remains [VERIFY] at M9 (doc 13 §6) — candidate:
-# rusqlite `bundled-sqlcipher` feature, swapped in without touching callers.
 rusqlite = { workspace = true }
 sqlite-vec = "0.1"
 libsqlite3-sys = "*"  # version driven by rusqlite's bundled selection
+
+# At-rest encryption (doc 13 §6, M9). OFF by default because
+# `bundled-sqlcipher-vendored-openssl` compiles OpenSSL from source, which on
+# Windows needs a **native** Perl (Strawberry) + NASM on PATH — the Git-for-
+# Windows/Cygwin perl fails with a missing `Locale::Maketext::Simple`.
+#
+# Turn it on for a release/gate build:
+#     cargo build -p aperture-db --features sqlcipher
+# With the feature OFF, `Db::is_encrypted()` returns false and the shell logs a
+# prominent warning: we never claim encryption we did not apply.
+[features]
+default = []
+sqlcipher = ["rusqlite/bundled-sqlcipher-vendored-openssl"]

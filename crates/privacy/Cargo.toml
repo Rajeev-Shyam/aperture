@@ -19,6 +19,13 @@ uuid = { workspace = true }
 regex = "1"  # [VERIFY] at build time
 # SHA-256 of wire bytes for the cloud_send audit row (doc 13 §3, §7).
 sha2 = "0.10"  # [VERIFY] at build time
+# The unwrapped DB page key must not linger in process memory after the DB is
+# opened (doc 13 §6): `Zeroizing<Vec<u8>>` wipes it on drop.
+zeroize = "1"
+# Audit rows + consent live in the encrypted history DB (doc 13 §3, §6, §8).
+# privacy sits ABOVE db and BELOW the gateway — no cycle (db depends only on
+# contracts).
+aperture-db = { workspace = true }
 # DPAPI (Security.Cryptography) + Credential Manager for at-rest key wrapping
 # (doc 13 §6). The DB key is generated per-install, wrapped by DPAPI (current
 # user), and stored in Windows Credential Manager; loss => DB unreadable.

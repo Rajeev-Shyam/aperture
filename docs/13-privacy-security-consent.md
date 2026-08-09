@@ -71,9 +71,104 @@ Every cloud send is approved — either individually **or** under a **scoped all
 - **Redaction pipeline implemented (§5)** — ahead of the M9 privacy milestone, because the gateway structurally needs redaction-**before**-preview (doc 09 §5). `redaction::Redactor` runs the ordered rules (secret / payment-card-with-Luhn / IBAN / email / phone / user-terms) over every text-bearing payload item — including recursive JSON **strings and numeric values** — replacing hits with `⟨noun#n⟩` and recording the per-rule counts the preview shows. Phone matches require a formatting separator, so a bare long digit run is left for the Luhn card rule + the human (never falsely scrubbed).
 - **Audit hash (§3).** `audit_log::sha256_hex` is implemented; the gateway records the `cloud_send` hash over the transport's **actual wire bytes**, **after** a successful send (never a phantom row on a failed send), tagged with the transport that actually egressed.
 - **Two-emitter rule (§2).** The CLI-spawn / HTTPS egress primitives now **self-guard** on `user_approved` in addition to the gateway chokepoint. Enforcement today = dependency direction + the SC5 gate; the scoped CI lint is still a TODO (the contracts comment was softened from "CI-lint enforced" to match).
-- **Still M9:** consent UI + first-run sequence, DPAPI key manager, audit-row **DB persistence** (`AuditLog::record_cloud_send` — the hash is computed now, the write lands at M9), the exclusion manager, and Purge All.
-
 Full session detail: `docs/handoff/session-bridge-2026-07-08-m6-m8.md`.
+
+---
+## Implementation status (2026-08-09) — M9 landed
+
+**M9 is implemented and gated** (`crates/gates/tests/m9_privacy.rs`, `cargo xtask gate m9`).
+
+- **At-rest key management (§6) — real, and verified on Windows.** `key_manager` now uses
+  `BCryptGenRandom` (system-preferred RNG) → `CryptProtectData` (DPAPI, current-user scope) →
+  `CredWriteW` (Credential Manager, `CRED_PERSIST_LOCAL_MACHINE`). `DbKey` is `Zeroizing` and its
+  `Debug` prints `redacted`. Tests exercise the **real OS APIs**: CSPRNG non-constancy, DPAPI
+  round-trip, tamper→fail-closed, Credential-Manager round-trip/miss/delete, and key stability
+  across calls (a changed key ⇒ the old DB is unreadable, by design).
+- **At-rest *encryption* (§6) — wired, OFF by default, and honest about it.** `Db::open_encrypted`
+  applies `PRAGMA key = "x'<hex>'"` as the first statement and then forces a schema read so a wrong
+  key surfaces `DbError::Decryption`. It sits behind the **`sqlcipher` cargo feature**
+  (`rusqlite/bundled-sqlcipher-vendored-openssl`), which is off by default because that build
+  compiles OpenSSL from source and needs a **native Windows Perl (Strawberry) + NASM on PATH** —
+  the Git-for-Windows/Cygwin perl fails on a missing `Locale::Maketext::Simple`. With the feature
+  off, `Db::is_encrypted()` returns `false`, the shell logs a prominent warning, the first-run and
+  privacy UIs *say* the history is not encrypted, and the gate prints an explicit INCOMPLETE note.
+  **Nothing anywhere claims encryption that was not applied.**
+  → **Carry-forward:** install Strawberry Perl + NASM, then
+  `cargo test -p aperture-gates --features sqlcipher --test m9_privacy` to close criterion 1.
+- **Audit log (§3, §7) — persisted.** `AuditLog` writes `capture_toggle` / `cloud_send` rows as
+  ordinary `Event`s into the encrypted DB (so they inherit at-rest protection and the retention
+  pruner's audit window for free — no second, weaker store). The gateway holds an `AuditSink` trait
+  (`NullAuditSink` by default, DB-backed via `Gateway::with_audit`) so it stays unit-testable
+  without a database. **An audit-write failure never fails a Send** — the bytes already left, and
+  reporting a completed send as failed is a worse lie than a missing row; it logs at `error`.
+- **Consent (§8) — persisted + audited, fails closed.** `ConsentManager` stores `ConsentState` in
+  the encrypted `settings` table under key `consent`; an **unparseable record defaults to capture
+  OFF** (an unreadable consent record is not evidence of consent). Every capture transition
+  persists *then* writes a `capture_toggle` row. `toggle_capture` aborts an ON transition if the
+  audit write fails, but never traps the user in ON on an OFF-path failure.
+- **Purge All (§7) — implemented, with one deliberate amendment.** Doc 03 §6 says "truncates every
+  table". `Db::purge_all` preserves three: `exclusion_list` (purging it would silently *resume
+  capturing* apps the user excluded — a privacy control must never weaken itself), `settings`
+  (holds consent; a *data* purge must not reset it and re-trigger first-run), and
+  `schema_migrations`. Everything else goes, audit rows inside `audit_days` survive, then `VACUUM`.
+- **Exclusions (§4) — de-duplicated, not rebuilt.** `privacy::exclusion_manager` was a second,
+  weaker copy of logic `aperture_capture::exclusion` already implemented in full (process /
+  window_class / title_regex / `url_pattern` + the private-window heuristic, running *inside* the
+  capture gate before any frame is pulled). It was **deleted** rather than kept in sync. The
+  persisted half lives in `db` (`read_exclusion_list` / `add_exclusion_rule` /
+  `set_exclusion_enabled`); the shell compiles the enabled rows into the `ExclusionList` at startup.
+- **Detect-and-suggest (§4, §8) — new `privacy::detect_suggest`.** A local, one-level filesystem
+  scan of the standard install roots produces *candidates* from a small curated catalogue of
+  password managers / finance apps. It never auto-excludes (ADR-029/Q15 holds: shipped defaults
+  stay empty), never egresses, and a failed scan yields fewer suggestions rather than a blocked
+  first run.
+- **First-run + Activity & Privacy UI (§7, §8; ADR-040).** `FirstRunConsent.tsx` runs the ordered
+  sequence (consent → detect-and-suggest → extension → enable capture); declining completes
+  first-run with capture OFF and never re-nags. `PrivacyPanel.tsx` is the Activity & Privacy view:
+  the audit feed (each `cloud_send` showing transport, byte count, and the SHA-256 prefix),
+  exclusion add/disable/delete, and Purge All behind a typed `DELETE` confirmation that states
+  plainly what survives. Both render as **opaque** chrome, never glass — they are the largest
+  surfaces in the app and would otherwise breach the ≤2 glass budget (doc 14 §5).
+- **Two-emitter CI lint (§2) — now actually scoped.** `xtask lint-emitters` was **failing** before
+  M9: the `vlm-host`/`stt-host` loopback sidecars tripped it (12 violations), because the
+  loopback carve-out tested `needle.contains("net")`, which never matches `reqwest` or
+  `TcpListener`. The carve-out now audits the sidecars' whole socket/spawn surface **and adds the
+  check that makes the exemption sound**: any non-loopback host (a public URL, `0.0.0.0`, an
+  unresolvable literal) inside a loopback-scoped crate is a violation. That boundary has its own
+  unit tests in `xtask`. The SC5 byte-monitor remains the authoritative dynamic backstop.
+
+- **Purge All is real on disk, not just logical.** The first implementation ran `DELETE; VACUUM` on
+  a WAL-mode connection held open for the process lifetime — which rewrites into `history.db-wal`
+  and leaves every "purged" row verbatim-recoverable from the files (plaintext in the default
+  build). It now runs `PRAGMA wal_checkpoint(TRUNCATE)` after the VACUUM, and the connection sets
+  `PRAGMA secure_delete=ON` so freed pages don't carry content between the nightly pruner's deletes
+  and the next VACUUM. Asserted by scanning the raw bytes of `history.db`/`-wal`/`-shm` for a
+  sentinel (`m9_purged_content_is_not_recoverable_from_the_files_on_disk`).
+- **Modal surfaces make the overlay interactive.** The overlay window is click-through
+  (`WS_EX_TRANSPARENT`) and unfocusable by design — correct for passive bubbles, fatal for a dialog.
+  `overlay::set_interactive` + the `set_overlay_interactive` command, paired by the UI's
+  `useModalSurface` hook, clear the bit while a modal is mounted. Without it the first-run consent
+  buttons (and the pre-existing Context Preview panel's Send/Cancel) were literally unclickable.
+- **Exclusion patterns are validated at entry.** `ExclusionList::compile` fails *open* on a bad
+  regex — right at load time, wrong at entry time, because it yields a rule the UI shows as an
+  active protection while it matches nothing. `exclusion::validate_pattern` (same `RegexBuilder`
+  config as the compile path) gates `add_exclusion`.
+- **`capture_toggle` rows share one schema across both writers.** `aperture_capture::toggle` writes
+  the *mechanism* row (capture actually started/stopped, `source: "capture"`) and
+  `aperture_privacy::audit_log` the *decision* row (`source: "consent"`). Both carry `enabled` +
+  `reason`. Keeping both is deliberate: a decision row with no matching mechanism row means capture
+  was requested and never actually ran, which the trail must show rather than hide.
+
+**Known gap (deliberate, documented):** a rule added from the Activity & Privacy view is durable
+immediately but the *running* capture matcher is built at startup, so it applies from the next
+launch. Hot-reload needs an interior-mutable `ExclusionList` in `aperture-capture`; deferred rather
+than bolted on.
+
+**Pre-existing gap surfaced by the M9 review (not fixed here):** `overlay::set_hit_test_rects` has
+**no callers** — the bubble input path was never wired (an M3-UI TODO). M9 works around it for modal
+surfaces via `set_interactive`; bubble click-through still needs its own wiring in the v1 close-out.
+
+Full session detail: `docs/handoff/session-bridge-2026-08-09-m9.md`.
 
 ---
 > **R2 amendments applied** (see docs/19–21): ADR-029 (honest minimization reframe; extension URL-only use; empty default exclusions), ADR-036 (precise emitter rule; diagnostics; updater carve-out), ADR-028 (loopback-fallback scoping + SC5 whitelist), ADR-026 (scoped-allow transparency), ADR-037 (gated `aperture_search_history`), ADR-040 (`url_pattern`, first-run sequence, Activity & Privacy view, global snooze, cold-start note), ADR-038 (optional Argon2id recovery passphrase). Redaction rules (Q21) and 30 d audit survival (Q18) unchanged.

@@ -165,10 +165,13 @@ fn lint_emitters() -> Result<()> {
                         needle,
                         crate_name
                     );
-                } else if loopback_scoped && needle.contains("net") {
-                    // ADR-028/036: sidecar hosts may bind 127.0.0.1 model servers.
-                    // Socket-type mentions are audited, not denied; process spawns
-                    // are still forbidden here (only `net` needles pass).
+                } else if loopback_scoped {
+                    // ADR-028/036 (doc 13 §2, M9 scoped lint): the sidecar hosts
+                    // bind a 127.0.0.1 model server, spawn their own model child,
+                    // and speak HTTP to it over loopback. That whole surface is
+                    // on-device, so it is audited rather than denied — but only
+                    // as long as it stays loopback. The address check below is
+                    // the part that actually enforces it.
                     println!(
                         "  [loopback-scoped] {}:{} uses `{}` (crate `{}`; 127.0.0.1-only, ADR-028)",
                         rel(file),
@@ -182,6 +185,22 @@ fn lint_emitters() -> Result<()> {
                         rel(file),
                         line_no,
                         needle,
+                        crate_name
+                    ));
+                }
+            }
+            // The loopback carve-out is only sound if it IS loopback. A
+            // non-loopback host anywhere in a loopback-scoped crate turns its
+            // exemption into an unaudited egress path, so it is a violation
+            // even though the socket call itself was allowed above.
+            if loopback_scoped {
+                if let Some(host) = non_loopback_host_in(line) {
+                    violations.push(format!(
+                        "{}:{}: non-loopback host `{}` in loopback-scoped crate `{}` — \
+                         the ADR-028 exemption covers 127.0.0.1 ONLY (doc 13 §2)",
+                        rel(file),
+                        line_no,
+                        host,
                         crate_name
                     ));
                 }
@@ -229,6 +248,48 @@ fn forbidden_needle_in(line: &str) -> Option<&'static str> {
         .iter()
         .copied()
         .find(|needle| line.contains(needle))
+}
+
+/// A non-loopback host referenced on a *code* line, or `None` (doc 13 §2, M9).
+///
+/// Enforces the scope of the ADR-028 loopback exemption: the sidecar hosts may
+/// bind and speak HTTP, but only to 127.0.0.1. Anything else — a public URL, a
+/// `0.0.0.0` bind, or a host we cannot resolve to loopback by inspection — is
+/// reported so it gets a human decision rather than a silent pass.
+///
+/// Heuristic by design, like the needle scan: the authoritative check is the SC5
+/// byte-monitor (ETW/mitmproxy), which sees the actual packets. This exists to
+/// catch the mistake at review time, not to be a sandbox.
+fn non_loopback_host_in(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("//") || trimmed.starts_with("//!") || trimmed.starts_with("*") {
+        return None;
+    }
+    // Binding a wildcard interface makes the service reachable off-box.
+    for wildcard in ["0.0.0.0", "UNSPECIFIED", "Ipv4Addr::BROADCAST"] {
+        if line.contains(wildcard) {
+            return Some(wildcard.to_string());
+        }
+    }
+    // Any URL literal must point at loopback.
+    for scheme in ["http://", "https://"] {
+        let mut rest = line;
+        while let Some(idx) = rest.find(scheme) {
+            let after = &rest[idx + scheme.len()..];
+            let host: String = after
+                .chars()
+                .take_while(|c| !matches!(c, '/' | '"' | '\'' | ' ' | ')' | ',' | '`'))
+                .collect();
+            let bare = host.split(':').next().unwrap_or("").to_ascii_lowercase();
+            let is_loopback =
+                matches!(bare.as_str(), "127.0.0.1" | "localhost" | "[::1]" | "::1");
+            if !is_loopback && !bare.is_empty() {
+                return Some(format!("{scheme}{host}"));
+            }
+            rest = &after[host.len().min(after.len())..];
+        }
+    }
+    None
 }
 
 /// Recursively visit every `.rs` file under `dir`, calling `f(path, line_no, line)`.
@@ -325,14 +386,44 @@ fn run_gate(milestone: &str) -> Result<()> {
             println!("gate M7: SC5 strict — zero bytes until Send, preview == wire (doc 16 M7)");
             run_sc5()
         }
-        "m5" | "m6" | "m8" | "m9" => {
-            // Honest stub: these gates' tests don't exist yet (the subsystems are
-            // later milestones). Don't fake a pass.
-            println!("gate {m}: no gate tests wired yet (doc 16 {})", m.to_uppercase());
-            todo!(
-                "{}: add this milestone's validation-gate test target and invoke it here",
-                m.to_uppercase()
-            )
+        "m5" => {
+            println!("gate M5: ≤7.0 GB admission ceiling + the 3–10/h wake band (doc 16 M5)");
+            cargo_test(&["-p", "aperture-gates", "--test", "m5_budget_ceiling"])?;
+            cargo_test(&["-p", "aperture-gates", "--test", "m5_wake_band"])?;
+            // On-target half: measured co-resident VRAM + SC3 cold-load SLAs are
+            // `#[ignore]` in m5_load_times until the RTX 5060 runs them.
+            println!("gate M5: on-target half = measured VRAM + SC3 cold-load (m5_load_times, #[ignore])");
+            Ok(())
+        }
+        "m6" => {
+            println!("gate M6: L1 co-residency + L2 STT-swap admission (doc 16 M6)");
+            cargo_test(&["-p", "aperture-gates", "--test", "m6_l2_swap"])?;
+            cargo_test(&["-p", "aperture-voice"])?;
+            println!("gate M6: on-target half = SC4 STT < 2 s with a real mic (#[ignore])");
+            Ok(())
+        }
+        "m8" => {
+            println!("gate M8: glass budget + degrade-under-load + multi-monitor overlay (doc 16 M8)");
+            // Pure UI logic is typechecked, not test-run (no TS runner is wired):
+            // `tsc --noEmit -p ui/tsconfig.json`. The overlay planner is Rust-side.
+            cargo_test(&["-p", "aperture"])?;
+            println!("gate M8: on-target half = PresentMon frame-drop + the final glass cap");
+            Ok(())
+        }
+        "m9" => {
+            println!("gate M9: DB unreadable without the key · Purge All · excluded apps never framed · the audit answers what left (doc 16 M9)");
+            cargo_test(&["-p", "aperture-gates", "--test", "m9_privacy"])?;
+            cargo_test(&["-p", "aperture-privacy"])?;
+            // The two-emitter rule is the structural half of the privacy story.
+            lint_emitters()?;
+            // The encryption criterion needs the SQLCipher build; say so plainly
+            // rather than letting a plaintext build read as a full pass.
+            println!(
+                "gate M9: at-rest encryption is asserted only under `--features sqlcipher` \
+                 (needs a native Perl + NASM on PATH). Run:\n  \
+                 cargo test -p aperture-gates --features sqlcipher --test m9_privacy"
+            );
+            run_sc5()
         }
         other => bail!("unknown milestone `{other}` (expected m0..m9)"),
     }
@@ -404,5 +495,53 @@ fn cargo_test(args: &[&str]) -> Result<()> {
         Ok(())
     } else {
         bail!("`cargo test {}` failed ({status})", args.join(" "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The loopback exemption (ADR-028) is a security carve-out, so its boundary
+    /// gets a test: loopback passes, anything reachable off-box does not.
+    #[test]
+    fn loopback_hosts_pass_and_external_hosts_are_caught() {
+        // The real lines from the sidecar hosts must stay clean.
+        assert_eq!(non_loopback_host_in(r#"let base_url = format!("http://127.0.0.1:{child_port}");"#), None);
+        assert_eq!(non_loopback_host_in(r#".arg("127.0.0.1")"#), None);
+        assert_eq!(non_loopback_host_in("TcpListener::bind((Ipv4Addr::LOCALHOST, args.port))"), None);
+        assert_eq!(non_loopback_host_in(r#"let u = "http://localhost:8080/infer";"#), None);
+
+        // Anything off-box is a violation, even inside a loopback-scoped crate.
+        assert_eq!(
+            non_loopback_host_in(r#"client.post("https://api.anthropic.com/v1/messages")"#).as_deref(),
+            Some("https://api.anthropic.com")
+        );
+        assert_eq!(
+            non_loopback_host_in(r#"let u = "http://evil.example/exfil";"#).as_deref(),
+            Some("http://evil.example")
+        );
+        // A wildcard bind makes the sidecar reachable from the network.
+        assert!(non_loopback_host_in(r#"TcpListener::bind("0.0.0.0:9000")"#).is_some());
+        assert!(non_loopback_host_in("Ipv4Addr::UNSPECIFIED").is_some());
+
+        // Comments and doc lines are not code.
+        assert_eq!(non_loopback_host_in("// see https://docs.rs/whatever"), None);
+        assert_eq!(non_loopback_host_in("//! posts to https://api.anthropic.com"), None);
+    }
+
+    #[test]
+    fn forbidden_needles_ignore_comments_and_named_pipes() {
+        assert_eq!(forbidden_needle_in("// uses reqwest somewhere"), None);
+        assert_eq!(
+            forbidden_needle_in("use tokio::net::windows::named_pipe::ServerOptions;"),
+            None,
+            "named pipes are same-machine kernel IPC, not sockets (ADR-028)"
+        );
+        assert_eq!(forbidden_needle_in("let c = reqwest::Client::new();"), Some("reqwest"));
+        assert_eq!(
+            forbidden_needle_in("std::process::Command::new(\"claude\")"),
+            Some("std::process::Command")
+        );
     }
 }

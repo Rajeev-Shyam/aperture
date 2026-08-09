@@ -235,6 +235,53 @@ pub fn set_hit_test_rects(
     }
 }
 
+/// Make the overlay window accept input (or go back to click-through).
+///
+/// The overlay is created click-through (`WS_EX_TRANSPARENT`, [`harden`]) and
+/// `"focus": false` — correct for passive bubbles, and fatal for a *modal*.
+/// M9 puts two real dialogs on this surface (first-run consent and the Activity
+/// & Privacy view); without clearing the bit, every click falls through to the
+/// app underneath and the user can never press "Turn on capture" — the flow just
+/// silently does nothing, forever.
+///
+/// `interactive == true` also focuses the window, since a window created with
+/// `focus: false` and `skipTaskbar: true` cannot otherwise be reached by
+/// keyboard either. Bubbles keep using [`set_hit_test_rects`]; this is the
+/// coarser "a modal owns the screen" switch.
+pub fn set_interactive(window: &WebviewWindow, interactive: bool) -> Result<(), OverlayError> {
+    #[cfg(windows)]
+    {
+        unsafe {
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_TRANSPARENT,
+            };
+            let hwnd = window
+                .hwnd()
+                .map_err(|e| OverlayError::Win32(e.to_string()))?;
+            let hwnd = HWND(hwnd.0);
+            let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            let new_style = if interactive {
+                style & !(WS_EX_TRANSPARENT.0 as isize)
+            } else {
+                style | (WS_EX_TRANSPARENT.0 as isize)
+            };
+            if new_style != style {
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
+            }
+        }
+        if interactive {
+            let _ = window.set_focus();
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (window, interactive);
+        Err(OverlayError::Win32("windows-only".into()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

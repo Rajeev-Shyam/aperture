@@ -42,6 +42,27 @@ pub async fn toggle_capture(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
+    // Persist the decision + stamp the `capture_toggle` audit row BEFORE driving
+    // the mechanism (doc 13 §3, §8, M9). Order matters: if we cannot record that
+    // capture started, we must not start it — so an ON toggle aborts here.
+    //
+    // An OFF toggle proceeds regardless: a failed write must never trap the user
+    // in the ON state. But it is NOT swallowed — the error is returned after the
+    // release, because the decision did not persist and the next launch will
+    // restore capture from the stale stored value. The user needs to know that.
+    let persist_error = {
+        let mut consent = state.consent.lock().await;
+        match consent.set_capture_enabled(on, crate::pipeline::epoch_ms()) {
+            Ok(()) => None,
+            Err(e) => {
+                tracing::error!(%e, on, "consent/audit write failed");
+                if on {
+                    return Err(format!("could not record capture consent: {e}"));
+                }
+                Some(e)
+            }
+        }
+    };
     {
         let mut orch = state.orchestration.lock().await;
         if on {
@@ -52,7 +73,196 @@ pub async fn toggle_capture(
             orch.toggle().turn_off().await;
         }
     }
-    Ok(on)
+    match persist_error {
+        None => Ok(on),
+        Some(e) => Err(format!(
+            "capture was turned off, but the setting could not be saved ({e}); \
+             it may switch back on at next launch"
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M9 — privacy surface (doc 13). Consent, the audit trail, exclusions, Purge All.
+// ---------------------------------------------------------------------------
+
+/// Let a modal overlay surface accept input (doc 11 §2, M9).
+///
+/// The overlay is click-through and unfocusable by default, which is right for
+/// passive bubbles and wrong for a dialog the user must answer. The first-run
+/// consent flow and the Activity & Privacy panel call this `true` on mount and
+/// `false` on unmount; without it their buttons are unclickable.
+///
+/// Failure is non-fatal but IS surfaced: a modal the user cannot dismiss is a
+/// worse outcome than a logged error, so the caller learns about it.
+#[tauri::command]
+pub async fn set_overlay_interactive(
+    interactive: bool,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    use tauri::Manager;
+    let window = app
+        .get_webview_window(crate::overlay::OVERLAY_LABEL)
+        .ok_or_else(|| "overlay window not found".to_string())?;
+    crate::overlay::set_interactive(&window, interactive).map_err(|e| e.to_string())
+}
+
+/// The consent snapshot the first-run flow and the settings view read
+/// (doc 13 §8). Also reports whether at-rest encryption is actually in force, so
+/// the UI can tell the truth about it rather than assume.
+#[tauri::command]
+pub async fn get_consent(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let consent = state.consent.lock().await;
+    let s = consent.state();
+    Ok(serde_json::json!({
+        "first_run_completed": s.first_run_completed,
+        "capture_enabled": s.capture_enabled,
+        "voice_opt_in": s.voice_opt_in,
+        "capture_opt_in_ts": s.capture_opt_in_ts,
+        "db_encrypted": state.db.is_encrypted(),
+    }))
+}
+
+/// Complete the first-run consent sequence (doc 13 §8, ADR-040). `enable_capture`
+/// is the user's explicit decision; declining is a first-class outcome that still
+/// marks first-run done, so the flow never re-nags.
+#[tauri::command]
+pub async fn complete_first_run(
+    enable_capture: bool,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    {
+        let mut consent = state.consent.lock().await;
+        consent
+            .complete_first_run(enable_capture, crate::pipeline::epoch_ms())
+            .map_err(|e| e.to_string())?;
+    }
+    // Drive the mechanism to match the decision (INVARIANT 3: the toggle owner
+    // is still the single writer of capture state).
+    if enable_capture {
+        state.orchestration.lock().await.toggle().turn_on().await;
+    } else {
+        let _ = events::emit_capture_indicator(&app, CaptureIndicator::Off);
+    }
+    Ok(())
+}
+
+/// Grant microphone consent at first PTT (doc 13 §8).
+#[tauri::command]
+pub async fn grant_voice_consent(state: State<'_, AppState>) -> Result<(), String> {
+    let mut consent = state.consent.lock().await;
+    consent.grant_voice().map_err(|e| e.to_string())
+}
+
+/// The Activity & Privacy view's audit feed (doc 13 §3, §7, ADR-040): "when was
+/// it watching?" and "what ever left this machine?", newest first.
+#[tauri::command]
+pub async fn list_audit(
+    limit: Option<u32>,
+    state: State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let rows = state
+        .db
+        .recent_audit_events(limit.unwrap_or(200))
+        .map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|e| {
+            serde_json::json!({
+                "id": e.id,
+                "ts": e.ts,
+                "type": e.r#type,
+                "payload": e.payload,
+            })
+        })
+        .collect())
+}
+
+/// One-click Purge All (doc 13 §7). The confirmation lives in the UI; by the time
+/// this is invoked the user has confirmed. Returns the number of history rows
+/// deleted so the UI can report what actually happened.
+///
+/// Audit rows inside the 30-day window, the exclusion list, and consent all
+/// survive — see `Db::purge_all` for why.
+#[tauri::command]
+pub async fn purge_all(state: State<'_, AppState>) -> Result<usize, String> {
+    let policy = aperture_db::retention::RetentionPolicy::default();
+    state
+        .db
+        .purge_all(crate::pipeline::epoch_ms(), &policy)
+        .map_err(|e| e.to_string())
+}
+
+/// The user's exclusion rules, for the Activity & Privacy view (doc 13 §4).
+#[tauri::command]
+pub async fn list_exclusions(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
+    let rows = state.db.read_exclusion_list().map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, match_kind, pattern, enabled)| {
+            serde_json::json!({ "id": id, "match_kind": match_kind, "pattern": pattern, "enabled": enabled })
+        })
+        .collect())
+}
+
+/// Add an exclusion rule — the one-click "exclude this app/domain" affordance
+/// and the first-run confirm rows (doc 13 §4, §9).
+///
+/// The pattern is validated with the SAME regex builder the capture gate
+/// compiles with (`exclusion::validate_pattern`). This matters: `compile` fails
+/// *open* on a bad regex, so persisting an invalid one would produce a rule the
+/// UI shows as an active protection while it silently matches nothing.
+///
+/// NOTE: the compiled matcher inside the running capture subsystem is built at
+/// startup, so a rule added now takes effect on the next launch. The row is
+/// durable immediately. Hot-reloading the matcher needs an interior-mutable
+/// `ExclusionList` in `aperture-capture`; deferred deliberately rather than
+/// bolted on here (see the M9 notes in doc 13).
+#[tauri::command]
+pub async fn add_exclusion(
+    match_kind: String,
+    pattern: String,
+    state: State<'_, AppState>,
+) -> Result<i64, String> {
+    let pattern = pattern.trim();
+    aperture_capture::exclusion::validate_pattern(&match_kind, pattern)?;
+    state
+        .db
+        .add_exclusion_rule(&match_kind, pattern)
+        .map_err(|e| e.to_string())
+}
+
+/// Enable/disable (`enabled: Some`) or delete (`enabled: None`) one rule.
+#[tauri::command]
+pub async fn set_exclusion(
+    id: i64,
+    enabled: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state.db.set_exclusion_enabled(id, enabled).map_err(|e| e.to_string())
+}
+
+/// First-run detect-and-suggest (doc 13 §4, §8; ADR-029/ADR-040): scan locally
+/// for installed password managers / finance apps and return *candidates* the
+/// user confirms. Nothing is applied here — confirming calls [`add_exclusion`].
+#[tauri::command]
+pub async fn suggest_exclusions(
+    state: State<'_, AppState>,
+) -> Result<Vec<aperture_privacy::detect_suggest::SuggestedExclusion>, String> {
+    let already: Vec<String> = state
+        .db
+        .read_exclusion_list()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|(_, _, pattern, _)| pattern)
+        .collect();
+    // The filesystem walk is blocking; keep it off the async executor.
+    let installed =
+        tauri::async_runtime::spawn_blocking(aperture_privacy::detect_suggest::installed_process_names)
+            .await
+            .map_err(|e| e.to_string())?;
+    Ok(aperture_privacy::detect_suggest::suggest_from(&installed, &already))
 }
 
 /// Record bubble feedback (doc 08 §7, ADR-040/Q81): update the durable

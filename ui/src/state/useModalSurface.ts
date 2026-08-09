@@ -1,0 +1,69 @@
+//! What a modal surface needs on the Aperture overlay (doc 11 §2, doc 13, a11y).
+//
+//  Two obligations, both easy to forget and both silently fatal:
+//
+//  1. **Input.** The overlay window is created click-through
+//     (`WS_EX_TRANSPARENT`) and `"focus": false` — right for passive bubbles,
+//     fatal for a dialog. Without clearing that bit, every click on a modal
+//     falls through to the app underneath and the buttons simply never fire.
+//     The `set_overlay_interactive` command toggles it; this hook pairs the
+//     mount/unmount calls so a surface cannot forget the `false`.
+//
+//  2. **Focus.** `aria-modal="true"` is a promise to assistive tech that focus
+//     is inside the surface and cannot wander behind it. Declaring it without
+//     implementing it is worse than not declaring it: a screen-reader user is
+//     told the rest of the page is inert while Tab quietly walks them out.
+//
+//  Escape is deliberately NOT handled here — whether Escape is a safe exit is
+//  per-surface (Cancel on the preview, Close on the privacy panel, nothing on a
+//  first-run flow that must be answered), so each caller wires it explicitly.
+
+import { useEffect, type RefObject } from "react";
+
+import { setOverlayInteractive } from "../lib/ipc";
+
+const FOCUSABLE =
+  'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+/**
+ * Mark `ref` as a live modal surface: make the overlay accept input while it is
+ * mounted, move focus in, restore focus on unmount, and cycle Tab within it.
+ *
+ * Returns the `onKeyDown` handler the surface must spread onto its root element.
+ */
+export function useModalSurface(
+  ref: RefObject<HTMLElement | null>,
+): (e: React.KeyboardEvent) => void {
+  useEffect(() => {
+    // If this fails the modal is unusable, so it is worth a console error —
+    // but it must not throw and leave the surface half-initialised.
+    void setOverlayInteractive(true).catch((e) =>
+      console.error("overlay did not become interactive; this modal may be unclickable", e),
+    );
+    const opener = document.activeElement as HTMLElement | null;
+    ref.current?.focus();
+    return () => {
+      void setOverlayInteractive(false).catch(() => {
+        /* going back to click-through is best-effort on teardown */
+      });
+      // Restoring focus to whatever opened the surface is what makes closing it
+      // non-disorienting; without it focus falls back to <body>.
+      opener?.focus?.();
+    };
+  }, [ref]);
+
+  return (e: React.KeyboardEvent) => {
+    if (e.key !== "Tab") return;
+    const focusables = ref.current?.querySelectorAll<HTMLElement>(FOCUSABLE);
+    if (!focusables || focusables.length === 0) return;
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  };
+}
