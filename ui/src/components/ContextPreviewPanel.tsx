@@ -21,7 +21,7 @@
 //  Contract law (doc 15 §2): only THIS panel sets `user_approved` (via
 //  `preview_set_approved`); only the gateway consumes an approved payload.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 
 import {
   previewSend,
@@ -33,6 +33,7 @@ import {
   type StructuredSuggestions,
   type TransportTarget,
 } from "../lib/ipc";
+import { useModalSurface } from "../state/useModalSurface";
 
 interface Props {
   /** The live payload object — rendering + editing target. */
@@ -71,14 +72,11 @@ export function ContextPreviewPanel({ payload, onChange, onClose }: Props) {
   const panelRef = useRef<HTMLDivElement>(null);
 
   // `aria-modal` must be backed by the real modal contract (this is the ONE gate
-  // where the user reviews exactly what egresses): move focus in on open, restore
-  // it to the opener on close, trap Tab, and map Escape to Cancel — the
-  // zero-residue safe path (doc 13 §3).
-  useEffect(() => {
-    const opener = document.activeElement as HTMLElement | null;
-    panelRef.current?.focus();
-    return () => opener?.focus?.();
-  }, []);
+  // where the user reviews exactly what egresses): make the click-through
+  // overlay accept input, move focus in on open, restore it to the opener on
+  // close, trap Tab, and map Escape to Cancel — the zero-residue safe path
+  // (doc 13 §3). Without the overlay half, Send/Cancel are literally unclickable.
+  const trapKeys = useModalSurface(panelRef);
 
   function onKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
     if (e.key === "Escape") {
@@ -86,20 +84,7 @@ export function ContextPreviewPanel({ payload, onChange, onClose }: Props) {
       onClose(); // Cancel — drop everything, zero residue (doc 13 §3).
       return;
     }
-    if (e.key !== "Tab") return;
-    const focusables = panelRef.current?.querySelectorAll<HTMLElement>(
-      'button:not([disabled]), [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
-    );
-    if (!focusables || focusables.length === 0) return;
-    const first = focusables[0];
-    const last = focusables[focusables.length - 1];
-    if (e.shiftKey && document.activeElement === first) {
-      e.preventDefault();
-      last.focus();
-    } else if (!e.shiftKey && document.activeElement === last) {
-      e.preventDefault();
-      first.focus();
-    }
+    trapKeys(e);
   }
 
   // Size/token estimate over the EXACT wire serialization (doc 09 §5). We strip

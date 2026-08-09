@@ -20,6 +20,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::audit_log::{CaptureToggleRecord, ToggleReason};
+use crate::PrivacyError;
+
 /// The persisted first-run / consent state (stored in the encrypted settings
 /// table, doc 13 §6). Additive-only per the compatibility law (doc 15 §6).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,47 +72,185 @@ impl ConsentState {
     }
 }
 
+/// The `settings` key the consent blob lives under (doc 13 §6).
+pub const CONSENT_SETTINGS_KEY: &str = "consent";
+
 /// Manages reading/writing [`ConsentState`] and emitting the matching audit
 /// rows (capture toggles, doc 13 §3). Persists to the encrypted settings table.
 pub struct ConsentManager {
-    // TODO(M9): hold ConsentState + a settings persistence handle + an AuditLog.
+    state: ConsentState,
+    db: std::sync::Arc<aperture_db::Db>,
+    audit: crate::audit_log::AuditLog,
 }
 
 impl ConsentManager {
     /// Load consent state, defaulting to first-run OFF when absent (doc 13 §8).
-    pub fn load() -> Self {
-        // TODO(M9): read from encrypted settings; Default::default() on miss.
-        todo!("M9: load consent state, default capture OFF (doc 13 §8)")
+    ///
+    /// A corrupt/unparseable blob also yields the safe default (capture OFF)
+    /// rather than an error: consent must fail **closed**, and an unreadable
+    /// consent record is not evidence that the user consented.
+    pub fn load(db: std::sync::Arc<aperture_db::Db>) -> Result<Self, PrivacyError> {
+        let stored = db
+            .get_setting(CONSENT_SETTINGS_KEY)
+            .map_err(|e| PrivacyError::Audit(e.to_string()))?;
+        let state = match stored.as_deref() {
+            None => ConsentState::default(),
+            Some(text) => serde_json::from_str(text).unwrap_or_else(|e| {
+                tracing::warn!(%e, "consent record unparseable — failing closed to capture OFF (doc 13 §8)");
+                ConsentState::default()
+            }),
+        };
+        let audit = crate::audit_log::AuditLog::new(std::sync::Arc::clone(&db));
+        Ok(Self { state, db, audit })
     }
 
     /// Record completion of the first-run flow and the user's capture decision.
     /// Enabling here also stamps a `capture_toggle` audit row
     /// ([`crate::audit_log::ToggleReason::Consent`], doc 13 §3).
-    pub fn complete_first_run(&mut self, _enable_capture: bool) {
-        // TODO(M9): set first_run_completed; apply capture decision via
-        // set_capture_enabled; persist.
-        todo!("M9: complete first-run consent (doc 13 §8)")
+    pub fn complete_first_run(&mut self, enable_capture: bool, now_ms: i64) -> Result<(), PrivacyError> {
+        self.state.first_run_completed = true;
+        self.apply_capture(enable_capture, ToggleReason::Consent, now_ms)
     }
 
     /// Toggle capture. On every transition, persist and write a `capture_toggle`
     /// audit row (doc 13 §3). INVARIANT (3): the OFF transition's sidecar-kill /
     /// VRAM release is performed by capture/orchestration in response to this.
-    pub fn set_capture_enabled(&mut self, _enabled: bool) {
-        // TODO(M9): update state + capture_opt_in_ts; persist; audit_log
-        // .record_capture_toggle(...).
-        todo!("M9: set capture enabled + audit (doc 13 §3, §8, invariant 3)")
+    pub fn set_capture_enabled(&mut self, enabled: bool, now_ms: i64) -> Result<(), PrivacyError> {
+        self.apply_capture(enabled, ToggleReason::UserAction, now_ms)
+    }
+
+    /// Re-apply the stored capture decision at startup (doc 13 §8).
+    ///
+    /// Distinct from [`Self::set_capture_enabled`] purely so the audit row is
+    /// labelled honestly: this is **stored consent taking effect**, not a fresh
+    /// user action, and a trail that calls a boot-time restore "user_action"
+    /// misreports when the user actually did something.
+    pub fn restore_capture(&mut self, now_ms: i64) -> Result<(), PrivacyError> {
+        self.apply_capture(true, ToggleReason::Consent, now_ms)
+    }
+
+    /// Shared body of the two capture-decision entry points. Persists first, then
+    /// audits: a row claiming capture flipped must never outlive a failed write.
+    ///
+    /// The audit row is written on **every** call, not only on a state *change* —
+    /// "when was it watching?" is answered by the trail, and a re-affirmed ON
+    /// (e.g. re-enabling after a failed start) is real user activity.
+    fn apply_capture(
+        &mut self,
+        enabled: bool,
+        reason: ToggleReason,
+        now_ms: i64,
+    ) -> Result<(), PrivacyError> {
+        let previous = self.state.clone();
+        self.state.capture_enabled = enabled;
+        if enabled && self.state.capture_opt_in_ts.is_none() {
+            self.state.capture_opt_in_ts = Some(now_ms);
+        }
+        // Roll back on a failed write. Otherwise in-memory state and the settings
+        // row disagree, and the NEXT launch reads the stale row — e.g. a failed
+        // OFF persist leaves `capture_enabled: true` on disk, so `restore_capture`
+        // silently turns capture back on against the user's last instruction.
+        if let Err(e) = self.persist() {
+            self.state = previous;
+            return Err(e);
+        }
+        self.audit.record_capture_toggle(CaptureToggleRecord { enabled, reason, ts: now_ms })
     }
 
     /// Grant microphone/voice consent at first PTT (doc 13 §8).
-    pub fn grant_voice(&mut self) {
-        // TODO(M9): set voice_opt_in = true; persist.
-        todo!("M9: voice opt-in at first PTT (doc 13 §8)")
+    pub fn grant_voice(&mut self) -> Result<(), PrivacyError> {
+        self.state.voice_opt_in = true;
+        self.persist()
     }
 
     /// The current state (read-only view for the indicator / UI).
     pub fn state(&self) -> &ConsentState {
-        // TODO(M9): return &self.state.
-        todo!("M9: expose current consent state (doc 13 §8)")
+        &self.state
+    }
+
+    fn persist(&self) -> Result<(), PrivacyError> {
+        let text = serde_json::to_string(&self.state)?;
+        self.db
+            .set_setting(CONSENT_SETTINGS_KEY, &text)
+            .map_err(|e| PrivacyError::Audit(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn db() -> Arc<aperture_db::Db> {
+        Arc::new(aperture_db::Db::open_in_memory().expect("db"))
+    }
+
+    #[test]
+    fn first_run_defaults_to_everything_off() {
+        let mgr = ConsentManager::load(db()).expect("load");
+        assert!(!mgr.state().first_run_completed);
+        assert!(!mgr.state().capture_allowed(), "capture is OFF until opt-in (doc 13 §8)");
+        assert!(!mgr.state().voice_allowed());
+    }
+
+    #[test]
+    fn consent_survives_a_reload_and_audits_the_transition() {
+        let db = db();
+        {
+            let mut mgr = ConsentManager::load(Arc::clone(&db)).expect("load");
+            mgr.complete_first_run(true, 1_000).expect("complete");
+        }
+        let mgr = ConsentManager::load(Arc::clone(&db)).expect("reload");
+        assert!(mgr.state().first_run_completed);
+        assert!(mgr.state().capture_allowed(), "the decision is durable");
+        assert_eq!(mgr.state().capture_opt_in_ts, Some(1_000));
+
+        let audit = crate::audit_log::AuditLog::new(db);
+        let rows = audit.recent(10).expect("audit");
+        assert_eq!(rows.len(), 1, "the opt-in is on the audit trail");
+        assert_eq!(rows[0].payload["reason"], serde_json::json!("consent"));
+        assert_eq!(rows[0].payload["enabled"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn toggling_capture_writes_one_audit_row_per_transition() {
+        let db = db();
+        let mut mgr = ConsentManager::load(Arc::clone(&db)).expect("load");
+        mgr.set_capture_enabled(true, 10).unwrap();
+        mgr.set_capture_enabled(false, 20).unwrap();
+        mgr.set_capture_enabled(true, 30).unwrap();
+
+        let rows = crate::audit_log::AuditLog::new(db).recent(10).expect("audit");
+        assert_eq!(rows.len(), 3, "every transition is on the trail (doc 13 §3)");
+        assert_eq!(rows[0].ts, 30, "newest first");
+        assert_eq!(rows[0].payload["reason"], serde_json::json!("user_action"));
+        // The opt-in stamp records the FIRST enable, not the latest.
+        assert_eq!(mgr.state().capture_opt_in_ts, Some(10));
+    }
+
+    #[test]
+    fn voice_requires_both_the_mic_opt_in_and_capture() {
+        let db = db();
+        let mut mgr = ConsentManager::load(Arc::clone(&db)).expect("load");
+        mgr.grant_voice().unwrap();
+        assert!(!mgr.state().voice_allowed(), "voice needs capture ON too (doc 13 §8)");
+        mgr.set_capture_enabled(true, 1).unwrap();
+        assert!(mgr.state().voice_allowed());
+
+        // And it survives a reload.
+        let reloaded = ConsentManager::load(db).expect("reload");
+        assert!(reloaded.state().voice_opt_in);
+    }
+
+    #[test]
+    fn a_corrupt_consent_record_fails_closed() {
+        let db = db();
+        db.set_setting(CONSENT_SETTINGS_KEY, "{ not json").unwrap();
+        let mgr = ConsentManager::load(db).expect("load must not error");
+        assert!(
+            !mgr.state().capture_allowed(),
+            "an unreadable consent record is NOT evidence of consent"
+        );
     }
 }
 

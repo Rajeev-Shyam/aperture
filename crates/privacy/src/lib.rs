@@ -9,10 +9,18 @@
 //!
 //! - [`redaction`] — the ordered, deterministic redaction pipeline that runs at
 //!   payload assembly, **before** preview (doc 13 §5).
-//! - [`exclusion_manager`] — the exclusion list + private/incognito heuristic
-//!   that stops collection at the earliest gate (doc 13 §4).
+//! - [`detect_suggest`] — the first-run local scan that *suggests* exclusions the
+//!   user confirms (doc 13 §4, §8; ADR-029/ADR-040).
 //! - [`audit_log`] — the local-only `capture_toggle` / `cloud_send` audit trail;
 //!   rows survive Purge All for 30 d (doc 13 §3, §7).
+//!
+//! **Exclusion matching does NOT live here.** `aperture_capture::exclusion`
+//! (`ExclusionList`) owns the compiled rules, the process/class/title/`url_pattern`
+//! matchers, and the private-window heuristic — it must run *inside* the capture
+//! gate, before a frame is pulled (doc 05 §4), so that is where it belongs. The
+//! persisted rules live in `aperture_db`'s `exclusion_list` table. This crate had
+//! a second, weaker copy of that logic until M9; it was deleted rather than kept
+//! in sync.
 //! - [`key_manager`] — the per-install at-rest key, wrapped by DPAPI (current
 //!   user) and stored in Windows Credential Manager (doc 13 §6).
 //! - [`consent`] — first-run capture opt-in (default OFF), per-send approval
@@ -27,11 +35,9 @@
 //!   `aperture-capture`/orchestration, recorded here as a `capture_toggle` audit
 //!   event.
 
-// TODO(M9): privacy is the M9 milestone (doc 16). Most bodies are `todo!("M9:")`.
-
 pub mod audit_log;
 pub mod consent;
-pub mod exclusion_manager;
+pub mod detect_suggest;
 pub mod key_manager;
 pub mod redaction;
 

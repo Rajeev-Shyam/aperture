@@ -192,6 +192,37 @@ fn matches_rule(
     false
 }
 
+/// Validate one `(match_kind, pattern)` pair BEFORE it is persisted (doc 13 §4).
+///
+/// [`ExclusionList::compile`] fails **open** on a bad regex — it drops that
+/// matcher and keeps going, so one broken rule cannot kill the whole list. That
+/// is right at load time and disastrous at *entry* time: a rule whose only
+/// matcher fails to compile becomes a rule that matches nothing, while the UI
+/// happily shows it as an active protection. The user believes an app is
+/// excluded and it is being captured.
+///
+/// So entry is validated here, with the *same* `RegexBuilder` configuration the
+/// compile path uses — one definition, no drift.
+pub fn validate_pattern(match_kind: &str, pattern: &str) -> Result<(), String> {
+    if pattern.trim().is_empty() {
+        return Err("an exclusion pattern cannot be empty".into());
+    }
+    match match_kind {
+        // Literal matchers: any non-empty string is valid.
+        "process" | "window_class" => Ok(()),
+        "title_regex" | "url_pattern" => {
+            regex::RegexBuilder::new(pattern)
+                .case_insensitive(true)
+                .build()
+                .map(|_| ())
+                .map_err(|e| format!("invalid regex: {e}"))
+        }
+        other => Err(format!(
+            "unknown match_kind `{other}` (expected process | window_class | title_regex | url_pattern)"
+        )),
+    }
+}
+
 /// Heuristic for a private/incognito browser window via title-suffix patterns
 /// (doc 13 §4). Treated as excluded with the [`redaction_flags::PRIVATE_WINDOW`]
 /// bit. [VERIFY reliability per browser — suffixes drift across versions/locales
@@ -282,6 +313,23 @@ mod tests {
         assert!(is_private_window(Some("x (Private Browsing)")));
         assert!(is_private_window(Some("tab [InPrivate]")));
         assert!(!is_private_window(Some("Incognito mode explained - Chrome")));
+    }
+
+    #[test]
+    fn validate_pattern_rejects_at_entry_what_compile_would_silently_drop() {
+        // The exact hazard: `compile` fails open, so an unvalidated bad regex
+        // becomes a rule the UI shows as active but which protects nothing.
+        assert!(validate_pattern("title_regex", "([unclosed").is_err());
+        assert!(validate_pattern("url_pattern", "*bad").is_err());
+        assert!(validate_pattern("process", "").is_err(), "empty is never a rule");
+        assert!(validate_pattern("process", "   ").is_err(), "whitespace is not a pattern");
+        assert!(validate_pattern("nonsense", "x").is_err(), "unknown kind rejected");
+
+        // Valid ones pass, including literals that are not valid regexes.
+        assert!(validate_pattern("process", "1Password.exe").is_ok());
+        assert!(validate_pattern("window_class", "([not-a-regex").is_ok(), "literal kinds are not regexes");
+        assert!(validate_pattern("title_regex", r"mybank\.example").is_ok());
+        assert!(validate_pattern("url_pattern", r"^https://banking\.").is_ok());
     }
 
     #[test]

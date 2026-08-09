@@ -288,6 +288,107 @@ export function setSettings(patch: Settings): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// M9 — privacy surface (doc 13). Consent, the audit trail, exclusions, purge.
+// ---------------------------------------------------------------------------
+
+/** Mirror of the `get_consent` response (doc 13 §8). `db_encrypted` is reported
+ *  by the core rather than assumed: the UI must never claim at-rest encryption
+ *  the build did not actually apply. */
+export interface ConsentState {
+  first_run_completed: boolean;
+  capture_enabled: boolean;
+  voice_opt_in: boolean;
+  capture_opt_in_ts: number | null;
+  db_encrypted: boolean;
+}
+
+/** The four exclusion match kinds (doc 13 §4, ADR-040). */
+export type ExclusionKind = "process" | "window_class" | "title_regex" | "url_pattern";
+
+/** Mirror of one `exclusion_list` row. */
+export interface ExclusionRow {
+  id: number;
+  match_kind: ExclusionKind;
+  pattern: string;
+  enabled: boolean;
+}
+
+/** Mirror of `detect_suggest::SuggestedExclusion` — a *candidate* the user
+ *  confirms. Nothing is auto-excluded (ADR-029/Q15). */
+export interface SuggestedExclusion {
+  match_kind: ExclusionKind;
+  pattern: string;
+  label: string;
+  reason: string;
+}
+
+/** One audit row: `capture_toggle` ("when was it watching?") or `cloud_send`
+ *  ("what left this machine?") — doc 13 §3. */
+export interface AuditRow {
+  id: number;
+  ts: number;
+  type: "capture_toggle" | "cloud_send";
+  payload: Record<string, unknown>;
+}
+
+/** Let a modal overlay surface accept clicks + keyboard (doc 11 §2, M9).
+ *
+ *  The overlay window is click-through and unfocusable by default — correct for
+ *  passive bubbles, fatal for a dialog. Any modal surface MUST call this `true`
+ *  on mount and `false` on unmount, or its buttons silently do nothing. */
+export function setOverlayInteractive(interactive: boolean): Promise<void> {
+  return invoke("set_overlay_interactive", { interactive });
+}
+
+/** Current consent + whether the DB is really encrypted (doc 13 §6, §8). */
+export function getConsent(): Promise<ConsentState> {
+  return invoke<ConsentState>("get_consent");
+}
+
+/** Finish the first-run sequence with the user's explicit capture decision.
+ *  Declining is a first-class outcome — first-run still completes. */
+export function completeFirstRun(enableCapture: boolean): Promise<void> {
+  return invoke("complete_first_run", { enableCapture });
+}
+
+/** Microphone opt-in at first PTT (doc 13 §8). */
+export function grantVoiceConsent(): Promise<void> {
+  return invoke("grant_voice_consent");
+}
+
+/** The Activity & Privacy audit feed, newest first (doc 13 §3, §7). */
+export function listAudit(limit?: number): Promise<AuditRow[]> {
+  return invoke<AuditRow[]>("list_audit", { limit: limit ?? null });
+}
+
+/** One-click Purge All (doc 13 §7). Confirm in the UI BEFORE calling this — it
+ *  is irreversible. Returns the number of history rows deleted. */
+export function purgeAll(): Promise<number> {
+  return invoke<number>("purge_all");
+}
+
+/** The user's exclusion rules (doc 13 §4). */
+export function listExclusions(): Promise<ExclusionRow[]> {
+  return invoke<ExclusionRow[]>("list_exclusions");
+}
+
+/** Add an exclusion rule — "exclude this app/domain" (doc 13 §4, §9). */
+export function addExclusion(matchKind: ExclusionKind, pattern: string): Promise<number> {
+  return invoke<number>("add_exclusion", { matchKind, pattern });
+}
+
+/** Enable/disable (`enabled` boolean) or delete (`enabled: null`) one rule. */
+export function setExclusion(id: number, enabled: boolean | null): Promise<void> {
+  return invoke("set_exclusion", { id, enabled });
+}
+
+/** First-run detect-and-suggest (doc 13 §4, §8): local scan → candidates the
+ *  user confirms. Applying one is a separate, explicit `addExclusion` call. */
+export function suggestExclusions(): Promise<SuggestedExclusion[]> {
+  return invoke<SuggestedExclusion[]>("suggest_exclusions");
+}
+
+// ---------------------------------------------------------------------------
 // Typed event listeners. Each returns the tauri `UnlistenFn` so callers can
 // clean up in a React effect.
 // ---------------------------------------------------------------------------

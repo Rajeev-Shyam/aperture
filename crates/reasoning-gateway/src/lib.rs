@@ -76,9 +76,9 @@ pub struct Gateway {
     /// returned `reconstruct_payload` is re-validated here before a bubble offers it.
     connectors: Box<dyn suggestion_validator::ConnectorLookup>,
     /// Audit sink for the `cloud_send` row written at Send (doc 13 §3, doc 09 §5).
-    /// // TODO(M9:) concrete `aperture_privacy::audit_log::AuditLog` handle; M7
-    /// computes + logs the record, M9 persists it to the encrypted DB.
-    _audit: Arc<()>,
+    /// Defaults to [`aperture_privacy::audit_log::NullAuditSink`]; the shell
+    /// injects the DB-backed `AuditLog` via [`Gateway::with_audit`] (M9).
+    audit: Arc<dyn aperture_privacy::audit_log::AuditSink>,
 }
 
 impl Gateway {
@@ -92,8 +92,16 @@ impl Gateway {
         Self {
             transports,
             connectors,
-            _audit: Arc::new(()),
+            audit: Arc::new(aperture_privacy::audit_log::NullAuditSink),
         }
+    }
+
+    /// Inject the persistent audit sink (M9, doc 13 §3). Without this the
+    /// gateway still *computes* and logs every `cloud_send` record — it just has
+    /// nowhere durable to put it.
+    pub fn with_audit(mut self, audit: Arc<dyn aperture_privacy::audit_log::AuditSink>) -> Self {
+        self.audit = audit;
+        self
     }
 
     /// Report the health of every configured transport, in settings order — feeds
@@ -169,7 +177,6 @@ impl Gateway {
         // 3. Audit AFTER a successful send (bytes actually left — never a phantom
         //    egress row on a failed send), over the transport's REAL wire bytes so
         //    the recorded SHA-256 matches what egressed (doc 13 §3, preview == wire).
-        //    (M9 persists the row via aperture_privacy::audit_log::AuditLog.)
         let wire = transport.wire_bytes(payload);
         let record = payload_builder::record_cloud_send(payload, &wire, used_target);
         tracing::info!(
@@ -177,8 +184,15 @@ impl Gateway {
             sha256 = %record.wire_sha256,
             bytes = record.byte_count,
             transport = ?record.transport,
-            "cloud_send (M9: persist via aperture_privacy::audit_log)"
+            "cloud_send"
         );
+        // A failed audit write does NOT fail the Send: the bytes have already
+        // left, so erroring here would report a send that happened as one that
+        // did not — a worse lie than a missing row. Surface it loudly instead;
+        // the accountability gap is real and belongs in the log.
+        if let Err(e) = self.audit.record_cloud_send(record) {
+            tracing::error!(%e, "cloud_send audit row FAILED to persist (doc 13 §3) — egress happened, the trail is incomplete");
+        }
 
         // 4. Re-validate every suggestion against its target connector — the cloud
         //    suggests, only connectors act (doc 09 §4).
@@ -352,6 +366,67 @@ mod tests {
         // Approved → the transport is finally reached.
         g.send_with_preview(&approved_payload(), true).await.unwrap();
         assert!(sent.load(Ordering::SeqCst), "an approved Send must actually transmit");
+    }
+
+    /// M9 (doc 13 §3): a successful Send hands the `cloud_send` record to the
+    /// injected audit sink — the trail that answers "what left this machine?".
+    /// A refused Send must record NOTHING (no phantom egress row).
+    #[tokio::test]
+    async fn m9_audit_sink_receives_exactly_the_sends_that_egressed() {
+        use aperture_privacy::audit_log::{AuditSink, CloudSendRecord};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Spy(Mutex<Vec<CloudSendRecord>>);
+        impl AuditSink for Spy {
+            fn record_cloud_send(
+                &self,
+                rec: CloudSendRecord,
+            ) -> Result<(), aperture_privacy::PrivacyError> {
+                self.0.lock().unwrap().push(rec);
+                Ok(())
+            }
+        }
+
+        let spy = std::sync::Arc::new(Spy::default());
+        let canned = StructuredSuggestions { suggestions: vec![], answer_text: None };
+        let g = gateway(vec![transport(Health::Ready, canned)])
+            .with_audit(std::sync::Arc::clone(&spy) as std::sync::Arc<dyn AuditSink>);
+
+        // Refused send: nothing egressed, so nothing may be audited.
+        assert!(g.send_with_preview(&approved_payload(), false).await.is_err());
+        assert!(spy.0.lock().unwrap().is_empty(), "a refused Send must not leave an audit row");
+
+        let payload = approved_payload();
+        g.send_with_preview(&payload, true).await.unwrap();
+        let rows = spy.0.lock().unwrap();
+        assert_eq!(rows.len(), 1, "one successful Send => exactly one audit row");
+        assert_eq!(rows[0].payload_id, payload.payload_id);
+        assert_eq!(rows[0].wire_sha256.len(), 64);
+        assert!(rows[0].byte_count > 0);
+    }
+
+    /// An audit-write failure must not turn a completed Send into a reported
+    /// failure — the bytes already left; lying about that is worse than a gap.
+    #[tokio::test]
+    async fn m9_a_failing_audit_sink_does_not_fail_the_send() {
+        use aperture_privacy::audit_log::{AuditSink, CloudSendRecord};
+        struct Broken;
+        impl AuditSink for Broken {
+            fn record_cloud_send(
+                &self,
+                _rec: CloudSendRecord,
+            ) -> Result<(), aperture_privacy::PrivacyError> {
+                Err(aperture_privacy::PrivacyError::Audit("disk full".into()))
+            }
+        }
+        let canned = StructuredSuggestions { suggestions: vec![], answer_text: None };
+        let g = gateway(vec![transport(Health::Ready, canned)])
+            .with_audit(std::sync::Arc::new(Broken) as std::sync::Arc<dyn AuditSink>);
+        assert!(
+            g.send_with_preview(&approved_payload(), true).await.is_ok(),
+            "egress succeeded; the Send result must reflect that"
+        );
     }
 
     #[tokio::test]

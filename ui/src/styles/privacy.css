@@ -1,0 +1,316 @@
+/* Privacy surfaces (doc 13, doc 14) — the first-run consent sequence and the
+ * Activity & Privacy view.
+ *
+ * Both wear `.surface-opaque`, never `.surface-glass`: they are the two largest
+ * surfaces in the app, and a backdrop-filter over a full-height panel is both
+ * the most expensive blur we could draw and an immediate breach of the ≤2 glass
+ * budget (ADR-039, doc 14 §5). Opaque chrome is the same call M8 made for the
+ * bubble overflow menu.
+ *
+ * Design-token discipline: no raw colors here — every value resolves through
+ * design-tokens.css so the reduced-transparency and gpu-busy fallbacks apply
+ * without a second code path.
+ */
+
+/* --- Shared shell for both panels ---------------------------------------- */
+.firstrun,
+.privacy {
+  position: fixed;
+  color: var(--ink-primary);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-24);
+  box-shadow: var(--shadow-elev);
+  font: inherit;
+  overflow-y: auto;
+  /* These panels own their scroll; the transparent overlay body never scrolls. */
+  overscroll-behavior: contain;
+}
+
+.firstrun h2,
+.privacy h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1.25rem;
+  font-weight: 600;
+}
+
+.privacy h3 {
+  margin: 0 0 0.5rem;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--ink-secondary);
+}
+
+/* --- First-run consent (doc 13 §8, ADR-040) ------------------------------ */
+.firstrun {
+  inset: 50% auto auto 50%;
+  transform: translate(-50%, -50%);
+  width: min(560px, calc(100vw - 2 * var(--edge-inset)));
+  max-height: calc(100vh - 2 * var(--edge-inset));
+  padding: 24px;
+}
+
+.firstrun__steps {
+  display: flex;
+  gap: 8px;
+  margin: 0 0 20px;
+  padding: 0;
+  list-style: none;
+}
+
+.firstrun__step {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  font-size: 0.75rem;
+  color: var(--ink-faint);
+  border: 1px solid var(--border-hairline);
+}
+
+.firstrun__step--active {
+  color: var(--accent-ink);
+  background: var(--accent);
+  border-color: transparent;
+}
+
+.firstrun__facts {
+  margin: 0 0 20px;
+  padding-left: 1.1rem;
+  color: var(--ink-secondary);
+  line-height: 1.6;
+}
+
+.firstrun__facts strong {
+  color: var(--ink-primary);
+}
+
+.firstrun__lede {
+  margin: 0 0 16px;
+  color: var(--ink-secondary);
+  line-height: 1.5;
+}
+
+.firstrun__note {
+  margin: 0 0 16px;
+  color: var(--ink-faint);
+  font-size: 0.85rem;
+}
+
+.firstrun__suggestions {
+  margin: 0 0 20px;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.firstrun__suggestions label {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-12);
+  cursor: pointer;
+}
+
+.firstrun__suggestions label:hover {
+  border-color: var(--border-hairline-hover);
+}
+
+.firstrun__suggestion-reason {
+  color: var(--ink-faint);
+  font-size: 0.8rem;
+}
+
+.firstrun__actions,
+.privacy__add {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.firstrun__actions {
+  justify-content: flex-end;
+}
+
+/* --- Activity & Privacy view (doc 13 §3, §7) ----------------------------- */
+.privacy {
+  inset: var(--edge-inset) var(--edge-inset) var(--edge-inset) auto;
+  width: min(460px, calc(100vw - 2 * var(--edge-inset)));
+  padding: 20px;
+}
+
+.privacy__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.privacy__section {
+  margin-bottom: 24px;
+}
+
+.privacy__encryption {
+  margin: 0 0 20px;
+  font-size: 0.85rem;
+  color: var(--ink-secondary);
+}
+
+.privacy__encryption--warn,
+.privacy__error {
+  color: var(--health-down);
+}
+
+.privacy__note {
+  margin: 0 0 8px;
+  font-size: 0.82rem;
+  color: var(--ink-faint);
+  line-height: 1.5;
+}
+
+.privacy__audit,
+.privacy__rules {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.privacy__audit {
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+.privacy__audit-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border-radius: var(--radius-12);
+  border-left: 2px solid var(--border-hairline);
+  font-size: 0.82rem;
+  color: var(--ink-secondary);
+}
+
+/* The one row type that means bytes left the machine reads differently. */
+.privacy__audit-row--cloud_send {
+  border-left-color: var(--health-setup);
+}
+
+.privacy__audit-row time {
+  color: var(--ink-faint);
+  font-size: 0.75rem;
+}
+
+.privacy__hash {
+  margin-left: 6px;
+  color: var(--ink-faint);
+  font-size: 0.75rem;
+}
+
+.privacy__rules li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.82rem;
+}
+
+.privacy__rules code {
+  flex: 1;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.privacy__rule--off {
+  opacity: 0.5;
+}
+
+.privacy__rule-kind {
+  color: var(--ink-faint);
+  font-size: 0.75rem;
+}
+
+.privacy__add {
+  margin-top: 10px;
+}
+
+.privacy__add input,
+.privacy__add select {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  border-radius: var(--radius-12);
+  border: 1px solid var(--border-hairline);
+  background: transparent;
+  color: var(--ink-primary);
+  font: inherit;
+  font-size: 0.82rem;
+}
+
+.privacy__danger {
+  padding-top: 16px;
+  border-top: 1px solid var(--border-hairline);
+}
+
+.btn--danger {
+  border-color: var(--health-down);
+  color: var(--health-down);
+}
+
+.btn--danger:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.privacy__status {
+  font-size: 0.82rem;
+  color: var(--accent);
+}
+
+.firstrun__error,
+.privacy__error {
+  font-size: 0.82rem;
+  margin: 8px 0 0;
+}
+
+/* The shield affordance that opens the privacy view.
+ *
+ * Anchored TOP-right, directly under the capture indicator (`.capture` is
+ * `top: var(--edge-inset)`, bubble.css). It previously sat bottom-right, which
+ * is the bubble stack's territory (`.bubble-stack`, 320px-wide bubbles at
+ * `bottom: var(--edge-inset)`) — the shield overlapped the first bubble and
+ * competed with it for clicks. Privacy chrome belongs next to the indicator it
+ * explains, not inside the suggestion surface. */
+.privacy-open {
+  position: fixed;
+  right: var(--edge-inset);
+  top: calc(var(--edge-inset) + 40px);
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: 1px solid var(--border-hairline);
+  background: var(--fallback-opaque);
+  color: var(--ink-secondary);
+  cursor: pointer;
+  font-size: 0.9rem;
+  line-height: 1;
+}
+
+.privacy-open:hover {
+  color: var(--ink-primary);
+  border-color: var(--border-hairline-hover);
+}
+
+.privacy-open:focus-visible,
+.privacy__add input:focus-visible,
+.privacy__add select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}

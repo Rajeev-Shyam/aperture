@@ -12,6 +12,7 @@ import App from "./App";
 // has the CSS vars before bubble.css references them.
 import "./styles/design-tokens.css";
 import "./styles/bubble.css";
+import "./styles/privacy.css";
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>

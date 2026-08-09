@@ -30,6 +30,20 @@ aperture-suggestion-generator = { workspace = true }
 # reqwest (loopback-only, doc 13 §2) is never exercised by these gates.
 aperture-orchestration = { workspace = true }
 
+# M9 gate (m9_privacy): the real privacy subsystem (audit log, consent, DPAPI key
+# manager, detect-and-suggest) plus the real capture normalizer, so "an excluded
+# app is never framed" is asserted against the production gate rather than a fake.
+aperture-privacy = { workspace = true }
+aperture-capture = { workspace = true }
+aperture-event-bus = { workspace = true }
+uuid = { workspace = true }
+
+[features]
+default = []
+# Forwards to aperture-db's SQLCipher build so `m9_db_is_unreadable_without_the_key`
+# can run. Needs a native Perl + NASM on PATH (doc 13 §6).
+sqlcipher = ["aperture-db/sqlcipher"]
+
 # NOTE (doc 16 M0): no extra dev-dependencies. The gate tests deliberately avoid a
 # network/HTTP/process-spawn crate — pulling one in here would itself violate the
 # two-emitter rule (doc 13 §2) that these very gates exist to protect. The SC5/SC6

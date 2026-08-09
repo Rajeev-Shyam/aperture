@@ -40,6 +40,44 @@ Every milestone has a **validation gate**: a measured/proven condition on the re
 - **Seed-table note:** under the conservative doc 04 §2 seeds, 7B (L2) projects 7.03 GB at minimum and is inadmissible until remeasured — L1 (3B) is the only admitted VLM loadout pre-hardware-gate (staged rec #2).
 - **RESOLVED this session:** CONN-M2 (decay/mute ladder now survives restart — migration `0002` + `PatternEngine::hydrate`); the L2 swap, crash-ladder, and warm-keep deferrals above.
 
+## Implementation status (as of 2026-08-09) — M9 landed
+
+**M9 landed in software.** Privacy hardening (doc 13): the real DPAPI key manager
+(`BCryptGenRandom` → `CryptProtectData` → `CredWriteW`, tested against the actual Windows APIs),
+DB-backed `AuditLog` + `ConsentManager`, `Db::purge_all`, exclusion persistence + `detect_suggest`,
+the first-run consent sequence and the Activity & Privacy view, and the now-correctly-scoped
+two-emitter CI lint. Gate: **`crates/gates/tests/m9_privacy.rs` (7 tests) + `cargo xtask gate m9`.**
+
+**Repo hygiene fixed first (2026-08-09).** Merge `6aa10cd` (main→r2) had been resolved as "keep both
+sides" — +369 duplicated lines across 4 files, leaving `gpu_scheduler.rs` syntactically invalid, so
+**the workspace did not compile on `main` or `r2-spec-integration`**. Root cause: two duplicate
+M4/M5 commit chains, which made `main` a strict subset of the r2 tip. Repaired in `c68ddb6`.
+
+**M9 amendments:**
+- **Purge All preserves three tables** (`exclusion_list`, `settings`, `schema_migrations`), against
+  doc 03 §6's "truncates every table". Purging exclusions would silently resume capturing apps the
+  user excluded, and purging settings would reset consent — a *data* purge must not weaken the
+  user's protections. Documented in doc 13's M9 status + asserted by the gate.
+- **`privacy::exclusion_manager` deleted, not implemented.** It duplicated
+  `aperture_capture::exclusion`, which was already complete and correctly placed *inside* the
+  capture gate. De-duplicated rather than kept in sync.
+- **At-rest encryption is behind the `sqlcipher` cargo feature, OFF by default** — the vendored
+  OpenSSL build needs a native Windows Perl + NASM. `Db::is_encrypted()` reports the truth, the UI
+  and the gate both say so, and the M9 gate prints an explicit INCOMPLETE note. **This is the one
+  M9 exit criterion not yet closed.**
+- **`xtask gate m5/m6/m8/m9` are wired.** They previously hit a `todo!()` and panicked, even though
+  the m5/m6 gate tests already existed.
+
+**M9 carry-forward:**
+- **Close the encryption criterion:** install Strawberry Perl + NASM, then
+  `cargo test -p aperture-gates --features sqlcipher --test m9_privacy`.
+- **Exclusion hot-reload:** a rule added at runtime is durable immediately but applies to capture
+  from the next launch (the compiled matcher is built at startup).
+- Unchanged from the M6–M8 bridge: composition-root wiring for voice/gateway, CONN-M1, the
+  on-hardware gates, and the deferred MCP stdio server + `aperture_search_history` UX decision.
+
+Full session detail: `docs/handoff/session-bridge-2026-08-09-m9.md`.
+
 ## Gate-failure protocol
 A failed gate stops forward progress on that path; the fix lands, the gate re-runs, and the affected doc is amended (the docs are living: measured numbers replace estimates).
 

@@ -45,11 +45,30 @@ fn main() {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let _rt_guard = rt.enter();
 
-    // 2. history DB (doc 03). M9 wires the DPAPI-wrapped key (doc 13 §6).
+    // 2. history DB (doc 03) opened under the DPAPI-wrapped per-install key
+    //    (doc 13 §6, M9). Key loss => the DB is unreadable by design, so a key
+    //    error is fatal rather than a silent fall back to plaintext.
+    let db_key = aperture_privacy::key_manager::get_or_create_key()
+        .expect("read/create the DPAPI-wrapped DB key (doc 13 §6)");
     let db = Arc::new(
-        aperture_db::Db::open_encrypted(aperture_db::default_db_path(), &[])
+        aperture_db::Db::open_encrypted(aperture_db::default_db_path(), db_key.as_bytes())
             .expect("open history DB"),
     );
+    // `db_key` drops (and zeroizes) at the end of main; the connection already
+    // holds the derived page key.
+    if !db.is_encrypted() {
+        tracing::warn!(
+            "HISTORY DB IS NOT ENCRYPTED AT REST — this build lacks the `sqlcipher` \
+             feature (doc 13 §6). Data is plaintext on disk; the M9 gate will fail."
+        );
+    }
+
+    // Consent (doc 13 §8) — the source of truth for whether capture may run.
+    // Loaded before capture is composed so a fresh install starts OFF.
+    let consent = Arc::new(tokio::sync::Mutex::new(
+        aperture_privacy::consent::ConsentManager::load(Arc::clone(&db))
+            .expect("load consent state"),
+    ));
 
     // Retention: enforce TTLs on startup + daily (doc 03 §6, doc 16 M2).
     spawn_retention(Arc::clone(&db));
@@ -83,8 +102,9 @@ fn main() {
     let capture = aperture_capture::CaptureSubsystem::new(
         aperture_capture::CaptureConfig::default(),
         bus.clone(),
-        // ADR-029/Q15: defaults ship EMPTY; user rules merge from settings at M9.
-        aperture_capture::exclusion::ExclusionList::shipped_defaults(),
+        // ADR-029/Q15: defaults ship EMPTY; the user's confirmed rules come from
+        // the encrypted `exclusion_list` table (doc 13 §4, M9).
+        load_exclusions(&db),
         sink,
         Some(store),
     );
@@ -112,8 +132,84 @@ fn main() {
         feedback_tx,
         snooze_until,
         connectors,
+        consent,
     );
     run_tauri(state, feedback_rx, current_session, &rt);
+}
+
+/// Re-apply the persisted capture decision at startup (doc 13 §8, M9).
+///
+/// `capture_enabled` is durable consent, not a per-session flag: a user who
+/// turned capture on and then rebooted expects it on. Without this the shell
+/// would silently drop back to OFF every launch while the stored state still
+/// said ON — a quiet disagreement between what the user chose and what runs.
+///
+/// The restore is stamped on the audit trail, because the trail's job is to
+/// answer "when was it watching?" and this genuinely is a watching window.
+/// `ToggleReason::Consent` is the right label: it is the stored consent taking
+/// effect, not a fresh user action.
+///
+/// Capture never starts when consent says OFF — including a first run, where the
+/// default is OFF and this is a no-op.
+fn restore_capture(state: &AppState) {
+    let consent = Arc::clone(&state.consent);
+    let orchestration = Arc::clone(&state.orchestration);
+    tauri::async_runtime::spawn(async move {
+        let mut consent = consent.lock().await;
+        if !consent.state().capture_allowed() {
+            return;
+        }
+        if let Err(e) = consent.restore_capture(pipeline::epoch_ms()) {
+            // Don't start watching if we could not record that we started.
+            tracing::error!(%e, "could not audit the capture restore — leaving capture OFF");
+            return;
+        }
+        drop(consent); // never hold the consent lock across the toggle lock
+        tracing::info!("restoring capture from stored consent (doc 13 §8)");
+        orchestration.lock().await.toggle().turn_on().await;
+    });
+}
+
+/// Compile the user's confirmed exclusion rules out of the encrypted
+/// `exclusion_list` table into the capture gate's matcher (doc 13 §4, M9).
+///
+/// Each row is one `(match_kind, pattern)` pair; disabled rows are skipped.
+///
+/// **A read failure is FATAL, deliberately.** Falling back to the empty default
+/// would silently run the whole session with zero exclusions — the user's
+/// excluded apps would start being captured, with a single `tracing::error!`
+/// line as the only signal, and no recovery until restart (the list is read
+/// once). "Capture is OFF at startup" is no defence: the user can enable it at
+/// any point in that same session. Refusing to start is the only outcome that
+/// cannot silently weaken a protection the user configured.
+fn load_exclusions(db: &aperture_db::Db) -> aperture_capture::exclusion::ExclusionList {
+    use aperture_capture::exclusion::{ExclusionList, ExclusionRule};
+    let rows = db.read_exclusion_list().unwrap_or_else(|e| {
+        panic!(
+            "could not read the exclusion list ({e}) — refusing to start rather than run \
+             with the user's protections silently dropped (doc 13 §4)"
+        )
+    });
+    let rules: Vec<ExclusionRule> = rows
+        .into_iter()
+        .filter(|(_, _, _, enabled)| *enabled)
+        .filter_map(|(_, kind, pattern, _)| {
+            let mut rule = ExclusionRule { label: pattern.clone(), ..Default::default() };
+            match kind.as_str() {
+                "process" => rule.process = Some(pattern),
+                "window_class" => rule.window_class = Some(pattern),
+                "title_regex" => rule.title_regex = Some(pattern),
+                "url_pattern" => rule.url_pattern = Some(pattern),
+                other => {
+                    tracing::warn!(kind = other, "unknown exclusion match_kind ignored");
+                    return None;
+                }
+            }
+            Some(rule)
+        })
+        .collect();
+    tracing::info!(count = rules.len(), "exclusion rules loaded (doc 13 §4)");
+    ExclusionList::compile(rules)
 }
 
 /// Local-only structured logging (doc 13). Never logs payload contents or wire
@@ -269,6 +365,17 @@ fn run_tauri(
             commands::voice_ptt_up,
             commands::get_settings,
             commands::set_settings,
+            // M9 — privacy surface (doc 13).
+            commands::set_overlay_interactive,
+            commands::get_consent,
+            commands::complete_first_run,
+            commands::grant_voice_consent,
+            commands::list_audit,
+            commands::purge_all,
+            commands::list_exclusions,
+            commands::add_exclusion,
+            commands::set_exclusion,
+            commands::suggest_exclusions,
         ])
         .setup(move |app| {
             use tauri::Manager;
@@ -284,7 +391,9 @@ fn run_tauri(
                     }
                 }
             }
-            // Capture starts OFF (doc 13 §8) — the indicator must say so.
+            // Capture starts OFF (doc 13 §8) — the indicator must say so. If the
+            // user previously consented AND left capture on, it is restored below,
+            // AFTER the capture driver subscribes (see `restore_capture`).
             let _ = events::emit_capture_indicator(
                 app.handle(),
                 events::CaptureIndicator::Off,
@@ -310,6 +419,11 @@ fn run_tauri(
                 Arc::clone(&current_session),
                 app.handle().clone(),
             );
+            // Restore the user's persisted capture decision (doc 13 §8, M9).
+            // MUST run after `spawn_capture_driver`: `turn_on` broadcasts, and a
+            // broadcast sent before the driver subscribes is simply lost — capture
+            // would then report ON while nothing was actually running.
+            restore_capture(&setup_state);
             // Connector capture (Path A step 4, doc 02 §4) — bus consumer, no
             // AppHandle needed, but spawned here with its siblings.
             pipeline::spawn_connector_task(

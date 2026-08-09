@@ -58,35 +58,126 @@ pub struct CloudSendRecord {
     pub ts: i64,
 }
 
-/// Writes audit rows into the encrypted DB. Holds (or borrows) a `db::Db` handle.
+impl ToggleReason {
+    /// The stable wire string persisted in the audit payload.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ToggleReason::UserAction => "user_action",
+            ToggleReason::SystemSuspend => "system_suspend",
+            ToggleReason::Consent => "consent",
+        }
+    }
+}
+
+/// The egress-recording seam the reasoning gateway holds (doc 09 §5, doc 13 §3).
+///
+/// A trait, not the concrete [`AuditLog`], for one reason: the gateway must be
+/// unit-testable without standing up a database, and the gateway is the crate we
+/// least want to complicate. INVARIANT (2) is unaffected — an audit sink only
+/// *records* egress, it never performs it.
+pub trait AuditSink: Send + Sync {
+    /// Persist a `cloud_send` row. Called by the gateway AFTER a successful send.
+    fn record_cloud_send(&self, rec: CloudSendRecord) -> Result<(), PrivacyError>;
+}
+
+/// The no-op sink: logs the record but persists nothing. Used by gateway tests
+/// and by any composition that has no DB handle. Deliberately still *logs*, so a
+/// misconfigured composition leaves a trace rather than silently losing the audit.
+pub struct NullAuditSink;
+
+impl AuditSink for NullAuditSink {
+    fn record_cloud_send(&self, rec: CloudSendRecord) -> Result<(), PrivacyError> {
+        tracing::warn!(
+            payload_id = %rec.payload_id,
+            sha256 = %rec.wire_sha256,
+            bytes = rec.byte_count,
+            "cloud_send NOT persisted — no audit sink configured (doc 13 §3)"
+        );
+        Ok(())
+    }
+}
+
+/// Writes audit rows into the encrypted DB (doc 13 §3, §7).
+///
+/// Audit rows are ordinary [`Event`]s, so they inherit the encrypted-at-rest
+/// storage and the retention pruner's audit-survival window for free — there is
+/// no second, weaker store to keep in sync.
 pub struct AuditLog {
-    // TODO(M9): hold an `aperture_db::Db` handle (or a writer channel into the
-    // single-writer Tier-0 pipeline, doc 03).
+    db: std::sync::Arc<aperture_db::Db>,
 }
 
 impl AuditLog {
+    /// Build an audit log over the history DB handle.
+    pub fn new(db: std::sync::Arc<aperture_db::Db>) -> Self {
+        Self { db }
+    }
+
     /// Record a capture on/off transition (doc 13 §3). Honors INVARIANT (3): the
     /// OFF transition that releases sidecars / drops VRAM is driven elsewhere;
     /// this just stamps the audit trail.
-    pub fn record_capture_toggle(&self, _rec: CaptureToggleRecord) -> Result<(), PrivacyError> {
-        // TODO(M9): build an Event { type: CaptureToggle, payload: rec } and
-        // persist via the single writer; return Audit on failure.
-        todo!("M9: write capture_toggle audit row (doc 13 §3)")
+    pub fn record_capture_toggle(&self, rec: CaptureToggleRecord) -> Result<(), PrivacyError> {
+        let ev = Event {
+            id: 0,
+            ts: rec.ts,
+            r#type: EventType::CaptureToggle,
+            app: None,
+            process: None,
+            window_title: None,
+            // Schema shared with `aperture_capture::toggle::emit_toggle_event`,
+            // which writes the *mechanism* row (capture actually started/stopped)
+            // while this is the *decision* row. Same keys so the Activity &
+            // Privacy view renders both; `source` distinguishes them. A decision
+            // row with no matching mechanism row means capture was requested and
+            // never actually ran — which the trail should show, not hide.
+            payload: serde_json::json!({
+                "enabled": rec.enabled,
+                "reason": rec.reason.as_str(),
+                "source": "consent",
+            }),
+            connector_id: None,
+            session_id: None,
+            redaction_flags: 0,
+        };
+        self.db
+            .insert_event(&ev)
+            .map(|_| ())
+            .map_err(|e| PrivacyError::Audit(e.to_string()))
     }
 
+    /// Read recent audit rows (both kinds) for the Activity & Privacy view,
+    /// newest first. `limit` caps the returned rows.
+    pub fn recent(&self, limit: u32) -> Result<Vec<Event>, PrivacyError> {
+        self.db
+            .recent_audit_events(limit)
+            .map_err(|e| PrivacyError::Audit(e.to_string()))
+    }
+}
+
+impl AuditSink for AuditLog {
     /// Record that bytes left the machine (doc 13 §3). Called by the gateway
     /// only, after Send, with the hash already computed over the wire bytes.
-    pub fn record_cloud_send(&self, _rec: CloudSendRecord) -> Result<(), PrivacyError> {
-        // TODO(M9): build an Event { type: CloudSend, payload: rec } and persist.
-        todo!("M9: write cloud_send audit row (doc 13 §3)")
-    }
-
-    /// Read recent audit rows (both kinds) for the privacy/history UI, newest
-    /// first. `limit` caps the returned rows.
-    pub fn recent(&self, _limit: u32) -> Result<Vec<Event>, PrivacyError> {
-        // TODO(M9): SELECT events WHERE type IN ('capture_toggle','cloud_send')
-        // ORDER BY ts DESC LIMIT ?.
-        todo!("M9: read recent audit rows (doc 13 §3)")
+    fn record_cloud_send(&self, rec: CloudSendRecord) -> Result<(), PrivacyError> {
+        let ev = Event {
+            id: 0,
+            ts: rec.ts,
+            r#type: EventType::CloudSend,
+            app: None,
+            process: None,
+            window_title: None,
+            payload: serde_json::json!({
+                "payload_id": rec.payload_id.to_string(),
+                "wire_sha256": rec.wire_sha256,
+                "transport": rec.transport,
+                "byte_count": rec.byte_count,
+            }),
+            connector_id: None,
+            session_id: None,
+            redaction_flags: 0,
+        };
+        self.db
+            .insert_event(&ev)
+            .map(|_| ())
+            .map_err(|e| PrivacyError::Audit(e.to_string()))
     }
 }
 
@@ -110,6 +201,110 @@ pub fn sha256_hex(wire_bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    fn log() -> AuditLog {
+        AuditLog::new(Arc::new(aperture_db::Db::open_in_memory().expect("db")))
+    }
+
+    #[test]
+    fn capture_toggle_rows_persist_and_read_back_newest_first() {
+        let log = log();
+        log.record_capture_toggle(CaptureToggleRecord {
+            enabled: true,
+            reason: ToggleReason::Consent,
+            ts: 1_000,
+        })
+        .expect("on");
+        log.record_capture_toggle(CaptureToggleRecord {
+            enabled: false,
+            reason: ToggleReason::UserAction,
+            ts: 2_000,
+        })
+        .expect("off");
+
+        let rows = log.recent(10).expect("recent");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].ts, 2_000, "newest first");
+        assert_eq!(rows[0].payload["enabled"], serde_json::json!(false));
+        assert_eq!(rows[0].payload["reason"], serde_json::json!("user_action"));
+        assert_eq!(rows[1].payload["reason"], serde_json::json!("consent"));
+    }
+
+    #[test]
+    fn cloud_send_row_records_the_hash_transport_and_byte_count() {
+        let log = log();
+        let id = uuid::Uuid::new_v4();
+        log.record_cloud_send(CloudSendRecord {
+            payload_id: id,
+            wire_sha256: sha256_hex(b"abc"),
+            transport: TransportTarget::ClaudeCli,
+            byte_count: 3,
+            ts: 5_000,
+        })
+        .expect("send row");
+
+        let rows = log.recent(10).expect("recent");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].r#type, EventType::CloudSend);
+        assert_eq!(rows[0].payload["payload_id"], serde_json::json!(id.to_string()));
+        assert_eq!(rows[0].payload["byte_count"], serde_json::json!(3));
+        // kebab-case, matching TransportTarget's serde repr.
+        assert_eq!(rows[0].payload["transport"], serde_json::json!("claude-cli"));
+        assert_eq!(
+            rows[0].payload["wire_sha256"],
+            serde_json::json!("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+    }
+
+    #[test]
+    fn recent_returns_only_audit_rows_and_honors_the_limit() {
+        let log = log();
+        // A non-audit event must never surface in the privacy view.
+        log.db
+            .insert_event(&Event {
+                id: 0,
+                ts: 9_000,
+                r#type: EventType::WindowFocus,
+                app: None,
+                process: None,
+                window_title: None,
+                payload: serde_json::json!({}),
+                connector_id: None,
+                session_id: None,
+                redaction_flags: 0,
+            })
+            .unwrap();
+        for ts in 0..5 {
+            log.record_capture_toggle(CaptureToggleRecord {
+                enabled: true,
+                reason: ToggleReason::UserAction,
+                ts,
+            })
+            .unwrap();
+        }
+
+        let rows = log.recent(3).expect("recent");
+        assert_eq!(rows.len(), 3, "limit honored");
+        assert!(
+            rows.iter().all(|r| matches!(r.r#type, EventType::CaptureToggle | EventType::CloudSend)),
+            "only audit rows appear in the Activity & Privacy view"
+        );
+    }
+
+    #[test]
+    fn the_null_sink_never_errors_but_persists_nothing() {
+        // Its only job is to keep a DB-less composition from breaking Send.
+        NullAuditSink
+            .record_cloud_send(CloudSendRecord {
+                payload_id: uuid::Uuid::new_v4(),
+                wire_sha256: sha256_hex(b""),
+                transport: TransportTarget::MessagesApi,
+                byte_count: 0,
+                ts: 1,
+            })
+            .expect("null sink is infallible");
+    }
 
     #[test]
     fn sha256_hex_matches_the_known_empty_and_abc_vectors() {

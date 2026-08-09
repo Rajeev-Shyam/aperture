@@ -82,6 +82,16 @@ pub struct KnnHit {
     pub distance: f64,
 }
 
+/// Whether this build can actually encrypt at rest (doc 13 §6).
+///
+/// `true` only when the `sqlcipher` feature is on, which swaps rusqlite's plain
+/// `bundled` SQLite for `bundled-sqlcipher-vendored-openssl`. That build needs a
+/// **native Windows Perl + NASM** on PATH to compile vendored OpenSSL — see the
+/// crate README note. With the feature off the DB is plaintext on disk and
+/// [`Db::is_encrypted`] reports `false`, so the M9 gate fails loudly instead of a
+/// silent downgrade (never claim encryption we did not apply).
+pub const ENCRYPTION_AVAILABLE: bool = cfg!(feature = "sqlcipher");
+
 /// A handle to the history DB. Wraps a `rusqlite::Connection` plus the loaded
 /// sqlite-vec extension. Cheap to share as `Arc<Db>`.
 pub struct Db {
@@ -89,18 +99,24 @@ pub struct Db {
     /// Whether the sqlite-vec extension registered — `ctx_vec` ops require it.
     /// (`false` only in stripped-down builds; the M2 gate asserts `true`.)
     vec_loaded: bool,
+    /// Whether page encryption is actually in force on this handle (doc 13 §6):
+    /// the `sqlcipher` feature is on AND a non-empty key was applied.
+    encrypted: bool,
 }
 
 impl Db {
     /// Open (creating if needed) the history DB, load sqlite-vec, set WAL, and
-    /// run pending migrations. `_wrapped_key` comes from `aperture-privacy`
-    /// (doc 13 §6).
+    /// run pending migrations. `key` is the **unwrapped** page key from
+    /// `aperture_privacy::key_manager` (doc 13 §6) — DPAPI unwrapping happens
+    /// there; this layer only applies it.
     ///
-    /// M0 status: **encryption is NOT yet applied** — SQLCipher wiring is the M9
-    /// milestone (doc 16); the key parameter is accepted now so the call
-    /// signature (and every caller) is already M9-shaped. The file lives under
-    /// the user profile with default ACLs until then.
-    pub fn open_encrypted(path: PathBuf, _wrapped_key: &[u8]) -> Result<Self, DbError> {
+    /// M9: when the `sqlcipher` feature is on, `PRAGMA key` is applied as the
+    /// FIRST statement on the connection (before WAL/foreign_keys/migrations —
+    /// SQLCipher requires the key before any other access), then the key is
+    /// **verified** by forcing a read of the schema. A wrong/missing key on an
+    /// existing encrypted file surfaces [`DbError::Decryption`]: the DB is
+    /// unreadable by design (doc 13 §6, "key loss ⇒ unreadable").
+    pub fn open_encrypted(path: PathBuf, key: &[u8]) -> Result<Self, DbError> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| DbError::Io(e.to_string()))?;
         }
@@ -108,11 +124,18 @@ impl Db {
         // migration's `CREATE VIRTUAL TABLE ... USING vec0` works (doc 03 §3).
         let vec_loaded = register_sqlite_vec();
         let conn = Connection::open(&path)?;
-        // TODO(M9): PRAGMA key = <unwrapped> (SQLCipher) BEFORE any other statement.
+        // MUST precede every other statement on this connection (doc 13 §6).
+        let encrypted = apply_key(&conn, key)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Overwrite freed pages instead of leaving their content in the file
+        // (doc 13 §7). Without this, deleted OCR text lingers in free pages
+        // between a delete and the next VACUUM — including the nightly pruner's
+        // deletes, which never VACUUM at all. Costs some write amplification;
+        // for a privacy product that is the right trade.
+        conn.pragma_update(None, "secure_delete", "ON")?;
         migrations::run(&conn, vec_loaded)?;
-        Ok(Self { conn: Mutex::new(conn), vec_loaded })
+        Ok(Self { conn: Mutex::new(conn), vec_loaded, encrypted })
     }
 
     /// Open an in-memory DB (tests / gates). Same migrations, no file, no key.
@@ -121,12 +144,19 @@ impl Db {
         let conn = Connection::open_in_memory()?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         migrations::run(&conn, vec_loaded)?;
-        Ok(Self { conn: Mutex::new(conn), vec_loaded })
+        Ok(Self { conn: Mutex::new(conn), vec_loaded, encrypted: false })
     }
 
     /// Whether `ctx_vec` (sqlite-vec) is available on this handle.
     pub fn vec_available(&self) -> bool {
         self.vec_loaded
+    }
+
+    /// Whether page encryption is actually in force (doc 13 §6). The M9 gate
+    /// asserts this; the shell logs a prominent warning when it is `false` so a
+    /// plaintext DB is never mistaken for an encrypted one.
+    pub fn is_encrypted(&self) -> bool {
+        self.encrypted
     }
 
     /// Run one closure against the raw connection (short lock; doc 03 §1 —
@@ -429,14 +459,238 @@ impl Db {
         })
     }
 
-    /// One-click Purge All: truncate every table + VACUUM (doc 03 §6, doc 13 §7).
-    /// Audit rows (`capture_toggle`, `cloud_send`) survive 30 d, then expire.
-    pub fn purge_all(&self) -> Result<(), DbError> {
-        // TODO(M9): truncate + VACUUM, preserving audit rows for 30 d
-        // (retention::RetentionPolicy::audit_days). Deliberately NOT implemented
-        // before the M9 privacy milestone wires the confirmation UX.
-        todo!("M9: truncate + VACUUM, preserving audit rows for 30 d")
+    /// One-click Purge All: wipe the history + VACUUM (doc 03 §6, doc 13 §7).
+    ///
+    /// Audit rows (`capture_toggle`, `cloud_send`) **survive** if they are within
+    /// `policy.audit_days` of `now_ms`; older audit rows go with everything else,
+    /// so the 30-day accountability window is honored exactly (doc 13 §7).
+    ///
+    /// **Amendment to doc 03 §6's "truncates every table" (M9).** Three tables
+    /// are deliberately preserved:
+    /// - `exclusion_list` — purging it would *silently reduce* the user's privacy
+    ///   protection: apps they had excluded would start being captured again on
+    ///   the next frame. A privacy control must never weaken itself.
+    /// - `settings` — holds consent (doc 13 §8). Wiping it would re-trigger the
+    ///   first-run flow and reset capture consent as a side effect of a *data*
+    ///   purge, which the user did not ask for.
+    /// - `schema_migrations` — dropping it would re-run migrations over live tables.
+    ///
+    /// Everything else (events + their `screen_context`/`ctx_vec`, patterns,
+    /// suggestions, connector state) is deleted. VACUUM **followed by a
+    /// `wal_checkpoint(TRUNCATE)`** then makes the purge real on disk rather than
+    /// only logical — see the comment at the call site for why the checkpoint is
+    /// load-bearing in WAL mode.
+    ///
+    /// Returns the number of rows deleted from `events` (what the confirmation
+    /// UX reports back).
+    pub fn purge_all(&self, now_ms: i64, policy: &retention::RetentionPolicy) -> Result<usize, DbError> {
+        let audit_floor = now_ms - policy.audit_days as i64 * 86_400_000;
+
+        let deleted = self.with_conn(|conn| {
+            conn.execute_batch("BEGIN")?;
+            // Same discipline as retention::run_nightly_prune: never leave BEGIN
+            // open on the shared connection, or every later write silently joins
+            // a dead transaction.
+            let purged = (|| -> Result<usize, rusqlite::Error> {
+                // ctx_vec is a vec0 virtual table — no FK cascade reaches it, so
+                // it is cleared explicitly and FIRST (tolerate its absence when
+                // sqlite-vec did not load).
+                let _ = conn.execute(
+                    "DELETE FROM ctx_vec WHERE event_id IN \
+                     (SELECT id FROM events WHERE type NOT IN ('capture_toggle','cloud_send') OR ts < ?1)",
+                    [audit_floor],
+                );
+                // Events: everything except audit rows inside the survival window.
+                // `screen_context` cascades (real table, FK ON DELETE CASCADE).
+                let events_deleted = conn.execute(
+                    "DELETE FROM events \
+                     WHERE type NOT IN ('capture_toggle','cloud_send') OR ts < ?1",
+                    [audit_floor],
+                )?;
+                conn.execute_batch(
+                    "DELETE FROM suggestions; \
+                     DELETE FROM patterns; \
+                     DELETE FROM connector_state;",
+                )?;
+                Ok(events_deleted)
+            })();
+
+            match purged {
+                Ok(n) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(n)
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })?;
+
+        // VACUUM cannot run inside a transaction, so it follows the COMMIT.
+        //
+        // ...and VACUUM ALONE IS NOT ENOUGH IN WAL MODE. We hold this connection
+        // open for the whole process lifetime, so VACUUM writes the rebuilt
+        // database into `history.db-wal` while `history.db` keeps its pre-purge
+        // pages until something checkpoints. Without the truncate below, every
+        // "purged" row stayed verbatim-recoverable from the two files on disk —
+        // the exact hand-over-the-laptop case Purge All exists for, and plaintext
+        // in the default (non-`sqlcipher`) build. `TRUNCATE` checkpoints the WAL
+        // into the main DB and then zeroes the `-wal` file.
+        self.with_conn(|conn| {
+            conn.execute_batch("VACUUM")?;
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        })?;
+        tracing::info!(events_deleted = deleted, "purge all complete (doc 13 §7)");
+        Ok(deleted)
     }
+
+    /// Recent audit rows — `capture_toggle` + `cloud_send`, newest first
+    /// (doc 13 §3). Backs the Activity & Privacy view's two questions: "when was
+    /// it watching?" and "what ever left this machine?".
+    pub fn recent_audit_events(&self, limit: u32) -> Result<Vec<Event>, DbError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, ts, type, app, process, window_title, payload, connector_id, \
+                        session_id, redaction_flags \
+                 FROM events WHERE type IN ('capture_toggle','cloud_send') \
+                 ORDER BY ts DESC, id DESC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map([limit], row_to_event)?;
+            rows.collect()
+        })
+    }
+
+    // ---------------------------------------------------------------------
+    // Exclusion list (doc 13 §4) — the persisted half of `capture::exclusion`.
+    // ---------------------------------------------------------------------
+
+    /// Read every exclusion row as `(id, match_kind, pattern, enabled)`
+    /// (doc 13 §4). The shell compiles the enabled ones into a
+    /// `capture::exclusion::ExclusionList`; this crate sits below capture, so it
+    /// deliberately returns raw tuples rather than depending upward.
+    pub fn read_exclusion_list(&self) -> Result<Vec<(i64, String, String, bool)>, DbError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, match_kind, pattern, enabled FROM exclusion_list ORDER BY id",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)? != 0,
+                ))
+            })?;
+            rows.collect()
+        })
+    }
+
+    /// Add one exclusion rule — the "exclude this app/domain" affordance
+    /// (doc 13 §9). Idempotent on `(match_kind, pattern)` so clicking twice does
+    /// not accumulate duplicates. Returns the row id.
+    pub fn add_exclusion_rule(&self, match_kind: &str, pattern: &str) -> Result<i64, DbError> {
+        self.with_conn(|conn| {
+            if let Ok(id) = conn.query_row(
+                "SELECT id FROM exclusion_list WHERE match_kind = ?1 AND pattern = ?2",
+                rusqlite::params![match_kind, pattern],
+                |r| r.get::<_, i64>(0),
+            ) {
+                conn.execute("UPDATE exclusion_list SET enabled = 1 WHERE id = ?1", [id])?;
+                return Ok(id);
+            }
+            conn.execute(
+                "INSERT INTO exclusion_list (match_kind, pattern, enabled) VALUES (?1, ?2, 1)",
+                rusqlite::params![match_kind, pattern],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+    }
+
+    /// Enable/disable or delete one exclusion rule from the Activity & Privacy
+    /// view (doc 13 §7). `enabled = None` deletes the row.
+    pub fn set_exclusion_enabled(&self, id: i64, enabled: Option<bool>) -> Result<(), DbError> {
+        self.with_conn(|conn| {
+            match enabled {
+                None => conn.execute("DELETE FROM exclusion_list WHERE id = ?1", [id])?,
+                Some(on) => conn.execute(
+                    "UPDATE exclusion_list SET enabled = ?2 WHERE id = ?1",
+                    rusqlite::params![id, i64::from(on)],
+                )?,
+            };
+            Ok(())
+        })
+    }
+
+    // ---------------------------------------------------------------------
+    // Settings (doc 13 §6) — the encrypted key/value store consent lives in.
+    // ---------------------------------------------------------------------
+
+    /// Read one `settings` value as raw JSON text; `None` when absent.
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>, DbError> {
+        self.with_conn(|conn| {
+            conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0))
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    other => Err(other),
+                })
+        })
+    }
+
+    /// Upsert one `settings` value (raw JSON text).
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<(), DbError> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![key, value],
+            )?;
+            Ok(())
+        })
+    }
+}
+
+/// Apply the SQLCipher page key, if this build has encryption compiled in.
+/// Returns whether encryption is actually in force. MUST be called before any
+/// other statement on the connection (doc 13 §6).
+#[cfg(feature = "sqlcipher")]
+fn apply_key(conn: &Connection, key: &[u8]) -> Result<bool, DbError> {
+    if key.is_empty() {
+        // An empty key with encryption compiled in is a composition bug, not a
+        // downgrade path — refuse rather than silently writing plaintext.
+        return Err(DbError::Io(
+            "sqlcipher build requires a non-empty page key (doc 13 §6)".into(),
+        ));
+    }
+    // Raw-key form `PRAGMA key = "x'<hex>'"` uses the bytes verbatim (no KDF
+    // over a passphrase) — the key already came from a CSPRNG. `hex` is our own
+    // generated alphabet, so the format! is not an injection surface.
+    let mut hex = String::with_capacity(key.len() * 2);
+    for byte in key {
+        use std::fmt::Write;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    conn.execute_batch(&format!("PRAGMA key = \"x'{hex}'\";"))
+        .map_err(|_| DbError::Decryption)?;
+    // Force a real read: with a wrong key SQLCipher fails here, not at PRAGMA.
+    conn.query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))
+        .map_err(|_| DbError::Decryption)?;
+    Ok(true)
+}
+
+/// No-encryption build: the key is accepted (so every caller is already
+/// M9-shaped) but NOT applied. Loud about it — a plaintext DB must never be
+/// mistaken for an encrypted one (doc 13 §6).
+#[cfg(not(feature = "sqlcipher"))]
+fn apply_key(_conn: &Connection, key: &[u8]) -> Result<bool, DbError> {
+    if !key.is_empty() {
+        tracing::warn!(
+            "at-rest encryption is NOT compiled in (cargo feature `sqlcipher` off): \
+             the history DB is PLAINTEXT on disk. Doc 13 §6 requires the encrypted \
+             build for the M9 gate."
+        );
+    }
+    Ok(false)
 }
 
 /// INSERT one event (shared by the plain and transactional paths).
@@ -658,5 +912,99 @@ mod tests {
             hits.iter().all(|h| h.ts >= 5_000_000),
             "no out-of-window (old) event may be returned"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // M9 — Purge All (doc 13 §7)
+    // -----------------------------------------------------------------------
+
+    const DAY_MS: i64 = 86_400_000;
+
+    fn ev_at(ts: i64, ty: EventType) -> Event {
+        Event { ts, ..sample_event(ty) }
+    }
+
+    #[test]
+    fn purge_all_wipes_history_but_keeps_audit_rows_inside_the_window() {
+        let db = Db::open_in_memory().expect("open");
+        let now = 1_700_000_000_000 + 100 * DAY_MS;
+        let policy = retention::RetentionPolicy::default(); // audit_days = 30
+
+        let history = db.insert_event(&ev_at(now - DAY_MS, EventType::WindowFocus)).unwrap();
+        let fresh_audit = db.insert_event(&ev_at(now - DAY_MS, EventType::CloudSend)).unwrap();
+        let stale_audit = db.insert_event(&ev_at(now - 60 * DAY_MS, EventType::CaptureToggle)).unwrap();
+
+        let deleted = db.purge_all(now, &policy).expect("purge");
+
+        assert!(db.read_event(history).is_err(), "history is purged");
+        assert!(db.read_event(fresh_audit).is_ok(), "audit inside 30 d survives (doc 13 §7)");
+        assert!(db.read_event(stale_audit).is_err(), "audit past 30 d expires with the rest");
+        assert_eq!(deleted, 2, "one history row + one expired audit row");
+    }
+
+    #[test]
+    fn purge_all_preserves_settings_and_exclusions_m9_amendment() {
+        // A privacy control must never weaken itself: purging the exclusion list
+        // would silently resume capturing apps the user had excluded.
+        let db = Db::open_in_memory().expect("open");
+        db.set_setting("consent", r#"{"capture_enabled":true}"#).unwrap();
+        let rule = db.add_exclusion_rule("process", "1password.exe").unwrap();
+
+        db.purge_all(1_700_000_000_000, &retention::RetentionPolicy::default()).unwrap();
+
+        assert_eq!(
+            db.get_setting("consent").unwrap().as_deref(),
+            Some(r#"{"capture_enabled":true}"#),
+            "consent survives a data purge"
+        );
+        let rules = db.read_exclusion_list().unwrap();
+        assert!(rules.iter().any(|(id, ..)| *id == rule), "exclusions survive a data purge");
+    }
+
+    #[test]
+    fn purge_all_leaves_the_connection_usable() {
+        let db = Db::open_in_memory().expect("open");
+        let now = 1_700_000_000_000;
+        db.insert_event(&ev_at(now, EventType::WindowFocus)).unwrap();
+        db.purge_all(now, &retention::RetentionPolicy::default()).unwrap();
+        // VACUUM outside the transaction must not leave BEGIN dangling.
+        let id = db.insert_event(&ev_at(now, EventType::WindowFocus)).expect("writable after purge");
+        assert!(db.read_event(id).is_ok());
+    }
+
+    #[test]
+    fn exclusion_rules_upsert_idempotently_and_toggle() {
+        let db = Db::open_in_memory().expect("open");
+        let a = db.add_exclusion_rule("process", "1password.exe").unwrap();
+        let b = db.add_exclusion_rule("process", "1password.exe").unwrap();
+        assert_eq!(a, b, "clicking `exclude this app` twice must not duplicate the rule");
+        assert_eq!(db.read_exclusion_list().unwrap().len(), 1);
+
+        db.set_exclusion_enabled(a, Some(false)).unwrap();
+        assert!(!db.read_exclusion_list().unwrap()[0].3, "rule disabled");
+
+        // Re-adding a disabled rule re-enables it rather than inserting a twin.
+        db.add_exclusion_rule("process", "1password.exe").unwrap();
+        assert!(db.read_exclusion_list().unwrap()[0].3, "re-add re-enables");
+
+        db.set_exclusion_enabled(a, None).unwrap();
+        assert!(db.read_exclusion_list().unwrap().is_empty(), "None deletes");
+    }
+
+    #[test]
+    fn settings_roundtrip_and_miss_is_none() {
+        let db = Db::open_in_memory().expect("open");
+        assert_eq!(db.get_setting("absent").unwrap(), None);
+        db.set_setting("k", "\"v\"").unwrap();
+        assert_eq!(db.get_setting("k").unwrap().as_deref(), Some("\"v\""));
+        db.set_setting("k", "\"v2\"").unwrap();
+        assert_eq!(db.get_setting("k").unwrap().as_deref(), Some("\"v2\""), "upsert overwrites");
+    }
+
+    #[test]
+    fn in_memory_db_reports_itself_unencrypted() {
+        // The gate relies on this being truthful, never optimistic.
+        let db = Db::open_in_memory().expect("open");
+        assert!(!db.is_encrypted());
     }
 }
