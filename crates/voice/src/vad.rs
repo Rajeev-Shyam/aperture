@@ -25,9 +25,27 @@ pub const MIN_SPEECH_MS: u32 = 300;
 /// standard VAD frame that Silero also uses, so the seam swaps cleanly.
 pub const FRAME_MS: u32 = 30;
 
-/// RMS (in `[0,1]`) at/above which a frame counts as speech. ≈ −38 dBFS.
-/// [ASSUMPTION — tune on real mic input at the hardware gate, doc 07 §2].
-pub const SPEECH_RMS_THRESHOLD: f32 = 0.012;
+/// Absolute RMS floor (in `[0,1]`) below which a frame can never count as
+/// speech, whatever the noise floor. ≈ −68 dBFS.
+///
+/// The original fixed threshold (0.012 ≈ −38 dBFS) was falsified on the real
+/// laptop mic 2026-08-14: normal speech peaked at ~1.5 % full-scale, so EVERY
+/// utterance was "all silence" and PTT died silently — and a first floor of
+/// 0.0016 (−56 dBFS) STILL ate a peak-0.9 %-FS capture on the same mic. The
+/// gate is noise-floor-adaptive (see [`speech_threshold`]); this constant only
+/// keeps digital silence / faint dither from promoting to speech. Erring low is
+/// safe now: a false positive costs one local STT pass that transcribes to
+/// nothing, and the discarded-tap path SAYS so instead of vanishing.
+pub const SPEECH_RMS_FLOOR: f32 = 0.0004;
+
+/// A frame counts as speech when its RMS exceeds the utterance's estimated
+/// noise floor by this factor (and clears [`SPEECH_RMS_FLOOR`]).
+pub const SPEECH_OVER_FLOOR_FACTOR: f32 = 3.0;
+
+/// Ceiling on the adaptive threshold (the original fixed value, ≈ −38 dBFS):
+/// a wall-to-wall loud utterance must not raise its own bar so high that its
+/// speech reads as noise. Levels at/above this were empirically speech.
+pub const SPEECH_RMS_CEILING: f32 = 0.012;
 
 /// Result of trimming: the speech-only buffer plus how much speech it contains.
 #[derive(Debug)]
@@ -57,11 +75,10 @@ pub enum VadError {
     Inference(String),
 }
 
-/// The per-frame speech decision — the seam a Silero ONNX backend replaces. The
-/// energy gate: a frame is speech when its RMS clears [`SPEECH_RMS_THRESHOLD`].
-fn frame_is_speech(frame: &[i16]) -> bool {
+/// RMS of one frame in `[0, 1]`.
+fn frame_rms(frame: &[i16]) -> f32 {
     if frame.is_empty() {
-        return false;
+        return 0.0;
     }
     let sum_sq: f64 = frame
         .iter()
@@ -70,8 +87,20 @@ fn frame_is_speech(frame: &[i16]) -> bool {
             f * f
         })
         .sum();
-    let rms = (sum_sq / frame.len() as f64).sqrt();
-    rms as f32 >= SPEECH_RMS_THRESHOLD
+    ((sum_sq / frame.len() as f64).sqrt()) as f32
+}
+
+/// The utterance's adaptive speech threshold — the seam a Silero ONNX backend
+/// replaces. Estimate the noise floor as the 20th-percentile frame RMS (a held
+/// utterance always contains inter-word gaps, so the quietest fifth is a fair
+/// floor sample), then require speech to stand [`SPEECH_OVER_FLOOR_FACTOR`]×
+/// above it, never below [`SPEECH_RMS_FLOOR`]. Absolute levels vary wildly
+/// across mics (the dev laptop peaks at ~1.5 % FS); relative prominence doesn't.
+fn speech_threshold(rms: &[f32]) -> f32 {
+    let mut sorted = rms.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let floor = sorted[sorted.len() / 5];
+    (floor * SPEECH_OVER_FLOOR_FACTOR).clamp(SPEECH_RMS_FLOOR, SPEECH_RMS_CEILING)
 }
 
 /// Trim leading/trailing silence (doc 07 §2): find the first and last speech
@@ -84,8 +113,10 @@ pub fn trim(pcm: &PcmBuffer) -> Result<Trimmed, VadError> {
         return Ok(Trimmed { speech: PcmBuffer::default(), speech_ms: 0 });
     }
     let frames: Vec<&[i16]> = pcm.samples.chunks(frame_len).collect();
-    let first = frames.iter().position(|f| frame_is_speech(f));
-    let last = frames.iter().rposition(|f| frame_is_speech(f));
+    let rms: Vec<f32> = frames.iter().map(|f| frame_rms(f)).collect();
+    let threshold = speech_threshold(&rms);
+    let first = rms.iter().position(|r| *r >= threshold);
+    let last = rms.iter().rposition(|r| *r >= threshold);
     match (first, last) {
         (Some(a), Some(b)) => {
             let start = a * frame_len;
