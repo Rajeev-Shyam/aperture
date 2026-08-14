@@ -93,18 +93,53 @@ pub async fn toggle_capture(
 /// consent flow and the Activity & Privacy panel call this `true` on mount and
 /// `false` on unmount; without it their buttons are unclickable.
 ///
+/// Routed through [`crate::hit_test::HitTestState`] so the modal override and
+/// the bubble hover poller compose instead of overwriting each other's
+/// `WS_EX_TRANSPARENT` writes (a modal closing must not kill a live bubble's
+/// clickability, and vice versa).
+///
 /// Failure is non-fatal but IS surfaced: a modal the user cannot dismiss is a
 /// worse outcome than a logged error, so the caller learns about it.
 #[tauri::command]
 pub async fn set_overlay_interactive(
     interactive: bool,
+    window: tauri::WebviewWindow,
     app: tauri::AppHandle,
+    hit_test: State<'_, crate::hit_test::HitTestState>,
 ) -> Result<(), String> {
-    use tauri::Manager;
-    let window = app
-        .get_webview_window(crate::overlay::OVERLAY_LABEL)
-        .ok_or_else(|| "overlay window not found".to_string())?;
-    crate::overlay::set_interactive(&window, interactive).map_err(|e| e.to_string())
+    hit_test.set_modal(&app, window.label(), interactive);
+    Ok(())
+}
+
+/// Publish the overlay's interactive rects (doc 11 §2, M3-UI wiring closed).
+///
+/// The UI measures every `.surface-interactive` element (physical px, relative
+/// to its own window) and calls this on change; the cursor poller
+/// (`hit_test::spawn_poller`) then flips click-through only while the cursor is
+/// inside one of these rects. An empty list restores full click-through — the
+/// doc 11 §7 watchdog reset.
+#[tauri::command]
+pub async fn set_hit_test_rects(
+    rects: Vec<crate::overlay::BubbleRect>,
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    hit_test: State<'_, crate::hit_test::HitTestState>,
+) -> Result<(), String> {
+    hit_test.set_rects(&app, window.label(), rects);
+    Ok(())
+}
+
+/// Reset this window's interactivity state to click-through. The UI root calls
+/// this once on mount so a WebView reload/crash cannot orphan a modal override
+/// (doc 11 §7 watchdog for the modal half).
+#[tauri::command]
+pub async fn reset_overlay_interactivity(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    hit_test: State<'_, crate::hit_test::HitTestState>,
+) -> Result<(), String> {
+    hit_test.reset(&app, window.label());
+    Ok(())
 }
 
 /// The consent snapshot the first-run flow and the settings view read
@@ -145,14 +180,46 @@ pub async fn complete_first_run(
     } else {
         let _ = events::emit_capture_indicator(&app, CaptureIndicator::Off);
     }
+    // From now on the app is "just there" at login (regardless of the capture
+    // decision — capture itself still follows consent at every launch). Release
+    // builds only: a dev run must not write a target\debug path into HKCU Run.
+    // Failure is non-fatal; the toggle stays available in the tray + dashboard.
+    if !cfg!(debug_assertions) {
+        match apply_autostart(&app, true) {
+            Ok(()) => {
+                if let Err(e) = persist_autostart(&state.db, true) {
+                    tracing::warn!(%e, "autostart choice could not be persisted");
+                }
+            }
+            Err(e) => tracing::warn!(%e, "start-at-login registration failed"),
+        }
+    }
     Ok(())
 }
 
-/// Grant microphone consent at first PTT (doc 13 §8).
+/// Grant microphone consent at first PTT (doc 13 §8). If capture is already
+/// running, voice comes up immediately — no restart needed.
+///
+/// The enable is gated on the LIVE toggle state, not persisted consent: a
+/// failed `capture.start()` leaves `consent.capture_enabled` true while the
+/// mechanism is Off (decision vs mechanism rows, doc 13 §3), and voice must
+/// follow the mechanism — never a stale decision (multi-agent review, 2026-08-13).
 #[tauri::command]
 pub async fn grant_voice_consent(state: State<'_, AppState>) -> Result<(), String> {
-    let mut consent = state.consent.lock().await;
-    consent.grant_voice().map_err(|e| e.to_string())
+    {
+        let mut consent = state.consent.lock().await;
+        consent.grant_voice().map_err(|e| e.to_string())?;
+    }
+    if capture_is_live(&state).await {
+        let _ = state.voice.tx.send(crate::voice::VoiceCmd::Enable);
+    }
+    Ok(())
+}
+
+/// The mechanism truth: is capture actually ON right now (doc 02 §7)?
+async fn capture_is_live(state: &State<'_, AppState>) -> bool {
+    let mut orch = state.orchestration.lock().await;
+    orch.toggle().state() == aperture_orchestration::toggle_owner::CaptureState::On
 }
 
 /// The Activity & Privacy view's audit feed (doc 13 §3, §7, ADR-040): "when was
@@ -214,11 +281,9 @@ pub async fn list_exclusions(state: State<'_, AppState>) -> Result<Vec<serde_jso
 /// *open* on a bad regex, so persisting an invalid one would produce a rule the
 /// UI shows as an active protection while it silently matches nothing.
 ///
-/// NOTE: the compiled matcher inside the running capture subsystem is built at
-/// startup, so a rule added now takes effect on the next launch. The row is
-/// durable immediately. Hot-reloading the matcher needs an interior-mutable
-/// `ExclusionList` in `aperture-capture`; deferred deliberately rather than
-/// bolted on here (see the M9 notes in doc 13).
+/// The rule is durable immediately AND hot-swapped into the running capture
+/// matcher: `AppState.exclusions` is the same shared handle the sampler and
+/// normalizer hold, so `replace` takes effect on the next frame/event.
 #[tauri::command]
 pub async fn add_exclusion(
     match_kind: String,
@@ -227,10 +292,12 @@ pub async fn add_exclusion(
 ) -> Result<i64, String> {
     let pattern = pattern.trim();
     aperture_capture::exclusion::validate_pattern(&match_kind, pattern)?;
-    state
+    let id = state
         .db
         .add_exclusion_rule(&match_kind, pattern)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    reload_exclusions(&state);
+    Ok(id)
 }
 
 /// Enable/disable (`enabled: Some`) or delete (`enabled: None`) one rule.
@@ -240,7 +307,31 @@ pub async fn set_exclusion(
     enabled: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    state.db.set_exclusion_enabled(id, enabled).map_err(|e| e.to_string())
+    state.db.set_exclusion_enabled(id, enabled).map_err(|e| e.to_string())?;
+    reload_exclusions(&state);
+    Ok(())
+}
+
+/// Recompile the exclusion matcher from the durable rows and swap it into the
+/// live capture gate (doc 13 §4).
+///
+/// A re-read failure keeps the PREVIOUS compiled list — never an empty one.
+/// Failing open here would silently drop the user's protections mid-session,
+/// the exact bug the M9 review closed at startup (`main::load_exclusions`).
+fn reload_exclusions(state: &State<'_, AppState>) {
+    match state.db.read_exclusion_list() {
+        Ok(rows) => {
+            let rules = aperture_capture::exclusion::rules_from_rows(rows);
+            let n = rules.len();
+            state.exclusions.replace(rules);
+            tracing::info!(count = n, "exclusion matcher hot-reloaded (doc 13 §4)");
+        }
+        Err(e) => tracing::error!(
+            %e,
+            "exclusion re-read failed — keeping the previous matcher; \
+             the new rule is durable and applies at next launch"
+        ),
+    }
 }
 
 /// First-run detect-and-suggest (doc 13 §4, §8; ADR-029/ADR-040): scan locally
@@ -263,6 +354,179 @@ pub async fn suggest_exclusions(
             .await
             .map_err(|e| e.to_string())?;
     Ok(aperture_privacy::detect_suggest::suggest_from(&installed, &already))
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard (doc 11, ADR-040): read-only views over the local history — "what
+// has it captured, what does it know". Everything here is metadata + text the
+// user's own DB already holds; nothing egresses (two-emitter rule untouched).
+// ---------------------------------------------------------------------------
+
+/// Aggregate counts + storage facts for the dashboard's Overview tab.
+#[tauri::command]
+pub async fn dashboard_stats(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let counts = state
+        .db
+        .with_conn(|c| {
+            let count = |sql: &str| -> rusqlite::Result<i64> { c.query_row(sql, [], |r| r.get(0)) };
+            Ok(serde_json::json!({
+                "events": count("SELECT COUNT(*) FROM events")?,
+                "ocr_texts": count("SELECT COUNT(*) FROM screen_context WHERE ocr_text IS NOT NULL")?,
+                "embeddings": count("SELECT COUNT(*) FROM ctx_vec")?,
+                "patterns": count("SELECT COUNT(*) FROM patterns")?,
+                "suggestions": count("SELECT COUNT(*) FROM suggestions")?,
+                "connector_states": count("SELECT COUNT(*) FROM connector_state")?,
+                "voice_utterances": count("SELECT COUNT(*) FROM events WHERE type = 'voice_utterance'")?,
+                "sessions": count("SELECT COUNT(DISTINCT session_id) FROM events WHERE session_id IS NOT NULL")?,
+                "first_event_ts": c.query_row("SELECT MIN(ts) FROM events", [], |r| r.get::<_, Option<i64>>(0))?,
+                "last_event_ts": c.query_row("SELECT MAX(ts) FROM events", [], |r| r.get::<_, Option<i64>>(0))?,
+            }))
+        })
+        .map_err(|e| e.to_string())?;
+    let db_bytes = std::fs::metadata(aperture_db::default_db_path())
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let mut stats = counts;
+    stats["db_bytes"] = serde_json::json!(db_bytes);
+    stats["db_encrypted"] = serde_json::json!(state.db.is_encrypted());
+    {
+        let consent = state.consent.lock().await;
+        stats["capture_enabled"] = serde_json::json!(consent.state().capture_enabled);
+        stats["voice_opt_in"] = serde_json::json!(consent.state().voice_opt_in);
+    }
+    Ok(stats)
+}
+
+/// The History tab: recent events joined with their screen context, optionally
+/// filtered by taxonomy type and a LIKE search over app/title/OCR text.
+#[tauri::command]
+pub async fn list_events(
+    limit: Option<u32>,
+    kind: Option<String>,
+    search: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let limit = limit.unwrap_or(100).min(500);
+    let kind = kind.filter(|s| !s.is_empty());
+    let needle = search
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("%{s}%"));
+    state
+        .db
+        .with_conn(|c| {
+            let mut sql = String::from(
+                "SELECT e.id, e.ts, e.type, e.app, e.process, e.window_title, e.session_id, \
+                        e.redaction_flags, e.payload, \
+                        substr(sc.ocr_text, 1, 280), sc.vlm_summary \
+                 FROM events e LEFT JOIN screen_context sc ON sc.event_id = e.id WHERE 1=1",
+            );
+            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            if let Some(k) = &kind {
+                sql.push_str(" AND e.type = ?");
+                params.push(Box::new(k.clone()));
+            }
+            if let Some(n) = &needle {
+                sql.push_str(
+                    " AND (e.window_title LIKE ? OR e.app LIKE ? OR sc.ocr_text LIKE ?)",
+                );
+                params.push(Box::new(n.clone()));
+                params.push(Box::new(n.clone()));
+                params.push(Box::new(n.clone()));
+            }
+            sql.push_str(" ORDER BY e.ts DESC LIMIT ?");
+            params.push(Box::new(limit));
+
+            let mut stmt = c.prepare(&sql)?;
+            let rows = stmt.query_map(
+                rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
+                |r| {
+                    let payload: Option<String> = r.get(8)?;
+                    Ok(serde_json::json!({
+                        "id": r.get::<_, i64>(0)?,
+                        "ts": r.get::<_, i64>(1)?,
+                        "type": r.get::<_, String>(2)?,
+                        "app": r.get::<_, Option<String>>(3)?,
+                        "process": r.get::<_, Option<String>>(4)?,
+                        "title": r.get::<_, Option<String>>(5)?,
+                        "session_id": r.get::<_, Option<i64>>(6)?,
+                        "redaction_flags": r.get::<_, i64>(7)?,
+                        "payload": payload
+                            .and_then(|p| serde_json::from_str::<serde_json::Value>(&p).ok()),
+                        "ocr": r.get::<_, Option<String>>(9)?,
+                        "vlm_summary": r.get::<_, Option<String>>(10)?,
+                    }))
+                },
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// The Patterns tab: what the engine has mined (doc 08).
+#[tauri::command]
+pub async fn list_patterns(
+    limit: Option<u32>,
+    state: State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let limit = limit.unwrap_or(100).min(500);
+    state
+        .db
+        .with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, signature, n, support, confidence, last_seen, dismiss_decay, muted_until \
+                 FROM patterns ORDER BY confidence DESC, support DESC LIMIT ?",
+            )?;
+            let rows = stmt.query_map([limit], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "signature": r.get::<_, Option<String>>(1)?,
+                    "n": r.get::<_, Option<i64>>(2)?,
+                    "support": r.get::<_, Option<i64>>(3)?,
+                    "confidence": r.get::<_, Option<f64>>(4)?,
+                    "last_seen": r.get::<_, Option<i64>>(5)?,
+                    "dismiss_decay": r.get::<_, Option<f64>>(6)?,
+                    "muted_until": r.get::<_, Option<i64>>(7)?,
+                }))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// The Suggestions tab: every suggestion ever surfaced, newest first, with its
+/// lifecycle outcome — unlike `list_suggestions`, which serves only live ones.
+#[tauri::command]
+pub async fn list_suggestion_history(
+    limit: Option<u32>,
+    state: State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let limit = limit.unwrap_or(100).min(500);
+    state
+        .db
+        .with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, title, glyph, confidence, state, shown_ts, resolved_ts, outcome, \
+                        useful_rating, source \
+                 FROM suggestions ORDER BY id DESC LIMIT ?",
+            )?;
+            let rows = stmt.query_map([limit], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "title": r.get::<_, Option<String>>(1)?,
+                    "glyph": r.get::<_, Option<String>>(2)?,
+                    "confidence": r.get::<_, Option<f64>>(3)?,
+                    "state": r.get::<_, Option<String>>(4)?,
+                    "shown_ts": r.get::<_, Option<i64>>(5)?,
+                    "resolved_ts": r.get::<_, Option<i64>>(6)?,
+                    "outcome": r.get::<_, Option<String>>(7)?,
+                    "useful_rating": r.get::<_, Option<String>>(8)?,
+                    "source": r.get::<_, Option<String>>(9)?,
+                }))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|e| e.to_string())
 }
 
 /// Record bubble feedback (doc 08 §7, ADR-040/Q81): update the durable
@@ -491,53 +755,324 @@ pub async fn bubble_click(
     Ok(outcome)
 }
 
+/// How long an abandoned preview session may linger before the next
+/// `request_preview` prunes it (the UI's Cancel path calls `preview_cancel`;
+/// this is the backstop for a crashed WebView).
+const PREVIEW_TTL_MS: i64 = 60 * 60 * 1000;
+
 /// Build + redact the Context Payload for an intent and return the EXACT wire
 /// object the preview renders (doc 03 §4, doc 11 §4, doc 13 §5).
 ///
 /// "Preview == wire": this returns the single object that will later be sent
 /// byte-for-byte. It does NOT set `user_approved` (that is
 /// [`preview_set_approved`] only) and does NOT touch the network.
+///
+/// Items gathered, in order (doc 09 §5):
+/// - the `answer_query` intent seeds the last voice transcript (`user_addition`);
+/// - `seed_action_ref` resolves to the originating connector state;
+/// - a recent-events trail (metadata only, EXCLUDED/flagged rows filtered —
+///   excluded events can never appear in any payload, doc 13 §2/§4).
 #[tauri::command]
 pub async fn request_preview(
-    _intent: Intent,
-    // Optional originating bubble/answer `action_ref` so the preview seeds its
-    // connector item from the same context the user clicked (doc 11 §4-§5).
-    _seed_action_ref: Option<String>,
-    _state: State<'_, AppState>,
+    intent: Intent,
+    seed_action_ref: Option<String>,
+    state: State<'_, AppState>,
 ) -> Result<ContextPayload, String> {
-    // M7: payload builder (doc 03 §4) + redaction pipeline (doc 13 §5).
-    Err("request_preview: the reasoning gateway is the M7 milestone (doc 16)".into())
+    use aperture_contracts::PayloadItem;
+
+    let mut items: Vec<PayloadItem> = Vec::new();
+
+    // Voice escalation carries the user's actual question (doc 07 §5).
+    // `take`, not clone: the transcript seeds exactly ONE preview — a stale
+    // utterance must not attach to unrelated later payloads.
+    if intent == Intent::AnswerQuery {
+        let transcript = state
+            .voice
+            .last_transcript
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(text) = transcript {
+            items.push(PayloadItem::UserAddition { text });
+        }
+    }
+
+    // The originating bubble/answer's connector context (doc 11 §4-§5).
+    if let Some(action_ref) = seed_action_ref.filter(|s| !s.is_empty()) {
+        match state.db.read_connector_state(&action_ref) {
+            Ok(Some(st)) => items.push(PayloadItem::Connector {
+                connector_type: st.connector_type,
+                payload: st.reconstruct_payload,
+            }),
+            Ok(None) => tracing::warn!(%action_ref, "preview seed: connector_state row gone"),
+            Err(e) => tracing::error!(%e, "preview seed read failed"),
+        }
+    }
+
+    // Recent-events trail, oldest-first so oversize truncation drops the oldest
+    // (doc 09 §6). `redaction_flags = 0` keeps every excluded/private-window
+    // event out of the payload — the doc 13 §4 guarantee.
+    let trail = state
+        .db
+        .with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT ts, type, app, window_title FROM events \
+                 WHERE redaction_flags = 0 AND type NOT IN ('capture_toggle','cloud_send') \
+                 ORDER BY ts DESC LIMIT 50",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(serde_json::json!({
+                    "ts": r.get::<_, i64>(0)?,
+                    "type": r.get::<_, String>(1)?,
+                    "app": r.get::<_, Option<String>>(2)?,
+                    "title": r.get::<_, Option<String>>(3)?,
+                }))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|e| e.to_string())?;
+    if !trail.is_empty() {
+        let events: Vec<serde_json::Value> = trail.into_iter().rev().collect();
+        items.push(PayloadItem::EventTrail { events });
+    }
+
+    // Redact BEFORE preview (doc 13 §5), with the user's configured terms.
+    let user_terms = read_user_redaction_terms(&state.db);
+    let redactor = aperture_privacy::redaction::Redactor::new(&user_terms)
+        .map_err(|e| format!("redaction rules failed to compile: {e}"))?;
+
+    let (payload, report) = aperture_reasoning_gateway::payload_builder::build(
+        intent,
+        items,
+        state.push_target,
+        &redactor,
+        crate::pipeline::epoch_ms(),
+    )
+    .map_err(|e| e.to_string())?;
+    tracing::info!(
+        payload_id = %payload.payload_id,
+        bytes = report.serialized_bytes,
+        oversize = report.oversize_warning,
+        truncated = report.events_truncated,
+        "context payload assembled for preview (doc 09 §5)"
+    );
+
+    let mut previews = state.previews.lock().await;
+    // Prune sessions an old WebView abandoned without cancelling.
+    let now = crate::pipeline::epoch_ms();
+    let crate::app_state::PreviewStore { sessions, approved } = &mut *previews;
+    sessions.retain(|_, s| now - s.payload().created_ts < PREVIEW_TTL_MS);
+    approved.retain(|id, _| sessions.contains_key(id));
+    sessions.insert(
+        payload.payload_id,
+        aperture_reasoning_gateway::preview::PreviewSession::new(payload.clone()),
+    );
+    Ok(payload)
 }
 
-/// The ONLY setter of `ContextPayload::user_approved` (doc 15 §2(b), doc 11 §4).
+/// The user's configured redaction terms (doc 13 §5 rule 6), from settings.
+/// Each entry is a literal term; invalid regexes cannot arise from literals.
+/// `pub(crate)`: the MCP bridge's gated search redacts through the same terms.
+pub(crate) fn read_user_redaction_terms(
+    db: &aperture_db::Db,
+) -> Vec<aperture_privacy::redaction::UserTerm> {
+    let Ok(Some(raw)) = db.get_setting("privacy") else { return Vec::new() };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else { return Vec::new() };
+    v.get("redaction_user_terms")
+        .and_then(|t| t.as_array())
+        .map(|terms| {
+            terms
+                .iter()
+                .filter_map(|t| t.as_str())
+                .map(|pattern| aperture_privacy::redaction::UserTerm {
+                    pattern: pattern.to_string(),
+                    is_regex: false,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Approve a previewed payload (doc 15 §2(b), doc 11 §4) — the contract's SOLE
+/// approval path, and the point where the panel's edits become the in-process
+/// object (WYSIWYS).
+///
+/// Order is load-bearing (multi-agent review, 2026-08-13): the edits are synced
+/// HERE, re-redacted HERE, and the approval is recorded as a SHA-256 over the
+/// resulting canonical bytes — so what `preview_send` later ships is exactly
+/// the content that passed this gate, never a later client-supplied body.
+/// If the re-redaction changed anything (the user typed a note containing a
+/// secret/user term), approval is REFUSED and the redacted object is returned
+/// for re-review: the user must see the real wire bytes before approving them.
 #[tauri::command]
 pub async fn preview_set_approved(
-    _payload_id: Uuid,
-    _state: State<'_, AppState>,
-) -> Result<(), String> {
-    Err("preview_set_approved: the reasoning gateway is the M7 milestone (doc 16)".into())
+    payload: ContextPayload,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    use aperture_contracts::{PayloadItem, EVENT_TRAIL_MAX};
+
+    let payload_id = payload.payload_id;
+    let mut previews = state.previews.lock().await;
+    let session = previews
+        .sessions
+        .get_mut(&payload_id)
+        .ok_or_else(|| format!("preview_set_approved: unknown payload {payload_id}"))?;
+
+    // Sync the panel's edits onto the core-owned object.
+    let new_hits = {
+        let p = session.payload_mut();
+        p.intent = payload.intent;
+        p.items = payload.items;
+        // Re-enforce the trail cap (doc 03 §4) — the panel can only remove
+        // events today, but the cap must not depend on client behavior.
+        for item in &mut p.items {
+            if let PayloadItem::EventTrail { events } = item {
+                if events.len() > EVENT_TRAIL_MAX {
+                    let drop = events.len() - EVENT_TRAIL_MAX;
+                    events.drain(0..drop);
+                }
+            }
+        }
+        // Re-run redaction over the synced content (doc 13 §5): panel-added
+        // text has never seen the redactor. Placeholders from the first pass
+        // don't re-match, so this only catches NEW leaks.
+        let user_terms = read_user_redaction_terms(&state.db);
+        let redactor = aperture_privacy::redaction::Redactor::new(&user_terms)
+            .map_err(|e| format!("redaction rules failed to compile: {e}"))?;
+        redactor.redact_payload(p)
+    };
+
+    if !new_hits.is_empty() {
+        // Content changed under redaction — the user has not seen these bytes.
+        // Return the redacted object for re-review; no approval recorded.
+        return Ok(serde_json::json!({
+            "payload": session.payload(),
+            "changed": true,
+        }));
+    }
+
+    let wire = serde_json::to_vec(session.payload())
+        .map_err(|e| format!("serialize failed: {e}"))?;
+    let hash = aperture_privacy::audit_log::sha256_hex(&wire);
+    let response = serde_json::json!({ "payload": session.payload(), "changed": false });
+    previews.approved.insert(payload_id, hash);
+    Ok(response)
+}
+
+/// Cancel a preview: drop the in-process session — zero residue (doc 13 §3).
+#[tauri::command]
+pub async fn preview_cancel(payload_id: Uuid, state: State<'_, AppState>) -> Result<(), String> {
+    let mut previews = state.previews.lock().await;
+    previews.sessions.remove(&payload_id);
+    previews.approved.remove(&payload_id);
+    Ok(())
 }
 
 /// The ONLY call that reaches the network (doc 15 §2(c), doc 13 §2) — via the
-/// gateway, with an already-approved payload, SHA-256 audit-logged (M7).
+/// gateway, SHA-256 audit-logged as `cloud_send`.
+///
+/// Takes only the payload id: the bytes that ship are the CORE-owned session
+/// object whose hash was recorded at approval — a client cannot substitute
+/// content after the gate (preview == wire, doc 13 §3). On a transport failure
+/// the session and approval are RESTORED so Send can honestly be retried, and
+/// the error reaches the panel instead of dead-ending.
 #[tauri::command]
 pub async fn preview_send(
-    _payload: ContextPayload,
-    _state: State<'_, AppState>,
+    payload_id: Uuid,
+    state: State<'_, AppState>,
 ) -> Result<StructuredSuggestions, String> {
-    Err("preview_send: the reasoning gateway is the M7 milestone (doc 16)".into())
+    let (session, approved_hash) = {
+        let mut previews = state.previews.lock().await;
+        let Some(hash) = previews.approved.remove(&payload_id) else {
+            return Err(format!(
+                "preview_send: payload {payload_id} was not approved via preview_set_approved (doc 15 §2b)"
+            ));
+        };
+        let session = previews
+            .sessions
+            .remove(&payload_id)
+            .ok_or_else(|| format!("preview_send: no session for payload {payload_id}"))?;
+        (session, hash)
+    };
+
+    // Content-bound approval: the session must still hash to what was approved.
+    let wire = serde_json::to_vec(session.payload()).map_err(|e| e.to_string())?;
+    if aperture_privacy::audit_log::sha256_hex(&wire) != approved_hash {
+        return Err("preview_send: payload changed after approval — re-approve (doc 13 §3)".into());
+    }
+
+    // Keep an unapproved copy so a failed transport leaves Send retryable.
+    let backup = session.payload().clone();
+    let approved = session
+        .approve(aperture_reasoning_gateway::preview::PreviewDecision::Send)
+        .ok_or_else(|| "preview_send: session cancelled".to_string())?;
+
+    match state.gateway.send_with_preview(&approved, true).await {
+        Ok(result) => Ok(result),
+        Err(e) => {
+            let mut previews = state.previews.lock().await;
+            previews.sessions.insert(
+                payload_id,
+                aperture_reasoning_gateway::preview::PreviewSession::new(backup),
+            );
+            previews.approved.insert(payload_id, approved_hash);
+            Err(e.to_string())
+        }
+    }
 }
 
-/// PTT key pressed (doc 07, Path C) — M6.
+/// PTT key pressed (doc 07, Path C) — forwards to the voice thread.
 #[tauri::command]
-pub async fn voice_ptt_down(_state: State<'_, AppState>) -> Result<(), String> {
-    Err("voice_ptt_down: voice is the M6 milestone (doc 16)".into())
+pub async fn voice_ptt_down(state: State<'_, AppState>) -> Result<(), String> {
+    require_voice_consent(&state).await?;
+    state
+        .voice
+        .tx
+        .send(crate::voice::VoiceCmd::PttDown)
+        .map_err(|_| "voice thread not running".to_string())
 }
 
-/// PTT key released (doc 07, Path C) — M6.
+/// PTT key released (doc 07, Path C) — forwards to the voice thread.
 #[tauri::command]
-pub async fn voice_ptt_up(_state: State<'_, AppState>) -> Result<(), String> {
-    Err("voice_ptt_up: voice is the M6 milestone (doc 16)".into())
+pub async fn voice_ptt_up(state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .voice
+        .tx
+        .send(crate::voice::VoiceCmd::PttUp)
+        .map_err(|_| "voice thread not running".to_string())
+}
+
+/// Confirm-chip "Run" (doc 07 §4.4): re-issue a confirmed transcript through
+/// the query path at confidence 1.0. Never re-stores the utterance.
+#[tauri::command]
+pub async fn voice_run_transcript(
+    transcript: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if transcript.trim().is_empty() {
+        return Err("voice_run_transcript: empty transcript".into());
+    }
+    state
+        .voice
+        .tx
+        .send(crate::voice::VoiceCmd::RunTranscript(transcript))
+        .map_err(|_| "voice thread not running".to_string())
+}
+
+/// Voice consent gate (doc 13 §8): PTT requires the explicit mic opt-in AND
+/// capture actually running (the live toggle, not the persisted decision —
+/// voice rides the mechanism, doc 12 §6).
+async fn require_voice_consent(state: &State<'_, AppState>) -> Result<(), String> {
+    let opted_in = state.consent.lock().await.state().voice_opt_in;
+    if !opted_in {
+        return Err(
+            "microphone consent not granted (doc 13 §8) — call grant_voice_consent first".into(),
+        );
+    }
+    if !capture_is_live(state).await {
+        return Err("capture is off — voice rides the capture toggle (doc 12 §6)".into());
+    }
+    Ok(())
 }
 
 /// Read the current settings as opaque JSON (doc 13 §6): the `settings` table's
@@ -587,4 +1122,68 @@ pub async fn set_settings(
             Ok(())
         })
         .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Start-at-login (the "it's just on when the laptop turns on" contract).
+// The registration lives in HKCU Run (tauri-plugin-autostart); the user's
+// CHOICE lives in settings `ui.autostart` so a moved/reinstalled exe can be
+// re-registered at startup (`main::sync_autostart`) without re-asking.
+// ---------------------------------------------------------------------------
+
+/// Is start-at-login currently registered with Windows?
+#[tauri::command]
+pub async fn get_autostart(app: tauri::AppHandle) -> Result<bool, String> {
+    Ok(autostart_enabled(&app))
+}
+
+/// Register/unregister start-at-login and persist the choice as `ui.autostart`.
+#[tauri::command]
+pub async fn set_autostart(
+    on: bool,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    apply_autostart(&app, on)?;
+    persist_autostart(&state.db, on)
+}
+
+/// The registry truth (not the stored preference). Errors read as "not enabled".
+pub fn autostart_enabled(app: &tauri::AppHandle) -> bool {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().unwrap_or(false)
+}
+
+/// Drive the OS registration to `on`. Idempotent — safe to call every launch.
+pub fn apply_autostart(app: &tauri::AppHandle, on: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let autolaunch = app.autolaunch();
+    let registered = autolaunch.is_enabled().unwrap_or(false);
+    match (on, registered) {
+        (true, _) => autolaunch.enable().map_err(|e| e.to_string()), // re-enable repairs a moved exe path
+        (false, true) => autolaunch.disable().map_err(|e| e.to_string()),
+        (false, false) => Ok(()),
+    }
+}
+
+/// Persist the user's start-at-login choice into the `ui` settings section
+/// (read-modify-write: the section also carries `hud_anchor` etc.).
+pub fn persist_autostart(db: &aperture_db::Db, on: bool) -> Result<(), String> {
+    use rusqlite::OptionalExtension;
+    db.with_conn(|c| {
+        let raw: Option<String> = c
+            .query_row("SELECT value FROM settings WHERE key = 'ui'", [], |r| r.get(0))
+            .optional()?;
+        let mut ui: serde_json::Value = raw
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        ui["autostart"] = serde_json::Value::Bool(on);
+        c.execute(
+            "INSERT INTO settings (key, value) VALUES ('ui', ?1) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![ui.to_string()],
+        )
+        .map(|_| ())
+    })
+    .map_err(|e| e.to_string())
 }

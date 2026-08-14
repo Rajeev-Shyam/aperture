@@ -29,8 +29,9 @@ pub enum ValidationError {
 
 /// Resolves a `connector_type` string to its [`Connector`] for re-validation
 /// (doc 10 §1). Backed by the connector registry; abstracted here so the
-/// validator's *callers* can fake it in tests.
-pub trait ConnectorLookup {
+/// validator's *callers* can fake it in tests. `Send + Sync` because the
+/// gateway lives in the Tauri-managed `AppState`, shared across commands.
+pub trait ConnectorLookup: Send + Sync {
     /// Return the connector whose [`Connector::id`] equals `connector_type`, or
     /// `None` for unknown / `"none"` types.
     fn by_type(&self, connector_type: &str) -> Option<&dyn Connector>;

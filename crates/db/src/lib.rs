@@ -123,9 +123,27 @@ impl Db {
         // Register sqlite-vec as an auto-extension BEFORE opening, so the
         // migration's `CREATE VIRTUAL TABLE ... USING vec0` works (doc 03 §3).
         let vec_loaded = register_sqlite_vec();
+        // An install upgraded from a plaintext build carries a plaintext DB the
+        // keyed open below cannot read — convert it in place first (doc 13 §6).
+        #[cfg(feature = "sqlcipher")]
+        migrate_plaintext_if_needed(&path, key)?;
         let conn = Connection::open(&path)?;
         // MUST precede every other statement on this connection (doc 13 §6).
         let encrypted = apply_key(&conn, key)?;
+        // The keyed open above verified the encrypted file reads back — only
+        // now is it safe to drop the plaintext original the migration parked.
+        #[cfg(feature = "sqlcipher")]
+        if encrypted {
+            let bak = plaintext_backup_path(&path);
+            if bak.exists() {
+                match std::fs::remove_file(&bak) {
+                    Ok(()) => tracing::info!(
+                        "plaintext→SQLCipher migration verified; plaintext original deleted (doc 13 §6)"
+                    ),
+                    Err(e) => tracing::warn!(%e, "plaintext backup could not be deleted — remove it manually"),
+                }
+            }
+        }
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // Overwrite freed pages instead of leaving their content in the file
@@ -662,14 +680,7 @@ fn apply_key(conn: &Connection, key: &[u8]) -> Result<bool, DbError> {
             "sqlcipher build requires a non-empty page key (doc 13 §6)".into(),
         ));
     }
-    // Raw-key form `PRAGMA key = "x'<hex>'"` uses the bytes verbatim (no KDF
-    // over a passphrase) — the key already came from a CSPRNG. `hex` is our own
-    // generated alphabet, so the format! is not an injection surface.
-    let mut hex = String::with_capacity(key.len() * 2);
-    for byte in key {
-        use std::fmt::Write;
-        let _ = write!(hex, "{byte:02x}");
-    }
+    let hex = key_hex(key);
     conn.execute_batch(&format!("PRAGMA key = \"x'{hex}'\";"))
         .map_err(|_| DbError::Decryption)?;
     // Force a real read: with a wrong key SQLCipher fails here, not at PRAGMA.
@@ -677,6 +688,100 @@ fn apply_key(conn: &Connection, key: &[u8]) -> Result<bool, DbError> {
         .map_err(|_| DbError::Decryption)?;
     Ok(true)
 }
+
+/// Raw-key hex for SQLCipher's `x'…'` form. `key` came from a CSPRNG, and the
+/// output alphabet is our own `[0-9a-f]` — not an injection surface.
+#[cfg(feature = "sqlcipher")]
+fn key_hex(key: &[u8]) -> String {
+    let mut hex = String::with_capacity(key.len() * 2);
+    for byte in key {
+        use std::fmt::Write;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// Where a migrated plaintext original is parked until the encrypted copy is
+/// verified readable (then it is deleted — a lingering plaintext file would
+/// defeat the whole feature).
+#[cfg(feature = "sqlcipher")]
+fn plaintext_backup_path(path: &std::path::Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".plaintext-migrating");
+    path.with_file_name(name)
+}
+
+/// One-time plaintext→SQLCipher conversion for a DB written by a pre-encryption
+/// build (doc 13 §6). Detection is by the SQLite file magic: a plaintext DB
+/// starts with `SQLite format 3\0`; SQLCipher page 1 is ciphertext. Missing
+/// file (fresh install) and already-encrypted files are no-ops.
+///
+/// Crash-safe by ordering: export to a temp file → move plaintext aside →
+/// move the encrypted file into place. The parked plaintext is deleted only
+/// AFTER the keyed open verifies the encrypted file reads back (see
+/// [`Db::open_encrypted`]); a crash at any step leaves at least one complete
+/// copy of the data on disk, and re-running the migration cleans up.
+#[cfg(feature = "sqlcipher")]
+fn migrate_plaintext_if_needed(path: &std::path::Path, key: &[u8]) -> Result<(), DbError> {
+    if key.is_empty() || !is_plaintext_sqlite(path)? {
+        return Ok(());
+    }
+    tracing::info!(
+        "plaintext history DB found — converting to SQLCipher in place (doc 13 §6)"
+    );
+    let tmp = path.with_extension("db.encrypting");
+    let _ = std::fs::remove_file(&tmp); // stale partial from a crashed attempt
+    {
+        let conn = Connection::open(path)?;
+        // Fold the WAL into the main file so the export sees every row, then
+        // export schema + data into the keyed attach.
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        let hex = key_hex(key);
+        // The path is `%LOCALAPPDATA%\Aperture\…` (or a test dir) — no quote
+        // chars; escape defensively anyway so a quote cannot break the SQL.
+        let tmp_sql = tmp.display().to_string().replace('\'', "''");
+        conn.execute_batch(&format!(
+            "ATTACH DATABASE '{tmp_sql}' AS encrypted KEY \"x'{hex}'\";\n\
+             SELECT sqlcipher_export('encrypted');\n\
+             DETACH DATABASE encrypted;"
+        ))?;
+    } // close the plaintext connection before renaming files
+    let bak = plaintext_backup_path(path);
+    let _ = std::fs::remove_file(&bak);
+    std::fs::rename(path, &bak).map_err(|e| DbError::Io(e.to_string()))?;
+    // The old plaintext WAL/SHM were truncated by the checkpoint; drop the
+    // leftovers so the encrypted DB does not inherit stale sidecar files.
+    for suffix in ["-wal", "-shm"] {
+        let mut side = path.as_os_str().to_os_string();
+        side.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(side));
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // Roll the plaintext back into place: a failed migration must leave a
+        // working (if unencrypted) install, never a missing DB.
+        let _ = std::fs::rename(&bak, path);
+        return Err(DbError::Io(format!("could not activate the encrypted DB: {e}")));
+    }
+    Ok(())
+}
+
+/// Does `path` hold a **plaintext** SQLite file? (16-byte header magic.)
+/// Missing or too-short files read as "no" — nothing to migrate.
+#[cfg(feature = "sqlcipher")]
+fn is_plaintext_sqlite(path: &std::path::Path) -> Result<bool, DbError> {
+    use std::io::Read;
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(DbError::Io(e.to_string())),
+    };
+    let mut magic = [0u8; 16];
+    match file.read_exact(&mut magic) {
+        Ok(()) => Ok(&magic == b"SQLite format 3\0"),
+        Err(_) => Ok(false), // shorter than a header: not a plaintext SQLite DB
+    }
+}
+
 
 /// No-encryption build: the key is accepted (so every caller is already
 /// M9-shaped) but NOT applied. Loud about it — a plaintext DB must never be
@@ -1006,5 +1111,66 @@ mod tests {
         // The gate relies on this being truthful, never optimistic.
         let db = Db::open_in_memory().expect("open");
         assert!(!db.is_encrypted());
+    }
+}
+
+#[cfg(all(test, feature = "sqlcipher"))]
+mod sqlcipher_tests {
+    use super::*;
+
+    /// The upgrade path (doc 13 §6): a DB written by a pre-encryption build is
+    /// converted in place on the first keyed open — data intact, file now
+    /// ciphertext, no plaintext copy left behind.
+    #[test]
+    fn plaintext_db_is_migrated_to_sqlcipher_on_open() {
+        let dir = std::env::temp_dir().join(format!("aperture-migrate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("history.db");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).expect("plaintext create");
+            conn.execute_batch(
+                "CREATE TABLE legacy(v TEXT); INSERT INTO legacy VALUES ('kept');",
+            )
+            .expect("seed");
+        }
+        assert!(is_plaintext_sqlite(&path).expect("magic"), "precondition: plaintext");
+
+        let key = [7u8; 32];
+        let db = Db::open_encrypted(path.clone(), &key).expect("keyed open migrates");
+        assert!(db.is_encrypted());
+        let v: String = db
+            .with_conn(|c| c.query_row("SELECT v FROM legacy", [], |r| r.get(0)))
+            .expect("legacy row survives");
+        assert_eq!(v, "kept");
+        drop(db);
+
+        assert!(
+            !is_plaintext_sqlite(&path).expect("magic"),
+            "file must be ciphertext after migration"
+        );
+        assert!(
+            !plaintext_backup_path(&path).exists(),
+            "the plaintext original must be deleted once the encrypted open verified"
+        );
+        // A second open is a plain keyed open (no re-migration) and still reads.
+        let db = Db::open_encrypted(path, &key).expect("reopen");
+        assert!(db.is_encrypted());
+    }
+
+    /// A wrong key on an already-encrypted file must surface `Decryption`,
+    /// never fall back to migration or plaintext.
+    #[test]
+    fn wrong_key_is_a_decryption_error() {
+        let dir = std::env::temp_dir().join(format!("aperture-wrongkey-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("history.db");
+        let _ = std::fs::remove_file(&path);
+        drop(Db::open_encrypted(path.clone(), &[1u8; 32]).expect("create encrypted"));
+        match Db::open_encrypted(path, &[2u8; 32]) {
+            Err(DbError::Decryption) => {}
+            Err(e) => panic!("expected Decryption, got {e:?}"),
+            Ok(_) => panic!("expected Decryption, but the open succeeded"),
+        }
     }
 }

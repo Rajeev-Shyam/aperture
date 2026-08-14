@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 description = "The reasoning & Claude integration gateway (doc 09): builds/previews/sends the Context Payload via swappable transports (Desktop-MCP / CLI / Messages API, MCP-primary per ADR-025). THE ONLY crate permitted to open network sockets or spawn the Claude CLI (two-emitter rule, doc 13 §2)."
 
+# The stdio MCP server Claude Desktop spawns (doc 09 §3). Lives in THIS crate
+# deliberately: its stdout is an egress surface, and this crate is the emitter.
+[[bin]]
+name = "aperture-mcp"
+path = "src/bin/aperture_mcp.rs"
+
 [dependencies]
 aperture-contracts = { workspace = true }
 aperture-privacy = { workspace = true }

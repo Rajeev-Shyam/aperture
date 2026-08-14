@@ -19,8 +19,11 @@
 
 use std::time::Duration;
 
-/// Default PTT chord (doc 07 §2) — `Ctrl + Win + Space` [ASSUMPTION].
-pub const DEFAULT_HOTKEY: &str = "Ctrl+Win+Space";
+/// Default PTT chord (doc 07 §2). `Ctrl+Alt+Space`, NOT the doc's original
+/// `Ctrl+Win+Space` assumption: Windows reserves Ctrl+Win+Space for input-
+/// language switching, so registration fails on any machine with multiple
+/// layouts (observed live, 2026-08-13). Settings-configurable either way.
+pub const DEFAULT_HOTKEY: &str = "Ctrl+Alt+Space";
 
 /// Max hold before capture auto-stops regardless of key state (doc 07 §2).
 pub const MAX_HOLD: Duration = crate::MAX_UTTERANCE;
@@ -171,6 +174,26 @@ impl PttHotkey {
         }
     }
 
+    /// Non-blocking variant of [`next_event`](Self::next_event) for a caller
+    /// that multiplexes the hotkey with other work on one thread (the
+    /// composition root's voice loop, which must also pump Win32 messages and
+    /// drain a command channel). Drains any queued events for *our* chord and
+    /// returns the first, or `None` when the queue holds nothing for us.
+    pub fn try_next_event(&mut self) -> Option<PttEvent> {
+        use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
+        let rx = GlobalHotKeyEvent::receiver();
+        while let Ok(ev) = rx.try_recv() {
+            if ev.id != self.hotkey_id {
+                continue; // a different hotkey — ignore
+            }
+            return Some(match ev.state {
+                HotKeyState::Pressed => PttEvent::Down,
+                HotKeyState::Released => PttEvent::Up,
+            });
+        }
+        None
+    }
+
     /// Explicitly unregister (also happens on drop via the manager). Idempotent.
     pub fn manager(&self) -> &global_hotkey::GlobalHotKeyManager {
         &self.manager
@@ -220,7 +243,7 @@ mod tests {
     #[test]
     fn parses_the_default_chord() {
         let c = HotkeyChord::default().parse().unwrap();
-        assert!(c.ctrl && c.meta && !c.alt && !c.shift);
+        assert!(c.ctrl && c.alt && !c.meta && !c.shift);
         assert_eq!(c.key, "space");
     }
 

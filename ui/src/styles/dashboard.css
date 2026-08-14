@@ -1,0 +1,378 @@
+/* Dashboard + HUD cluster (doc 11, doc 14). Token-disciplined: no raw colors.
+ *
+ * The dashboard wears `.surface-opaque` — with first-run and the privacy panel
+ * it is one of the largest surfaces in the app; glass here would breach the ≤2
+ * glass budget (ADR-039, doc 14 §5).
+ */
+
+/* --- Stacking: bubbles < HUD < panels ------------------------------------- *
+ * Panels must sit ABOVE the HUD cluster: both gravitate to screen corners and
+ * a HUD covering a panel's close button makes the panel unclosable. */
+.hud {
+  position: fixed;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  z-index: 30;
+  cursor: grab;
+}
+
+.privacy,
+.firstrun,
+.preview,
+.dash {
+  z-index: 40;
+}
+
+.hud--dragging {
+  opacity: 0.85;
+  transition: none;
+  cursor: grabbing;
+}
+
+/* Window-style drag handles (panel headers / the dashboard titlebar). */
+.panel-handle {
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+}
+
+/* Inside the cluster the members flow in the flex column instead of pinning
+ * themselves to the viewport. */
+.hud .capture,
+.hud .privacy-open {
+  position: static;
+}
+
+.hud__buttons {
+  display: flex;
+  gap: 6px;
+}
+
+.hud__grip {
+  align-self: center;
+  width: 34px;
+  height: 14px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink-faint);
+  font-size: 10px;
+  line-height: 1;
+  cursor: grab;
+  touch-action: none;
+}
+
+.hud__grip:hover {
+  color: var(--ink-secondary);
+  background: var(--fallback-opaque);
+}
+
+.hud--dragging .hud__grip {
+  cursor: grabbing;
+}
+
+/* --- Dashboard window ------------------------------------------------------ */
+.dash {
+  position: fixed;
+  inset: 50% auto auto 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  width: min(880px, calc(100vw - 2 * var(--edge-inset)));
+  height: min(620px, calc(100vh - 2 * var(--edge-inset)));
+  color: var(--ink-primary);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-24);
+  box-shadow: var(--shadow-elev);
+  overflow: hidden;
+  font: inherit;
+}
+
+.dash__titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-hairline);
+}
+
+.dash__body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.dash__nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 190px;
+  flex-shrink: 0;
+  padding: 12px 10px;
+  border-right: 1px solid var(--border-hairline);
+}
+
+.dash__brand {
+  font-weight: 600;
+  font-size: 1rem;
+}
+
+.dash__banner {
+  margin: 0 0 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-12);
+}
+
+.dash__banner p {
+  margin: 0 0 10px;
+  color: var(--ink-secondary);
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
+.dash__navitem {
+  text-align: left;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: var(--radius-12);
+  background: transparent;
+  color: var(--ink-secondary);
+  font: inherit;
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.dash__navitem:hover {
+  color: var(--ink-primary);
+  background: var(--fallback-opaque);
+}
+
+.dash__navitem--active {
+  color: var(--accent-ink);
+  background: var(--accent);
+}
+
+.dash__navfoot {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-hairline);
+}
+
+.dash__content {
+  flex: 1;
+  min-width: 0;
+  padding: 20px 24px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.dash__content h2 {
+  margin: 0 0 6px;
+  font-size: 1.15rem;
+  font-weight: 600;
+}
+
+.dash__lede {
+  margin: 0 0 16px;
+  color: var(--ink-secondary);
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
+.dash__error {
+  color: var(--health-down);
+  font-size: 0.85rem;
+}
+
+.dash__empty {
+  color: var(--ink-faint);
+  font-size: 0.85rem;
+}
+
+/* Overview tiles */
+.dash__tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.dash__tile {
+  padding: 12px 14px;
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-12);
+}
+
+.dash__tile-value {
+  font-size: 1.4rem;
+  font-weight: 600;
+}
+
+.dash__tile-label {
+  color: var(--ink-secondary);
+  font-size: 0.78rem;
+}
+
+.dash__tile-sub {
+  color: var(--ink-faint);
+  font-size: 0.72rem;
+}
+
+.dash__facts {
+  color: var(--ink-secondary);
+  font-size: 0.85rem;
+}
+
+/* Overview settings row (start-at-login). */
+.dash__setting {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-12);
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.dash__setting input {
+  margin-top: 2px;
+  accent-color: var(--accent);
+}
+
+.dash__setting-sub {
+  display: block;
+  color: var(--ink-faint);
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+
+/* Search + row lists (History / Patterns / Suggestions / Voice) */
+.dash__search {
+  width: 100%;
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-12);
+  background: transparent;
+  color: var(--ink-primary);
+  font: inherit;
+  font-size: 0.85rem;
+}
+
+.dash__search:focus-visible,
+.dash__navitem:focus-visible,
+.hud__grip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.dash__rows {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.dash__row {
+  padding: 8px 10px;
+  border-left: 2px solid var(--border-hairline);
+  border-radius: var(--radius-12);
+  font-size: 0.82rem;
+}
+
+.dash__row-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.dash__row-head time {
+  margin-left: auto;
+  color: var(--ink-faint);
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
+.dash__row-type {
+  color: var(--ink-faint);
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
+.dash__row-app {
+  color: var(--ink-secondary);
+  font-size: 0.75rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dash__row-title {
+  color: var(--ink-primary);
+  overflow-wrap: anywhere;
+}
+
+.dash__row-title code {
+  font-size: 0.78rem;
+}
+
+.dash__row-ocr {
+  margin-top: 2px;
+  color: var(--ink-faint);
+  font-size: 0.75rem;
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.dash__row-excluded {
+  color: var(--health-setup);
+  font-size: 0.72rem;
+}
+
+/* Voice notice surface: opaque + readable + always closable (user feedback:
+ * the glass error toast was unreadable and had no way to dismiss it). */
+.voice--notice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(440px, calc(100vw - 2 * var(--edge-inset)));
+  background: var(--fallback-opaque);
+}
+
+.voice--notice .voice__empty {
+  line-height: 1.45;
+}
+
+.voice__close {
+  flex-shrink: 0;
+}
+
+.voice--answer {
+  position: relative;
+}
+
+.voice--answer .voice__close {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+}
+
+/* Preview panel send error (review fix: a failed Send must be visible). */
+.preview__send-error {
+  margin: 8px 16px 12px;
+  color: var(--health-down);
+  font-size: 0.82rem;
+}

@@ -34,8 +34,19 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["nsis"],
     "icon": ["icons/icon.ico"],
-    "externalBin": ["binaries/vlm-host", "binaries/stt-host"]
+    "externalBin": ["binaries/vlm-host", "binaries/stt-host", "binaries/aperture-mcp"],
+    "resources": {
+      "../extension/": "extension/",
+      "binaries/whisper/": "whisper/",
+      "../models/ggml-base.en.bin": "models/ggml-base.en.bin"
+    },
+    "shortDescription": "Aperture — your local-first screen memory",
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
   }
 }

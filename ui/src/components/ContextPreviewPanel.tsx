@@ -33,6 +33,7 @@ import {
   type StructuredSuggestions,
   type TransportTarget,
 } from "../lib/ipc";
+import { useDraggable } from "../state/useDraggable";
 import { useModalSurface } from "../state/useModalSurface";
 
 interface Props {
@@ -76,7 +77,11 @@ export function ContextPreviewPanel({ payload, onChange, onClose }: Props) {
   // overlay accept input, move focus in on open, restore it to the opener on
   // close, trap Tab, and map Escape to Cancel — the zero-residue safe path
   // (doc 13 §3). Without the overlay half, Send/Cancel are literally unclickable.
-  const trapKeys = useModalSurface(panelRef);
+  // Non-exclusive: the panel's own rect keeps Send/Cancel clickable while the
+  // rest of the screen stays click-through to the user's apps.
+  const trapKeys = useModalSurface(panelRef, { exclusive: false });
+  // Window-style drag by the header.
+  const drag = useDraggable(panelRef);
 
   function onKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
     if (e.key === "Escape") {
@@ -143,16 +148,45 @@ export function ContextPreviewPanel({ payload, onChange, onClose }: Props) {
     //           replacing the existing event_trail item in `items`.
   }
 
-  // ---- Send (transmits the EXACT object the panel holds) -------------------
+  // ---- Send / Approve (over the EXACT object the panel holds) --------------
+  const [sendError, setSendError] = useState<string | null>(null);
+
+  // MCP is PULL (doc 09 §3): approving releases the payload to Claude Desktop
+  // when IT calls `aperture_get_context` — there is no push transmission.
+  const isMcpPull = payload.transport_target === "claude-desktop-mcp";
+
   async function send() {
     if (sending) return;
     setSending(true);
+    setSendError(null);
     try {
-      // Contract law: ONLY this panel sets approval (doc 15 §2b).
-      await previewSetApproved(payload);
-      // Transmit exactly this object's serialization (hash-logged, doc 03 §4).
-      const result = await previewSend(payload);
+      // Contract law: ONLY this panel sets approval (doc 15 §2b). The core
+      // syncs the edits, re-runs redaction, and binds approval to the bytes.
+      const approval = await previewSetApproved(payload);
+      onChange(approval.payload);
+      if (approval.changed) {
+        // Redaction altered content the user hasn't seen — show the real wire
+        // bytes and require a second, informed approval (doc 13 §3).
+        setSendError(
+          `Redaction changed the content — review the updated items, then press ${
+            isMcpPull ? "Approve for Claude" : "Send"
+          } again.`,
+        );
+        return;
+      }
+      if (isMcpPull) {
+        // Approved: Claude Desktop's next `aperture_get_context` call receives
+        // exactly these bytes (audited core-side). Nothing is pushed from here.
+        onClose();
+        return;
+      }
+      // Transmit the approved object (hash-bound core-side, doc 03 §4).
+      const result = await previewSend(approval.payload.payload_id);
       onClose(result);
+    } catch (e) {
+      // A failed transport leaves the approval retryable core-side; say so
+      // instead of dead-ending silently.
+      setSendError(String(e));
     } finally {
       setSending(false);
     }
@@ -167,9 +201,10 @@ export function ContextPreviewPanel({ payload, onChange, onClose }: Props) {
       ref={panelRef}
       tabIndex={-1}
       onKeyDown={onKeyDown}
+      style={drag.style}
     >
       {/* 1. Intent (editable preset) */}
-      <header className="preview__head">
+      <header className="preview__head panel-handle" {...drag.handleProps}>
         <label className="preview__intent">
           <span>Intent</span>
           <select value={payload.intent} onChange={(e) => setIntent(e.target.value as Intent)}>
@@ -295,10 +330,21 @@ export function ContextPreviewPanel({ payload, onChange, onClose }: Props) {
             onClick={() => void send()}
             disabled={sending || payload.items.length === 0}
           >
-            {sending ? "Sending…" : "Send"}
+            {sending
+              ? isMcpPull
+                ? "Approving…"
+                : "Sending…"
+              : isMcpPull
+                ? "Approve for Claude"
+                : "Send"}
           </button>
         </div>
       </footer>
+      {sendError && (
+        <p className="preview__send-error" role="alert">
+          {sendError}
+        </p>
+      )}
     </div>
   );
 }

@@ -13,6 +13,7 @@ import App from "./App";
 import "./styles/design-tokens.css";
 import "./styles/bubble.css";
 import "./styles/privacy.css";
+import "./styles/dashboard.css";
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>

@@ -23,7 +23,7 @@ pub const OVERLAY_LABEL: &str = "overlay";
 /// A live, hit-testable bubble rectangle in physical (device) pixels, relative
 /// to its monitor's overlay window. The set of these is the ONLY region where
 /// the click-through window accepts input (doc 11 §2).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
 pub struct BubbleRect {
     pub x: i32,
     pub y: i32,
@@ -196,17 +196,10 @@ pub fn exclude_from_capture(window: &WebviewWindow) -> Result<(), OverlayError> 
     }
 }
 
-/// Re-enable hit-testing ONLY over the given live bubble rects (doc 11 §2). With
-/// an empty slice the overlay is fully click-through. The §7 watchdog asserts the
-/// inverse: a hit-test region with no visible bubble resets to full click-through.
-///
-/// Window-level granularity: `WS_EX_TRANSPARENT` is toggled off while any bubble
-/// is live (the WebView's own CSS `pointer-events` gates per-rect input — the UI
-/// agent owns that half), and back on when none are.
-pub fn set_hit_test_rects(
-    window: &WebviewWindow,
-    rects: &[BubbleRect],
-) -> Result<(), OverlayError> {
+/// Flip only the `WS_EX_TRANSPARENT` bit — the raw click-through switch, with no
+/// focus side effect. The cursor poller (`hit_test`) drives this at bubble-hover
+/// granularity; [`set_interactive`] layers focus on top for modal surfaces.
+pub fn set_transparent(window: &WebviewWindow, transparent: bool) -> Result<(), OverlayError> {
     #[cfg(windows)]
     unsafe {
         use windows::Win32::Foundation::HWND;
@@ -218,10 +211,10 @@ pub fn set_hit_test_rects(
             .map_err(|e| OverlayError::Win32(e.to_string()))?;
         let hwnd = HWND(hwnd.0);
         let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let new_style = if rects.is_empty() {
-            style | (WS_EX_TRANSPARENT.0 as isize) // full click-through (watchdog reset)
+        let new_style = if transparent {
+            style | (WS_EX_TRANSPARENT.0 as isize)
         } else {
-            style & !(WS_EX_TRANSPARENT.0 as isize) // bubbles live: WebView hit-tests
+            style & !(WS_EX_TRANSPARENT.0 as isize)
         };
         if new_style != style {
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
@@ -230,9 +223,23 @@ pub fn set_hit_test_rects(
     }
     #[cfg(not(windows))]
     {
-        let _ = (window, rects);
+        let _ = (window, transparent);
         Err(OverlayError::Win32("windows-only".into()))
     }
+}
+
+/// Re-enable hit-testing ONLY over the given live bubble rects (doc 11 §2). With
+/// an empty slice the overlay is fully click-through. The §7 watchdog asserts the
+/// inverse: a hit-test region with no visible bubble resets to full click-through.
+///
+/// Window-level granularity: `WS_EX_TRANSPARENT` is toggled off while any bubble
+/// is live (the WebView's own CSS `pointer-events` gates per-rect input — the UI
+/// agent owns that half), and back on when none are.
+pub fn set_hit_test_rects(
+    window: &WebviewWindow,
+    rects: &[BubbleRect],
+) -> Result<(), OverlayError> {
+    set_transparent(window, rects.is_empty())
 }
 
 /// Make the overlay window accept input (or go back to click-through).

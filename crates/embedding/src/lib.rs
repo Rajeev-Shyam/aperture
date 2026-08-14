@@ -161,7 +161,7 @@ impl Embedder for NomicEmbedder {
         } else {
             format!("{DOC_PREFIX}{text}")
         };
-        let mut model = self.model.lock().expect("embedder lock");
+        let model = self.model.lock().expect("embedder lock");
         let mut out = model
             .embed(vec![input], None)
             .map_err(|e| EmbedError::Inference(e.to_string()))?;

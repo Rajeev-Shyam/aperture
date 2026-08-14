@@ -29,6 +29,13 @@ pub const CAPTURE_INDICATOR: &str = "capture_indicator";
 pub const VOICE_SURFACE: &str = "voice_surface";
 /// Bubble lifecycle transition (queued/entering/idle/clicked/dismissed/expired, doc 11 §3).
 pub const SUGGESTION_LIFECYCLE: &str = "suggestion_lifecycle";
+/// Ask the primary overlay's WebView to open the Dashboard (tray click, second
+/// app launch). Targeted — never broadcast: every monitor runs its own React
+/// root, and a broadcast would open one dashboard per monitor.
+pub const DASHBOARD_OPEN: &str = "dashboard_open";
+/// Ask the primary overlay to open the Context-Preview panel for a payload the
+/// core staged (the MCP gated-search flow, ADR-037). Carries the full payload.
+pub const PREVIEW_REQUEST: &str = "preview_request";
 
 /// The capture-indicator state the overlay/tray render (doc 12 §6).
 /// `Releasing` covers the <3 s toggle-OFF window (doc 12 §6 step 5). Internal
@@ -42,7 +49,9 @@ pub enum CaptureIndicator {
 
 /// The `capture_indicator` wire payload (matches the UI's `CaptureIndicatorEvent`):
 /// a boolean plus an optional one-line status (e.g. the releasing detail).
-#[derive(Debug, Clone, Serialize)]
+/// Deserialize: the tray mirrors this same channel (`tray.rs`) so the menu's
+/// capture checkmark can never disagree with the overlay dot.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct CaptureIndicatorPayload {
     pub capturing: bool,
     pub detail: Option<String>,
@@ -101,6 +110,22 @@ pub fn emit_capture_indicator(app: &AppHandle, state: CaptureIndicator) -> tauri
 /// source-agnostic JSON value the UI agent's voice components consume.
 pub fn emit_voice_surface(app: &AppHandle, payload: &serde_json::Value) -> tauri::Result<()> {
     app.emit(VOICE_SURFACE, payload)
+}
+
+/// Ask the primary overlay to open the Dashboard (tray left-click / menu item,
+/// or a second instance launch handing off to the running one).
+pub fn emit_dashboard_open(app: &AppHandle) -> tauri::Result<()> {
+    app.emit_to(crate::overlay::OVERLAY_LABEL, DASHBOARD_OPEN, ())
+}
+
+/// Ask the primary overlay to open the preview panel on a core-staged payload
+/// (MCP gated search, ADR-037): the user must SEE what Claude asked for before
+/// anything can be approved, and approval releases it via `aperture_get_context`.
+pub fn emit_preview_request(
+    app: &AppHandle,
+    payload: &aperture_contracts::ContextPayload,
+) -> tauri::Result<()> {
+    app.emit_to(crate::overlay::OVERLAY_LABEL, PREVIEW_REQUEST, payload)
 }
 
 /// Emit a suggestion-lifecycle transition (doc 11 §3). The matching

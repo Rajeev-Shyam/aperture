@@ -127,7 +127,20 @@ export interface UiSettings {
   max_concurrent_bubbles: number;
   bubble_dwell_sec: number;
   max_glass_surfaces: number;
+  /** Where the HUD cluster (indicator + buttons) is anchored — user-draggable. */
+  hud_anchor?: HudAnchor;
 }
+
+/** The 8 snap positions for the HUD cluster (4 corners + 4 edge midpoints). */
+export type HudAnchor =
+  | "top-left"
+  | "top-center"
+  | "top-right"
+  | "center-left"
+  | "center-right"
+  | "bottom-left"
+  | "bottom-center"
+  | "bottom-right";
 
 export interface Settings {
   ui?: UiSettings;
@@ -252,19 +265,32 @@ export function requestPreview(intent: Intent, seedActionRef?: string): Promise<
   return invoke<ContextPayload>("request_preview", { intent, seedActionRef: seedActionRef ?? null });
 }
 
-/** Set the in-process approval flag on a previewed payload (contract law: ONLY
- *  the preview panel may do this — doc 15 §2b). Sends the exact edited object. */
-export function previewSetApproved(payload: ContextPayload): Promise<void> {
-  // Contract law (doc 15 §2b): the sole setter of `user_approved`, which it always
-  // flips true. Sends just the id; the core marks the in-process payload approved.
-  return invoke("preview_set_approved", { payloadId: payload.payload_id });
+/** The approval gate's answer: the core-owned payload after the edits were
+ *  synced and RE-REDACTED. `changed: true` means redaction altered content the
+ *  user has not seen — approval was refused; re-render and ask again. */
+export interface ApprovalResult {
+  payload: ContextPayload;
+  changed: boolean;
 }
 
-/** Transmit the EXACT serialized payload bytes to the gateway (doc 11 §4,
- *  doc 03 §4 — SHA-256 of the wire bytes is audit-logged as `cloud_send`).
- *  Only the gateway, behind this command, may emit to the network. */
-export function previewSend(payload: ContextPayload): Promise<StructuredSuggestions> {
-  return invoke<StructuredSuggestions>("preview_send", { payload });
+/** Approve a previewed payload (contract law: ONLY the preview panel may do
+ *  this — doc 15 §2b). Sends the exact edited object; the core syncs it,
+ *  re-runs redaction, and binds the approval to a content hash. */
+export function previewSetApproved(payload: ContextPayload): Promise<ApprovalResult> {
+  return invoke<ApprovalResult>("preview_set_approved", { payload });
+}
+
+/** Transmit the approved payload (doc 11 §4, doc 03 §4 — SHA-256 of the wire
+ *  bytes is audit-logged as `cloud_send`). Takes only the id: the bytes that
+ *  ship are the core-owned object bound at approval — preview == wire. */
+export function previewSend(payloadId: string): Promise<StructuredSuggestions> {
+  return invoke<StructuredSuggestions>("preview_send", { payloadId });
+}
+
+/** Reset this window's interactivity to click-through. The UI root calls this
+ *  once on mount so a reload can never orphan a modal override. */
+export function resetOverlayInteractivity(): Promise<void> {
+  return invoke("reset_overlay_interactivity");
 }
 
 /** PTT pressed (doc 07): begin holding the mic. */
@@ -277,14 +303,124 @@ export function voicePttUp(): Promise<void> {
   return invoke("voice_ptt_up");
 }
 
+/** Confirm-chip Run (doc 07 §4.4): re-issue the confirmed transcript through
+ *  the query path at confidence 1.0. Never re-stores the utterance. */
+export function voiceRunTranscript(transcript: string): Promise<void> {
+  return invoke("voice_run_transcript", { transcript });
+}
+
+/** Cancel a preview: the core drops its in-process session — zero residue
+ *  (doc 13 §3). Call on panel close without Send. */
+export function previewCancel(payloadId: string): Promise<void> {
+  return invoke("preview_cancel", { payloadId });
+}
+
 /** Read settings (the `ui`/`reasoning` blocks at minimum). */
 export function getSettings(): Promise<Settings> {
   return invoke<Settings>("get_settings");
 }
 
+// ---------------------------------------------------------------------------
+// Dashboard — read-only views over the local history ("what has it captured,
+// what does it know"). Local DB only; nothing here egresses.
+// ---------------------------------------------------------------------------
+
+/** Aggregate counts + storage facts for the dashboard Overview. */
+export interface DashboardStats {
+  events: number;
+  ocr_texts: number;
+  embeddings: number;
+  patterns: number;
+  suggestions: number;
+  connector_states: number;
+  voice_utterances: number;
+  sessions: number;
+  first_event_ts: number | null;
+  last_event_ts: number | null;
+  db_bytes: number;
+  db_encrypted: boolean;
+  capture_enabled: boolean;
+  voice_opt_in: boolean;
+}
+
+export function dashboardStats(): Promise<DashboardStats> {
+  return invoke<DashboardStats>("dashboard_stats");
+}
+
+/** One history row: an event joined with its screen context (OCR excerpt). */
+export interface HistoryEvent {
+  id: number;
+  ts: number;
+  type: string;
+  app: string | null;
+  process: string | null;
+  title: string | null;
+  session_id: number | null;
+  redaction_flags: number;
+  payload: Record<string, unknown> | null;
+  ocr: string | null;
+  vlm_summary: string | null;
+}
+
+export function listEvents(opts?: {
+  limit?: number;
+  kind?: string;
+  search?: string;
+}): Promise<HistoryEvent[]> {
+  return invoke<HistoryEvent[]>("list_events", {
+    limit: opts?.limit ?? null,
+    kind: opts?.kind ?? null,
+    search: opts?.search ?? null,
+  });
+}
+
+/** One mined pattern row (doc 08). */
+export interface PatternRow {
+  id: number;
+  signature: string | null;
+  n: number | null;
+  support: number | null;
+  confidence: number | null;
+  last_seen: number | null;
+  dismiss_decay: number | null;
+  muted_until: number | null;
+}
+
+export function listPatterns(limit?: number): Promise<PatternRow[]> {
+  return invoke<PatternRow[]>("list_patterns", { limit: limit ?? null });
+}
+
+/** One suggestion lifecycle row — includes resolved/expired ones. */
+export interface SuggestionHistoryRow {
+  id: number;
+  title: string | null;
+  glyph: string | null;
+  confidence: number | null;
+  state: string | null;
+  shown_ts: number | null;
+  resolved_ts: number | null;
+  outcome: string | null;
+  useful_rating: string | null;
+  source: string | null;
+}
+
+export function listSuggestionHistory(limit?: number): Promise<SuggestionHistoryRow[]> {
+  return invoke<SuggestionHistoryRow[]>("list_suggestion_history", { limit: limit ?? null });
+}
+
 /** Persist a (partial) settings patch. */
 export function setSettings(patch: Settings): Promise<void> {
   return invoke("set_settings", { patch });
+}
+
+/** Is start-at-login registered with Windows (the registry truth)? */
+export function getAutostart(): Promise<boolean> {
+  return invoke<boolean>("get_autostart");
+}
+
+/** Register/unregister start-at-login; the choice persists as `ui.autostart`. */
+export function setAutostart(on: boolean): Promise<void> {
+  return invoke("set_autostart", { on });
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +474,21 @@ export interface AuditRow {
  *  on mount and `false` on unmount, or its buttons silently do nothing. */
 export function setOverlayInteractive(interactive: boolean): Promise<void> {
   return invoke("set_overlay_interactive", { interactive });
+}
+
+/** One interactive region, physical px relative to this window (doc 11 §2). */
+export interface HitRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/** Publish the overlay's interactive regions. The core's cursor poller makes
+ *  the window accept input only while the cursor is inside one of these —
+ *  everywhere else stays click-through. Empty array = fully click-through. */
+export function setHitTestRects(rects: HitRect[]): Promise<void> {
+  return invoke("set_hit_test_rects", { rects });
 }
 
 /** Current consent + whether the DB is really encrypted (doc 13 §6, §8). */
@@ -411,5 +562,15 @@ export const onVoiceSurface = (h: (e: VoiceSurfaceEvent) => void) =>
 
 export const onSuggestionLifecycle = (h: (e: SuggestionLifecycleEvent) => void) =>
   on<SuggestionLifecycleEvent>("suggestion_lifecycle", h);
+
+/** `"dashboard_open"` — the tray (left-click / menu) or a second app launch
+ *  asks this window to open the Dashboard. Targeted at the primary overlay. */
+export const onDashboardOpen = (h: () => void) => on<null>("dashboard_open", () => h());
+
+/** `"preview_request"` — the core staged a payload (MCP gated search, ADR-037)
+ *  and asks this window to open the preview panel on it. The user's explicit
+ *  "Approve for Claude" is the ONLY way its content ever leaves. */
+export const onPreviewRequest = (h: (p: ContextPayload) => void) =>
+  on<ContextPayload>("preview_request", h);
 
 export type { UnlistenFn };
