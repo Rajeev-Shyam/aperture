@@ -252,13 +252,32 @@ impl VoiceSubsystem {
         // 1. VAD trim + accidental-tap gate (doc 07 §2): a sub-300 ms tap stores
         //    nothing (no real utterance occurred).
         let trimmed = vad::trim(&pcm).map_err(|e| VoiceError::Stt(e.to_string()))?;
+        // Always log what the mic actually delivered — a silent discard is
+        // indistinguishable from "voice is broken" without these numbers
+        // (user report 2026-08-14: pill showed, then nothing, no logs).
+        let peak = pcm
+            .samples
+            .iter()
+            .map(|s| (*s as i32).unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        tracing::info!(
+            captured_ms = pcm.duration_ms(),
+            speech_ms = trimmed.speech_ms,
+            peak_pcm = peak,
+            "utterance captured (doc 07 §2)"
+        );
         if trimmed.is_accidental_tap() {
             return Ok(UtteranceOutcome::DiscardedTap);
         }
 
         // 2. STT GpuJob (priority 100, never cancellable) via the injected scheduler
         //    — CPU fallback is the orchestrator's call, not ours (doc 07 §3).
-        let job = stt_job::build(trimmed.speech.to_wav());
+        //    Quiet-mic gain first (VAD already judged the raw levels): Whisper
+        //    gets near-full-scale audio, not this laptop mic's ~1.5 % FS.
+        let mut speech = trimmed.speech;
+        speech.normalize_peak(0.9);
+        let job = stt_job::build(speech.to_wav());
         let output = self
             .scheduler
             .enqueue(job)

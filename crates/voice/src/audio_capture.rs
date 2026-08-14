@@ -63,6 +63,33 @@ impl PcmBuffer {
     }
 }
 
+impl PcmBuffer {
+    /// Amplify (never attenuate) so the peak reaches `target` (fraction of full
+    /// scale). Quiet mics — the dev laptop peaks at ~1.5 % FS for normal speech
+    /// (2026-08-14) — otherwise hand Whisper ~9-bit audio. Run AFTER VAD (the
+    /// gate reasons about the raw levels), and the gain is capped so ambient
+    /// noise cannot be blown up into a phantom utterance.
+    pub fn normalize_peak(&mut self, target: f32) {
+        const MAX_GAIN: f32 = 40.0;
+        let peak = self
+            .samples
+            .iter()
+            .map(|s| (*s as i32).unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        if peak == 0 {
+            return;
+        }
+        let gain = ((target * i16::MAX as f32) / peak as f32).clamp(1.0, MAX_GAIN);
+        if gain <= 1.0 {
+            return;
+        }
+        for s in &mut self.samples {
+            *s = ((*s as f32) * gain).clamp(i16::MIN as f32 + 1.0, i16::MAX as f32) as i16;
+        }
+    }
+}
+
 /// Clamp + scale one `f32` sample in `[-1, 1]` to `i16` PCM.
 fn f32_to_i16(s: f32) -> i16 {
     (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16

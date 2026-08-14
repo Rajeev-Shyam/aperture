@@ -293,7 +293,14 @@ fn finish_utterance(
     emit(app, serde_json::json!({ "surface": "thinking" }));
     match rt.block_on(vs.ptt_up()) {
         Ok(UtteranceOutcome::DiscardedTap) => {
-            emit(app, serde_json::json!({ "surface": "hidden" }));
+            // NOT silent (user report 2026-08-14): a held-and-spoken press that
+            // yields no detected speech must SAY so, or voice looks broken.
+            emit(app, serde_json::json!({
+                "surface": "empty",
+                "message": "Didn't catch that — hold the keys, speak, then release. \
+                            (If you spoke, check Windows mic permissions for desktop \
+                            apps and the default microphone.)",
+            }));
         }
         Ok(UtteranceOutcome::ConfirmChip { transcript }) => {
             remember(deps, &transcript);
@@ -320,6 +327,9 @@ fn finish_utterance(
             }));
         }
         Ok(UtteranceOutcome::StoredSilently) => {
+            // Telemetry-only utterances are UI-silent by design (doc 07 §4.3),
+            // but never LOG-silent — see the user report above.
+            tracing::info!("utterance stored silently (telemetry intent)");
             emit(app, serde_json::json!({ "surface": "hidden" }));
         }
         Err(e) => {
