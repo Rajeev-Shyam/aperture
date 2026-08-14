@@ -72,45 +72,63 @@ struct CompiledRule {
 /// The compiled, in-memory exclusion list (doc 05 §4). Built from
 /// [`ExclusionRule`]s loaded from the encrypted settings store (doc 13 §6).
 /// Cloned cheaply (shared) into the sampler and the normalizer so both can gate.
+///
+/// Interior-mutable since the M9 follow-up: every clone shares ONE swappable
+/// rule set, so [`replace`](Self::replace) (the Activity & Privacy view's
+/// add/disable path) takes effect on the next frame/event in every holder —
+/// no restart. Readers take a snapshot `Arc` per check; the write lock is held
+/// only for the pointer swap.
 #[derive(Clone, Default)]
 pub struct ExclusionList {
-    rules: Arc<Vec<CompiledRule>>,
+    rules: Arc<std::sync::RwLock<Arc<Vec<CompiledRule>>>>,
 }
 
 impl std::fmt::Debug for ExclusionList {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ExclusionList({} rules)", self.rules.len())
+        write!(f, "ExclusionList({} rules)", self.len())
     }
 }
 
-impl ExclusionList {
-    /// Compile a set of rules into a matchable list (doc 05 §4). Pre-compiles each
-    /// regex; an invalid pattern drops that matcher with a warning (fail-open on a
-    /// single bad rule, never fail-closed for the whole list).
-    pub fn compile(rules: Vec<ExclusionRule>) -> Self {
-        let compiled = rules
-            .into_iter()
-            .map(|r| {
-                let compile = |src: Option<&String>, kind: &str| -> Option<regex::Regex> {
-                    let src = src?;
-                    match regex::RegexBuilder::new(src).case_insensitive(true).build() {
-                        Ok(re) => Some(re),
-                        Err(e) => {
-                            tracing::warn!(rule = %r.label, kind, %e, "invalid exclusion regex dropped");
-                            None
-                        }
+/// Compile rules, dropping (with a warning) any matcher whose regex is invalid
+/// (fail-open on a single bad rule, never fail-closed for the whole list).
+fn compile_rules(rules: Vec<ExclusionRule>) -> Vec<CompiledRule> {
+    rules
+        .into_iter()
+        .map(|r| {
+            let compile = |src: Option<&String>, kind: &str| -> Option<regex::Regex> {
+                let src = src?;
+                match regex::RegexBuilder::new(src).case_insensitive(true).build() {
+                    Ok(re) => Some(re),
+                    Err(e) => {
+                        tracing::warn!(rule = %r.label, kind, %e, "invalid exclusion regex dropped");
+                        None
                     }
-                };
-                CompiledRule {
-                    title_regex: compile(r.title_regex.as_ref(), "title_regex"),
-                    url_pattern: compile(r.url_pattern.as_ref(), "url_pattern"),
-                    process: r.process.map(|p| p.to_ascii_lowercase()),
-                    window_class: r.window_class,
-                    label: r.label,
                 }
-            })
-            .collect();
-        Self { rules: Arc::new(compiled) }
+            };
+            CompiledRule {
+                title_regex: compile(r.title_regex.as_ref(), "title_regex"),
+                url_pattern: compile(r.url_pattern.as_ref(), "url_pattern"),
+                process: r.process.map(|p| p.to_ascii_lowercase()),
+                window_class: r.window_class,
+                label: r.label,
+            }
+        })
+        .collect()
+}
+
+impl ExclusionList {
+    /// Compile a set of rules into a matchable list (doc 05 §4).
+    pub fn compile(rules: Vec<ExclusionRule>) -> Self {
+        Self { rules: Arc::new(std::sync::RwLock::new(Arc::new(compile_rules(rules)))) }
+    }
+
+    /// Recompile and swap the shared rule set — visible to every clone (the
+    /// capture sampler + normalizer) on their next check. The caller owns the
+    /// fail-open/fail-closed policy: on a source read error, DON'T call this —
+    /// keeping the previous list beats silently dropping protections.
+    pub fn replace(&self, rules: Vec<ExclusionRule>) {
+        let compiled = Arc::new(compile_rules(rules));
+        *self.rules.write().unwrap_or_else(|p| p.into_inner()) = compiled;
     }
 
     /// The shipped defaults: **EMPTY** (ADR-029/Q15). Sensitive-app protection
@@ -120,14 +138,19 @@ impl ExclusionList {
         Self::default()
     }
 
+    /// Snapshot the current compiled set (one atomic pointer clone per check).
+    fn snapshot(&self) -> Arc<Vec<CompiledRule>> {
+        self.rules.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
     /// Rule count (diagnostics).
     pub fn len(&self) -> usize {
-        self.rules.len()
+        self.snapshot().len()
     }
 
     /// True when no rules are loaded.
     pub fn is_empty(&self) -> bool {
-        self.rules.is_empty()
+        self.snapshot().is_empty()
     }
 
     /// The core predicate (doc 05 §4, doc 13 §4): is this context excluded?
@@ -140,7 +163,7 @@ impl ExclusionList {
         title: Option<&str>,
         url: Option<&str>,
     ) -> ExclusionVerdict {
-        for rule in self.rules.iter() {
+        for rule in self.snapshot().iter() {
             let hit = matches_rule(rule, process, window_class, title, url);
             if hit {
                 let mut flags = redaction_flags::EXCLUDED;
@@ -190,6 +213,30 @@ fn matches_rule(
         }
     }
     false
+}
+
+/// Map durable `exclusion_list` rows — `(id, match_kind, pattern, enabled)` —
+/// into [`ExclusionRule`]s, skipping disabled rows and warning on an unknown
+/// kind. ONE definition shared by the startup compile and the hot-reload path
+/// (`add_exclusion`/`set_exclusion`), so the two cannot drift.
+pub fn rules_from_rows(rows: Vec<(i64, String, String, bool)>) -> Vec<ExclusionRule> {
+    rows.into_iter()
+        .filter(|(_, _, _, enabled)| *enabled)
+        .filter_map(|(_, kind, pattern, _)| {
+            let mut rule = ExclusionRule { label: pattern.clone(), ..Default::default() };
+            match kind.as_str() {
+                "process" => rule.process = Some(pattern),
+                "window_class" => rule.window_class = Some(pattern),
+                "title_regex" => rule.title_regex = Some(pattern),
+                "url_pattern" => rule.url_pattern = Some(pattern),
+                other => {
+                    tracing::warn!(kind = other, "unknown exclusion match_kind ignored");
+                    return None;
+                }
+            }
+            Some(rule)
+        })
+        .collect()
 }
 
 /// Validate one `(match_kind, pattern)` pair BEFORE it is persisted (doc 13 §4).

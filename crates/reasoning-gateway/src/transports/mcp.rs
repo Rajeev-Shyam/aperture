@@ -36,9 +36,70 @@ pub const TOOL_GET_CONTEXT: &str = "aperture_get_context";
 pub const TOOL_LIST_RECENT: &str = "aperture_list_recent";
 /// Tool name: the suggestions return channel.
 pub const TOOL_SUBMIT_SUGGESTIONS: &str = "aperture_submit_suggestions";
+/// Tool name: the **gated** history search (ADR-037): results are staged as a
+/// preview the user approves on screen before anything returns.
+pub const TOOL_SEARCH_HISTORY: &str = "aperture_search_history";
 
-/// The MCP server executable Claude Desktop launches for Aperture. // [VERIFY] name.
+/// The local named pipe bridging the `aperture-mcp` stdio binary (spawned by
+/// Claude Desktop) to the RUNNING app, where the approval gate lives.
+pub const MCP_PIPE_NAME: &str = r"\\.\pipe\aperture-mcp-v1";
+
+/// The MCP server executable Claude Desktop launches for Aperture. The startup
+/// registration passes the resolved absolute path instead (see `register_with_command`).
 const MCP_SERVER_COMMAND: &str = "aperture-mcp";
+
+/// The MCP `tools/list` descriptors — the single source of truth for the tool
+/// surface, shared by the stdio binary. Kept static: the pipe only carries calls.
+pub fn tool_descriptors() -> serde_json::Value {
+    serde_json::json!([
+        {
+            "name": TOOL_GET_CONTEXT,
+            "description": "Fetch one user-approved Aperture context payload by id. The user must \
+                            first approve the payload in Aperture's preview panel; until then this \
+                            returns a waiting notice. Every returned payload is audit-logged.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "payload_id": { "type": "string", "description": "The payload id shown in Aperture's preview / handoff prompt." }
+                },
+                "required": ["payload_id"]
+            }
+        },
+        {
+            "name": TOOL_LIST_RECENT,
+            "description": "List Aperture's currently staged context payloads — metadata only \
+                            (id, intent, created, approved). Content never crosses here.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": TOOL_SEARCH_HISTORY,
+            "description": "Search the user's local Aperture history. Results are redacted, \
+                            exclusion-filtered, and STAGED for the user to approve on screen — \
+                            nothing returns until they approve; fetch the approved results with \
+                            aperture_get_context.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search terms (matched against window titles, apps, and on-screen text)." }
+                },
+                "required": ["query"]
+            }
+        },
+        {
+            "name": TOOL_SUBMIT_SUGGESTIONS,
+            "description": "Return structured suggestions to Aperture ({suggestions:[{title, \
+                            connector_type, reconstruct_payload, rationale}], answer_text}). \
+                            They are schema-checked and connector-validated; only connectors act.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "suggestions": { "type": "array" },
+                    "answer_text": { "type": "string" }
+                }
+            }
+        }
+    ])
+}
 
 /// Pull transport: the local MCP (stdio, JSON-RPC 2.0) server bridging Claude
 /// Desktop (doc 09 §3).
@@ -58,6 +119,13 @@ impl McpTransport {
     /// read the existing config (or start empty), merge our entry, write it back.
     /// // [VERIFY] whether a Desktop restart is required to pick it up.
     pub fn register(&self) -> Result<(), TransportError> {
+        self.register_with_command(MCP_SERVER_COMMAND)
+    }
+
+    /// [`Self::register`] with an explicit command path — the composition root
+    /// passes the resolved absolute `aperture-mcp.exe` path so the entry
+    /// survives installs/moves (re-registering each launch repairs it).
+    pub fn register_with_command(&self, command: &str) -> Result<(), TransportError> {
         let path = std::path::Path::new(&self.config_path);
         let existing = if path.exists() {
             let raw = std::fs::read_to_string(path).map_err(|e| TransportError::Other(e.to_string()))?;
@@ -71,7 +139,7 @@ impl McpTransport {
         } else {
             serde_json::json!({})
         };
-        let merged = with_aperture_registered(existing, MCP_SERVER_COMMAND)?;
+        let merged = with_aperture_registered(existing, command)?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| TransportError::Other(e.to_string()))?;
         }

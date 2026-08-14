@@ -100,6 +100,9 @@ export function VoiceSurfaces({ event, onAskClaude, onDismiss, onRun }: Props) {
     case "answer":
       return (
         <div className="voice voice--answer surface-glass surface-interactive" role="dialog">
+          <button className="btn btn--icon voice__close" aria-label="Dismiss" onClick={onDismiss}>
+            ×
+          </button>
           <div className="voice__answer-title">{event.title}</div>
           {event.source && <div className="voice__answer-source">{event.source}</div>}
           <div className="voice__answer-actions">
@@ -124,10 +127,14 @@ export function VoiceSurfaces({ event, onAskClaude, onDismiss, onRun }: Props) {
       );
 
     case "empty":
-      // Honest empty state when retrieval finds nothing (doc 07 §5).
+      // Honest empty/notice state (doc 07 §5). Opaque, not glass: this often
+      // carries an error the user must be able to READ — and always closable.
       return (
-        <div className="voice voice--chip surface-glass surface-interactive" role="status">
+        <div className="voice voice--chip voice--notice surface-opaque surface-interactive" role="status">
           <span className="voice__empty">{event.message}</span>
+          <button className="btn btn--icon voice__close" aria-label="Dismiss" onClick={onDismiss}>
+            ×
+          </button>
         </div>
       );
   }

@@ -60,3 +60,7 @@ Built + CPU-tested in `crates/reasoning-gateway`:
 Full session detail: `docs/handoff/session-bridge-2026-07-08-m6-m8.md`.
 
 > **R2 amendments applied** (see docs/19–21): ADR-025 (MCP-primary transport), ADR-035 (validate-on-click), ADR-036 (diagnostics via gateway), ADR-037 (gated `aperture_search_history`); Q83 (fallback UX), Q84 (cache layout).
+
+## Implementation status (2026-08-13) — gateway wired into the shell
+
+`main::build_gateway` composes the settings-ordered transports (MCP → CLI → API; model id + endpoint + headers all from settings, NG8) with the DB-backed `AuditLog` via `Gateway::with_audit`. The preview commands are real, with a content-bound gate hardened by the 2026-08-13 review: `preview_set_approved` syncs the panel's edits into the core-owned session, re-runs redaction (refusing approval when it changes anything the user hasn't seen), and records a SHA-256 over the canonical bytes; `preview_send` takes only the payload id, re-verifies the hash, ships the CORE object, and restores the session on transport failure so Send is retryable. `preview_cancel` drops the session (zero residue). Deferred: the MCP stdio server + `aperture_get_context` gate; the gated `aperture_search_history` UX decision. Full detail: `docs/handoff/session-bridge-2026-08-13-v1-wiring.md`.

@@ -3,7 +3,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Core permissions for the Aperture overlay window: window control, event channels, app lifecycle. No network/shell/fs surface (two-emitter gate, doc 13 §2).",
-  "windows": ["overlay"],
+  "windows": ["overlay", "overlay-*"],
   "permissions": [
     "core:default",
     "core:app:default",

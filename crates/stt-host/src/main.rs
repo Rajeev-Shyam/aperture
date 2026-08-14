@@ -34,12 +34,14 @@
 //! card (doc 07 §3). CPU fallback = **whisper.cpp base (default) / tiny** when the
 //! GPU is unavailable or STT is swapped out (doc 07 §3, §6) — slower but functional.
 //!
-//! ## Status (M6, best-effort)
+//! ## Status
 //! The child supervision, loopback HTTP surface, kill-on-drop, and response parse
 //! are implemented; [`parse_transcription`] / [`is_wav`] are pure + unit-tested.
-//! The child wire contract (whisper.cpp `/inference` multipart shape, health probe,
-//! GPU flags) is **UNVERIFIED** and [VERIFY]-tagged — it is confirmed on the RTX
-//! box with real weights at the SC4 gate (doc 04 §9; cold-load < 2 s).
+//! The child wire contract (whisper.cpp `/inference` multipart, `verbose_json`
+//! confidence, health probe) was **verified live 2026-08-14** against
+//! whisper.cpp v1.9.2 `whisper-server` (CPU+BLAS build, ggml-base.en): a real
+//! utterance round-tripped at 0.93 confidence in ~0.8 s. The GPU
+//! (faster-whisper / CUDA) flags remain [VERIFY] — deferred with the SC4 gate.
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;

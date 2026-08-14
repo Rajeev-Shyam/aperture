@@ -224,7 +224,9 @@ export function FirstRunConsent({ dbEncrypted, onDone }: Props) {
             ignored. You can install it later.
           </p>
           <p className="firstrun__note">
-            Install from <code>extension/</code> — see its README for the unpacked-load steps.
+            The extension ships in the <code>extension</code> folder where Aperture is
+            installed: open <code>chrome://extensions</code>, turn on Developer mode, click
+            "Load unpacked", and pick that folder.
           </p>
           <div className="firstrun__actions">
             <button className="btn" onClick={advance} disabled={busy}>

@@ -530,8 +530,38 @@ impl JobRunner for SidecarRunner {
                     resp.json().await.map_err(|_| JobError::SidecarDown)?;
                 Ok(JobOutput::Vlm(value))
             }
-            // STT execution is M6 (doc 16); admission/routing already work.
-            GpuJobKind::Stt { .. } => Err(JobError::SidecarDown),
+            GpuJobKind::Stt { wav } => {
+                // stt-host contract (crates/stt-host): POST /transcribe with the
+                // 16 kHz mono WAV; the response mirrors JobOutput::Stt. STT is
+                // never cancellable (doc 12 §3) — the deadline is the scheduler's.
+                let resp = self
+                    .client
+                    .post(format!("{endpoint}/transcribe"))
+                    .json(&serde_json::json!({ "wav": wav }))
+                    .send()
+                    .await
+                    .map_err(|_| JobError::SidecarDown)?;
+                if !resp.status().is_success() {
+                    return Err(JobError::SidecarDown);
+                }
+                let value: serde_json::Value =
+                    resp.json().await.map_err(|_| JobError::SidecarDown)?;
+                Ok(JobOutput::Stt {
+                    transcript: value
+                        .get("transcript")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    avg_token_confidence: value
+                        .get("avg_token_confidence")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(1.0) as f32,
+                    duration_ms: value
+                        .get("duration_ms")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32,
+                })
+            }
         }
     }
 }

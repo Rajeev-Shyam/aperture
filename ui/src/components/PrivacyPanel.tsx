@@ -28,6 +28,7 @@ import {
   type ExclusionKind,
   type ExclusionRow,
 } from "../lib/ipc";
+import { useDraggable } from "../state/useDraggable";
 import { useModalSurface } from "../state/useModalSurface";
 
 interface Props {
@@ -55,7 +56,11 @@ export function PrivacyPanel({ dbEncrypted, onClose }: Props) {
   const [error, setError] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   // Backs the `aria-modal` declaration below with the real contract.
-  const trapKeys = useModalSurface(rootRef);
+  // Non-exclusive: the panel's own rect makes it clickable; the rest of the
+  // screen stays click-through to the user's apps while it is open.
+  const trapKeys = useModalSurface(rootRef, { exclusive: false });
+  // Window-style drag by the header.
+  const drag = useDraggable(rootRef);
 
   const refresh = useCallback(async () => {
     try {
@@ -115,6 +120,7 @@ export function PrivacyPanel({ dbEncrypted, onClose }: Props) {
       aria-label="Activity and privacy"
       ref={rootRef}
       tabIndex={-1}
+      style={drag.style}
       onKeyDown={(e) => {
         if (e.key === "Escape") {
           e.preventDefault();
@@ -124,7 +130,7 @@ export function PrivacyPanel({ dbEncrypted, onClose }: Props) {
         trapKeys(e);
       }}
     >
-      <header className="privacy__head">
+      <header className="privacy__head panel-handle" {...drag.handleProps}>
         <h2>Activity &amp; Privacy</h2>
         <button className="btn btn--icon" aria-label="Close" onClick={onClose}>
           ×

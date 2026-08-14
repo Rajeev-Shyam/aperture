@@ -61,10 +61,13 @@ fn m9_encryption_status_is_reported_truthfully() {
         !db.is_encrypted(),
         "an in-memory DB is never encrypted; reporting otherwise would make the gate a lie"
     );
-    assert_eq!(
-        aperture_db::ENCRYPTION_AVAILABLE,
-        cfg!(feature = "sqlcipher"),
-        "the advertised capability must track the actual build"
+    // Implication, not equality: this crate's own `sqlcipher` feature must
+    // guarantee the capability, but cargo FEATURE UNIFICATION can also enable
+    // aperture-db's sqlcipher from elsewhere in the workspace (the app crate
+    // defaults it since 2026-08-14) without this crate's flag being set.
+    assert!(
+        !cfg!(feature = "sqlcipher") || aperture_db::ENCRYPTION_AVAILABLE,
+        "gates' sqlcipher feature must produce an encryption-capable db build"
     );
 
     if !aperture_db::ENCRYPTION_AVAILABLE {
@@ -182,7 +185,11 @@ fn m9_purged_content_is_not_recoverable_from_the_files_on_disk() {
     let now = 1_700_000_000_000i64;
     {
         // The handle stays open across the purge, exactly as the shell holds it.
-        let db = Db::open_encrypted(path.clone(), &[]).expect("open");
+        // Build-aware key: a sqlcipher build refuses an empty key by design
+        // (doc 13 §6), and with encryption in force the sentinel-scan below
+        // flips meaning — see the precondition branch.
+        let key: &[u8] = if aperture_db::ENCRYPTION_AVAILABLE { &[9u8; 32] } else { &[] };
+        let db = Db::open_encrypted(path.clone(), key).expect("open");
         for i in 0..400 {
             let ctx = aperture_db::ScreenContextInsert {
                 ocr_text: Some(format!("{SENTINEL} row {i} — sensitive captured text")),
@@ -193,13 +200,23 @@ fn m9_purged_content_is_not_recoverable_from_the_files_on_disk() {
                 .expect("write");
         }
 
-        // Sanity: the sentinel really is on disk before the purge, or the test
-        // would pass vacuously.
+        // Precondition, build-aware. Plaintext build: the sentinel must be
+        // findable on disk pre-purge or the scan below is vacuous. Encrypted
+        // build: the sentinel must be UNREADABLE on disk even BEFORE the purge
+        // — that is page encryption doing its job (doc 13 §6) — and the purge
+        // assertions below still run on top.
         let before: usize = ["", "-wal"]
             .iter()
             .map(|suffix| count_sentinel(&with_suffix(&path, suffix), SENTINEL))
             .sum();
-        assert!(before > 0, "precondition: the sentinel must be on disk before purging");
+        if aperture_db::ENCRYPTION_AVAILABLE {
+            assert_eq!(
+                before, 0,
+                "plaintext sentinel found inside an ENCRYPTED database's files (doc 13 §6)"
+            );
+        } else {
+            assert!(before > 0, "precondition: the sentinel must be on disk before purging");
+        }
 
         db.purge_all(now + 1_000, &RetentionPolicy::default()).expect("purge");
 

@@ -69,3 +69,10 @@ Overlay + surfaces in `ui/` + `src-tauri/src/overlay.rs`:
 Full session detail: `docs/handoff/session-bridge-2026-07-08-m6-m8.md`.
 
 > **R2 amendments applied** (see docs/19–21): ADR-026, ADR-039, ADR-040 · Q42, Q49, Q65, Q66, Q71, Q81.
+
+## Implementation status (2026-08-13) — hit-testing wired; dashboard + movable HUD
+
+- **§2 bubble hit-testing is real**: the UI publishes every `.surface-interactive` rect (`useHitTestRects`), and a ~30 Hz cursor poller (`src-tauri/src/hit_test.rs`) clears `WS_EX_TRANSPARENT` only while the cursor is inside one — bubbles/indicator/chips are clickable and the rest of the screen stays pass-through. Modal state is a per-window COUNT that composes with hover; `reset_overlay_interactivity` (App mount) heals a reloaded/crashed WebView; the poller caches the applied mechanism so a modal mounting under a hovering cursor still gets focus.
+- **Panels are non-exclusive** (`useModalSurface(ref, {exclusive:false})`): PrivacyPanel/ContextPreviewPanel/Dashboard are clickable via their own rects while clicks outside pass through to the user's apps. Only FirstRunConsent owns the screen.
+- **New surfaces**: the HUD cluster (indicator + ◎ dashboard + 🛡 privacy) drags to any corner/edge midpoint and persists in `ui.hud_anchor`; the Dashboard (opaque, sidebar+content) exposes Overview/History(search)/Patterns/Suggestions/Voice over four read-only commands.
+Full detail: `docs/handoff/session-bridge-2026-08-13-v1-wiring.md`.

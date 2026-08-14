@@ -41,14 +41,25 @@ uuid = { workspace = true }
 # Required: overlay.rs derives `#[derive(thiserror::Error)]` on OverlayError.
 thiserror = { workspace = true }
 
-# Tauri v2 runtime. Feature set is [VERIFY] at build time against the chosen
-# Tauri 2.x line (e.g. `tray-icon` for the toggle tray, `devtools` in dev).
-tauri = { version = "2", features = [] }  # [VERIFY] at build time
+# Tauri v2 runtime. `tray-icon` = the system tray (the overlay skips the
+# taskbar, so the tray is the app's only findable/quittable handle);
+# `image-ico` lets the tray reuse the bundled icon.ico.
+tauri = { version = "2", features = ["tray-icon", "image-ico"] }
+
+# Desktop-app plumbing: start-at-login ("it's just on when the laptop turns
+# on") + single-instance (autostart AND a shortcut double-click must not spawn
+# a second capture pipeline against the same DB).
+tauri-plugin-autostart = "2"
+tauri-plugin-single-instance = "2"
 
 # Win32 for the overlay: layered + transparent (click-through) window styles and
 # SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) so our own bubbles never enter
 # capture (doc 11 §2, doc 05 §2). [VERIFY] feature set + exact version.
 [target.'cfg(windows)'.dependencies]
+# Tray-icon visibility: Windows 11 buries new tray icons in the overflow
+# chevron; tray.rs promotes ours on first registration (NotifyIconSettings).
+# Same winreg line auto-launch already pulls in — no new tree.
+winreg = "0.10"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",   # WS_EX_LAYERED | WS_EX_TRANSPARENT, GetWindowLongPtr/SetWindowLongPtr
@@ -65,8 +76,10 @@ workspace = true
 tauri-build = { version = "2", features = [] }  # [VERIFY] at build time
 
 [features]
-# Default ON since 2026-07-05 — the model is fetched into models/ (see
-# crates/embedding). Build with --no-default-features to fall back to the
-# zero-download HashEmbedder dev path.
-default = ["nomic"]
+# Defaults ON: `nomic` since 2026-07-05 (weights fetched into models/, see
+# crates/embedding); `sqlcipher` since 2026-08-14 (at-rest encryption, doc 13
+# §6 — the M9 criterion; build host needs Strawberry Perl + NASM on PATH).
+# Build with --no-default-features for the zero-download plaintext dev path.
+default = ["nomic", "sqlcipher"]
 nomic = ["aperture-embedding/nomic"]
+sqlcipher = ["aperture-db/sqlcipher"]

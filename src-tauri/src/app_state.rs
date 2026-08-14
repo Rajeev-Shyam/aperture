@@ -16,10 +16,28 @@
 
 use std::sync::Arc;
 
+use aperture_capture::exclusion::ExclusionList;
 use aperture_capture::CaptureSubsystem;
 use aperture_db::Db;
 use aperture_event_bus::EventBus;
 use aperture_orchestration::OrchestratedSystem;
+use aperture_reasoning_gateway::preview::PreviewSession;
+use aperture_reasoning_gateway::Gateway;
+
+/// In-flight preview sessions (doc 13 §3), keyed by `payload_id`.
+///
+/// `request_preview` inserts; `preview_set_approved` marks; `preview_send`
+/// consumes; `preview_cancel` drops (zero residue). Sessions the UI abandoned
+/// without telling us are pruned by age on the next `request_preview`.
+#[derive(Default)]
+pub struct PreviewStore {
+    pub sessions: std::collections::HashMap<uuid::Uuid, PreviewSession>,
+    /// payload_id → SHA-256 of the approved payload's canonical serialization.
+    /// Approval is bound to CONTENT, not just the id: `preview_send` refuses a
+    /// session whose bytes no longer hash to what was approved (preview == wire,
+    /// doc 13 §3).
+    pub approved: std::collections::HashMap<uuid::Uuid, String>,
+}
 
 /// Injected into every `#[tauri::command]` via `tauri::State<AppState>`.
 ///
@@ -66,12 +84,33 @@ pub struct AppState {
     /// may run, and the writer of the `capture_toggle` audit trail. A tokio
     /// Mutex because every mutation persists to the encrypted DB.
     pub consent: Arc<tokio::sync::Mutex<aperture_privacy::consent::ConsentManager>>,
-    // gateway: wired at M7 (doc 09) — the ONLY field that may reach the network.
+
+    /// The reasoning gateway (doc 09) — the ONLY field that may reach the
+    /// network, and only via `preview_send` with an approved payload (doc 13 §2).
+    /// Carries the DB-backed `AuditLog` via `Gateway::with_audit`.
+    pub gateway: Arc<Gateway>,
+
+    /// In-flight preview sessions (doc 13 §3): built by `request_preview`,
+    /// approved by `preview_set_approved`, consumed by `preview_send`.
+    pub previews: Arc<tokio::sync::Mutex<PreviewStore>>,
+
+    /// The intended transport line the preview shows: the first *push* transport
+    /// in the settings order (MCP is pull-only and serves the handoff path).
+    pub push_target: aperture_contracts::TransportTarget,
+
+    /// Voice subsystem handle (doc 07, M6): commands + the last completed
+    /// transcript (seeds the `answer_query` preview's `user_addition`).
+    pub voice: crate::voice::VoiceHandle,
+
+    /// The live exclusion matcher handle (doc 13 §4) — the SAME shared handle
+    /// the capture sampler/normalizer hold, so `add_exclusion`/`set_exclusion`
+    /// hot-swap the compiled rules without a restart.
+    pub exclusions: ExclusionList,
 }
 
 impl AppState {
     /// Assemble the handle bag at startup (doc 16 M0). Called from `main.rs`
-    /// after the bus, DB, orchestration, and capture subsystem exist.
+    /// after the bus, DB, orchestration, capture, gateway, and voice exist.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         bus: EventBus,
@@ -85,7 +124,25 @@ impl AppState {
         snooze_until: Arc<std::sync::atomic::AtomicI64>,
         connectors: Arc<aperture_connectors::ConnectorRegistry>,
         consent: Arc<tokio::sync::Mutex<aperture_privacy::consent::ConsentManager>>,
+        gateway: Arc<Gateway>,
+        push_target: aperture_contracts::TransportTarget,
+        voice: crate::voice::VoiceHandle,
+        exclusions: ExclusionList,
     ) -> Self {
-        Self { bus, db, capture, orchestration, feedback_tx, snooze_until, connectors, consent }
+        Self {
+            bus,
+            db,
+            capture,
+            orchestration,
+            feedback_tx,
+            snooze_until,
+            connectors,
+            consent,
+            gateway,
+            previews: Arc::new(tokio::sync::Mutex::new(PreviewStore::default())),
+            push_target,
+            voice,
+            exclusions,
+        }
     }
 }

@@ -342,8 +342,19 @@ pub struct SidecarConfig {
     pub vlm_model_gguf: std::path::PathBuf,
     /// Vision projector (mmproj, FP16, doc 04 §2).
     pub vlm_mmproj_gguf: std::path::PathBuf,
+    /// The llama.cpp `llama-server` executable the VLM host supervises
+    /// (doc 06 §3; CUDA build on the RTX target).
+    pub llama_bin: std::path::PathBuf,
     /// `aperture-stt-host` executable (M6).
     pub stt_host_bin: std::path::PathBuf,
+    /// The whisper server executable the STT host supervises (whisper.cpp
+    /// `whisper-server`; doc 07 §3).
+    pub whisper_bin: std::path::PathBuf,
+    /// Whisper GGML weights (base.en default — doc 07 §3 CPU fallback tier).
+    pub stt_model: std::path::PathBuf,
+    /// Run whisper on GPU? The shipped whisper build is CPU+BLAS, so default
+    /// false; a CUDA whisper-server flips this without code changes (doc 07 §6).
+    pub stt_on_gpu: bool,
     /// Context cap handed to the VLM sidecar (doc 04 R2).
     pub vlm_ctx: u32,
     /// Cold-load readiness deadline (doc 04 §5).
@@ -356,7 +367,11 @@ impl Default for SidecarConfig {
             vlm_host_bin: std::path::PathBuf::from("aperture-vlm-host"),
             vlm_model_gguf: std::path::PathBuf::from("models/qwen2.5-vl-3b-q4_k_m.gguf"),
             vlm_mmproj_gguf: std::path::PathBuf::from("models/qwen2.5-vl-3b-mmproj-f16.gguf"),
+            llama_bin: std::path::PathBuf::from("llama-server"),
             stt_host_bin: std::path::PathBuf::from("aperture-stt-host"),
+            whisper_bin: std::path::PathBuf::from("whisper-server"),
+            stt_model: std::path::PathBuf::from("models/ggml-base.en.bin"),
+            stt_on_gpu: false,
             vlm_ctx: 4096,
             cold_load_timeout: Duration::from_secs(15),
         }
@@ -450,24 +465,43 @@ mod os_spawn {
         model: ModelId,
         next_port: &AtomicU16,
     ) -> Result<Box<dyn SidecarProcess>, LifecycleError> {
-        if SidecarKind::of(model) == SidecarKind::SttHost {
-            return Err(LifecycleError::Spawn("stt-host is the M6 milestone".into()));
-        }
         let port = next_port.fetch_add(1, Ordering::Relaxed);
         let child_port = port.wrapping_add(1000);
         // The ONLY sanctioned std::process::Command outside the gateway (doc 13
         // §2): a local model host, loopback only, no network reach.
-        let child = tokio::process::Command::new(&config.vlm_host_bin)
-            .arg("--port")
-            .arg(port.to_string())
-            .arg("--model")
-            .arg(&config.vlm_model_gguf)
-            .arg("--mmproj")
-            .arg(&config.vlm_mmproj_gguf)
-            .arg("--ctx")
-            .arg(config.vlm_ctx.to_string())
-            .arg("--child-port")
-            .arg(child_port.to_string())
+        let mut cmd = match SidecarKind::of(model) {
+            SidecarKind::SttHost => {
+                let mut cmd = tokio::process::Command::new(&config.stt_host_bin);
+                cmd.arg("--port")
+                    .arg(port.to_string())
+                    .arg("--whisper-bin")
+                    .arg(&config.whisper_bin)
+                    .arg("--model")
+                    .arg(&config.stt_model)
+                    .arg("--device")
+                    .arg(if config.stt_on_gpu { "gpu" } else { "cpu" })
+                    .arg("--child-port")
+                    .arg(child_port.to_string());
+                cmd
+            }
+            SidecarKind::VlmHost => {
+                let mut cmd = tokio::process::Command::new(&config.vlm_host_bin);
+                cmd.arg("--port")
+                    .arg(port.to_string())
+                    .arg("--llama-bin")
+                    .arg(&config.llama_bin)
+                    .arg("--model")
+                    .arg(&config.vlm_model_gguf)
+                    .arg("--mmproj")
+                    .arg(&config.vlm_mmproj_gguf)
+                    .arg("--ctx")
+                    .arg(config.vlm_ctx.to_string())
+                    .arg("--child-port")
+                    .arg(child_port.to_string());
+                cmd
+            }
+        };
+        let child = cmd
             .kill_on_drop(true) // invariant 3: kill => VRAM release
             .spawn()
             .map_err(|e| LifecycleError::Spawn(e.to_string()))?;

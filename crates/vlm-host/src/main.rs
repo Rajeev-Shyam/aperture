@@ -329,15 +329,42 @@ impl LlamaChild {
 }
 
 /// The screen-understanding system prompt (doc 06 §3): a *function*, not a chat.
+/// The schema is SPELLED OUT — "matching the schema" with no schema in sight
+/// left the model guessing (found live 2026-08-14: every reply failed parse).
 const SYSTEM_PROMPT: &str = "You are a screen-understanding function. Given one \
-screenshot of a Windows 11 desktop, return ONLY JSON matching the schema. Do not \
-guess text you cannot read.";
+screenshot of a Windows 11 desktop, return ONLY a single JSON object with exactly \
+these keys: \
+\"scene\" (string, one short sentence), \
+\"app_guess\" (string, the foreground application), \
+\"key_entities\" (array of {\"kind\": \"url\"|\"file\"|\"video\"|\"control\"|\"text\", \"value\": string} — only text you actually read), \
+\"resumable_hint\" ({\"connector_type\": \"browser\"|\"youtube\"|\"document\"|\"ide\"|\"none\", \"payload_guess\": object}), \
+\"ocr_gaps\" (string, what plain OCR likely missed), \
+\"confidence\" (number between 0.0 and 1.0). \
+Do not guess text you cannot read. No prose, no code fences.";
 
 /// Parse the model's text content into the structured scene (doc 06 §3). Tolerates
-/// the model wrapping the JSON in prose/fences by extracting the outermost object.
+/// the model wrapping the JSON in prose/fences by extracting the outermost object,
+/// and coerces a stringified `confidence` ("High" / "0.8") to a number — observed
+/// live with Qwen2.5-VL-3B (2026-08-14): discarding an otherwise-good scene over
+/// a label the caller clamps anyway is the wrong trade.
 fn parse_scene(content: &str) -> Result<InferResponse, HostError> {
     let json = extract_json_object(content).ok_or(HostError::MalformedJson)?;
-    serde_json::from_str::<InferResponse>(json).map_err(|_| HostError::MalformedJson)
+    let mut value: serde_json::Value =
+        serde_json::from_str(json).map_err(|_| HostError::MalformedJson)?;
+    if let Some(c) = value.get_mut("confidence") {
+        if let Some(label) = c.as_str() {
+            let coerced = label.trim().parse::<f32>().unwrap_or_else(|_| {
+                match label.trim().to_ascii_lowercase().as_str() {
+                    "high" | "very high" => 0.9,
+                    "medium" | "moderate" => 0.6,
+                    "low" | "very low" => 0.3,
+                    _ => 0.5,
+                }
+            });
+            *c = serde_json::json!(coerced);
+        }
+    }
+    serde_json::from_value::<InferResponse>(value).map_err(|_| HostError::MalformedJson)
 }
 
 /// Extract the first balanced `{...}` object from a string (the model may fence

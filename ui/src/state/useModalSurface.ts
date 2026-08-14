@@ -26,31 +26,44 @@ const FOCUSABLE =
   'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
 /**
- * Mark `ref` as a live modal surface: make the overlay accept input while it is
- * mounted, move focus in, restore focus on unmount, and cycle Tab within it.
+ * Mark `ref` as a live modal surface: move focus in, restore focus on unmount,
+ * and cycle Tab within it.
+ *
+ * `exclusive` (default `true`) additionally makes the WHOLE overlay window
+ * accept input for the surface's lifetime — required for a dialog that must be
+ * answerable with no prior click (first-run consent). Dismissible panels pass
+ * `exclusive: false`: their own rect (published by `useHitTestRects`) makes
+ * them clickable, while everywhere OUTSIDE the panel stays click-through to
+ * the user's apps — a visible panel must not swallow the rest of the screen.
  *
  * Returns the `onKeyDown` handler the surface must spread onto its root element.
  */
 export function useModalSurface(
   ref: RefObject<HTMLElement | null>,
+  opts?: { exclusive?: boolean },
 ): (e: React.KeyboardEvent) => void {
+  const exclusive = opts?.exclusive ?? true;
   useEffect(() => {
-    // If this fails the modal is unusable, so it is worth a console error —
-    // but it must not throw and leave the surface half-initialised.
-    void setOverlayInteractive(true).catch((e) =>
-      console.error("overlay did not become interactive; this modal may be unclickable", e),
-    );
+    if (exclusive) {
+      // If this fails the modal is unusable, so it is worth a console error —
+      // but it must not throw and leave the surface half-initialised.
+      void setOverlayInteractive(true).catch((e) =>
+        console.error("overlay did not become interactive; this modal may be unclickable", e),
+      );
+    }
     const opener = document.activeElement as HTMLElement | null;
     ref.current?.focus();
     return () => {
-      void setOverlayInteractive(false).catch(() => {
-        /* going back to click-through is best-effort on teardown */
-      });
+      if (exclusive) {
+        void setOverlayInteractive(false).catch(() => {
+          /* going back to click-through is best-effort on teardown */
+        });
+      }
       // Restoring focus to whatever opened the surface is what makes closing it
       // non-disorienting; without it focus falls back to <body>.
       opener?.focus?.();
     };
-  }, [ref]);
+  }, [ref, exclusive]);
 
   return (e: React.KeyboardEvent) => {
     if (e.key !== "Tab") return;

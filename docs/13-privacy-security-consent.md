@@ -172,3 +172,11 @@ Full session detail: `docs/handoff/session-bridge-2026-08-09-m9.md`.
 
 ---
 > **R2 amendments applied** (see docs/19–21): ADR-029 (honest minimization reframe; extension URL-only use; empty default exclusions), ADR-036 (precise emitter rule; diagnostics; updater carve-out), ADR-028 (loopback-fallback scoping + SC5 whitelist), ADR-026 (scoped-allow transparency), ADR-037 (gated `aperture_search_history`), ADR-040 (`url_pattern`, first-run sequence, Activity & Privacy view, global snooze, cold-start note), ADR-038 (optional Argon2id recovery passphrase). Redaction rules (Q21) and 30 d audit survival (Q18) unchanged.
+
+## Implementation status (2026-08-13) — v1 wiring + review hardening
+
+- **Approval is content-bound (§3).** `preview_set_approved` re-redacts the synced edits and hashes the canonical bytes; `preview_send` ships the core-owned object only after re-verifying that hash — a client cannot substitute content after the gate, and panel-added text cannot bypass the redactor (2026-08-13 multi-agent review, HIGH).
+- **Voice follows the mechanism, not the decision (§8).** Voice enable and PTT gate on the LIVE ToggleOwner state; a failed `capture.start()` can no longer leave the mic arm-able off a stale `consent.capture_enabled`.
+- **Exclusion hot-reload (§4).** `ExclusionList` is interior-mutable; `add_exclusion`/`set_exclusion` recompile+swap the live matcher (keep-previous-on-error). Settings first-run seeding is per-key `INSERT OR IGNORE`, keyed on the `reasoning` row (never table-emptiness — `consent` shares the table).
+- The gateway now actually carries the DB-backed `AuditLog` (`Gateway::with_audit`) — `cloud_send` rows persist.
+Full detail: `docs/handoff/session-bridge-2026-08-13-v1-wiring.md`.

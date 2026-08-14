@@ -58,3 +58,7 @@ Built + CPU-tested in `crates/voice` + `crates/stt-host`:
 Full session detail: `docs/handoff/session-bridge-2026-07-08-m6-m8.md`.
 
 > **R2 amendments applied** (see docs/19–21): Q49 (click-to-toggle PTT), ADR-024 (faster-whisper GPU / whisper.cpp CPU), ADR-034 (embedding-head intent + lexicon fast-path), Q52 (configurable CPU-fallback threshold).
+
+## Implementation status (2026-08-13) — composition root wired
+
+The shell constructs `VoiceSubsystem` on a dedicated OS thread (`src-tauri/src/voice.rs`: Win32 message pump + non-blocking hotkey drain + command channel + 30 s ceiling + warm-keep). Capture-toggle→enable/disable rides the observed toggle broadcast; `voice_run_transcript` (confirm-chip Run) exists and never re-stores; the escalation transcript seeds exactly one `answer_query` preview (`take`, cleared on disable). PTT commands gate on mic opt-in AND the live toggle. STT still degrades honestly: no whisper weights/binaries installed, `OsSpawner` still refuses stt-host, and `SidecarRunner::run` still returns `SidecarDown` for Stt — the three remaining pieces for real speech. Full detail: `docs/handoff/session-bridge-2026-08-13-v1-wiring.md`.

@@ -538,11 +538,15 @@ pub fn spawn_connector_task(
     let bus = bus.clone();
     tokio::spawn(async move {
         let deriver = Arc::new(aperture_connectors::SecondaryDeriver::new());
-        // (connector_type, natural_key) → (row_id, stale_after_ts): the
-        // coalescing map. In-memory only — a restart just starts new rows and
-        // retention prunes the old ones (doc 03 §6).
-        let mut coalesce: std::collections::HashMap<(String, String), (String, Option<i64>)> =
-            std::collections::HashMap::new();
+        // (connector_type, natural_key) → (row_id, stale_after_ts, captured_ts,
+        // position_rank): the coalescing map. In-memory only — a restart just
+        // starts new rows and retention prunes the old ones (doc 03 §6).
+        // captured_ts + rank close CONN-M1: a later position-less navigation
+        // must not clobber a known media position (ADR-027 source hierarchy).
+        let mut coalesce: std::collections::HashMap<
+            (String, String),
+            (String, Option<i64>, i64, u8),
+        > = std::collections::HashMap::new();
         loop {
             let ev = match events.recv().await {
                 Ok(ev) => ev,
@@ -586,40 +590,57 @@ pub fn spawn_connector_task(
                 &state.connector_type,
                 &state.reconstruct_payload,
             );
+            let new_rank = position_rank(&state.reconstruct_payload);
             let used_id = match key {
                 Some(k) => {
                     let map_key = (state.connector_type.clone(), k);
                     match coalesce.get(&map_key) {
-                        // Same resource, existing row still fresh ⇒ refresh in
-                        // place (freshest position wins, doc 10 §3).
-                        // TODO(CONN-M1): this guard only checks the existing row is
-                        // still fresh, not that the NEW capture is newer or carries
-                        // an equal/better position source. A later position-less
-                        // navigation (same video_id, position = null) can clobber a
-                        // known media_state timestamp → "resume from start" instead
-                        // of the real position (defeats ADR-027's source hierarchy).
-                        // Fix = store captured_ts + a position-source rank in the
-                        // coalesce value and refresh only when the new capture wins.
-                        Some((row_id, stale)) if stale.is_none_or(|s| s > state.captured_ts) => {
-                            match db.refresh_connector_state(
-                                row_id,
-                                &state.reconstruct_payload,
-                                state.captured_ts,
-                                state.stale_after_ts,
-                            ) {
-                                Ok(true) => {
-                                    let id = row_id.clone();
-                                    coalesce.insert(map_key, (id.clone(), state.stale_after_ts));
-                                    Some(id)
-                                }
-                                Ok(false) | Err(_) => {
-                                    insert_state(&db, &state).then(|| {
+                        // Same resource, existing row still fresh. CONN-M1: only
+                        // refresh when the NEW capture wins — an equal-or-better
+                        // position source, or a same-rank later observation
+                        // (freshest position wins, doc 10 §3 / ADR-027). A later
+                        // position-LESS navigation over a known position keeps
+                        // the old row (and still stamps the event with it).
+                        Some((row_id, stale, prev_ts, prev_rank))
+                            if stale.is_none_or(|s| s > state.captured_ts) =>
+                        {
+                            // A lower-ranked capture NEVER overwrites a fresh
+                            // higher-ranked row, regardless of timestamps — the
+                            // ts comparison only orders captures of equal rank
+                            // (out-of-order delivery is real: media ticks and
+                            // UIA-derived navigations race). Same-rank older
+                            // captures are dropped too.
+                            let new_wins = new_rank > *prev_rank
+                                || (new_rank == *prev_rank && state.captured_ts >= *prev_ts);
+                            if !new_wins {
+                                tracing::debug!(
+                                    "coalesce kept the higher-ranked/newer position (CONN-M1)"
+                                );
+                                Some(row_id.clone())
+                            } else {
+                                match db.refresh_connector_state(
+                                    row_id,
+                                    &state.reconstruct_payload,
+                                    state.captured_ts,
+                                    state.stale_after_ts,
+                                ) {
+                                    Ok(true) => {
+                                        let id = row_id.clone();
                                         coalesce.insert(
                                             map_key,
-                                            (state.id.clone(), state.stale_after_ts),
+                                            (id.clone(), state.stale_after_ts, state.captured_ts, new_rank),
                                         );
-                                        state.id.clone()
-                                    })
+                                        Some(id)
+                                    }
+                                    Ok(false) | Err(_) => {
+                                        insert_state(&db, &state).then(|| {
+                                            coalesce.insert(
+                                                map_key,
+                                                (state.id.clone(), state.stale_after_ts, state.captured_ts, new_rank),
+                                            );
+                                            state.id.clone()
+                                        })
+                                    }
                                 }
                             }
                         }
@@ -627,7 +648,10 @@ pub fn spawn_connector_task(
                             if coalesce.len() >= 1024 {
                                 coalesce.clear(); // crude bound; repopulates live
                             }
-                            coalesce.insert(map_key, (state.id.clone(), state.stale_after_ts));
+                            coalesce.insert(
+                                map_key,
+                                (state.id.clone(), state.stale_after_ts, state.captured_ts, new_rank),
+                            );
                             state.id.clone()
                         }),
                     }
@@ -645,6 +669,16 @@ pub fn spawn_connector_task(
             }
         }
     })
+}
+
+/// Rank a capture's position information for the CONN-M1 coalesce guard
+/// (ADR-027 source hierarchy): a payload carrying a known playback position
+/// (`position_s`, the youtube connector's v1 key) outranks one without.
+fn position_rank(payload: &serde_json::Value) -> u8 {
+    match payload.get("position_s") {
+        Some(v) if !v.is_null() => 1,
+        _ => 0,
+    }
 }
 
 fn insert_state(db: &Db, state: &aperture_contracts::ConnectorState) -> bool {

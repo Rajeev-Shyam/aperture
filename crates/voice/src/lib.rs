@@ -183,6 +183,37 @@ impl VoiceSubsystem {
         self.hotkey = None; // unregister the chord (Drop)
     }
 
+    /// Whether the PTT chord is currently registered (capture toggle ON and
+    /// [`enable`](Self::enable) succeeded).
+    pub fn is_enabled(&self) -> bool {
+        self.hotkey.is_some()
+    }
+
+    /// Swap the PTT chord before (re-)enabling — the composition root's
+    /// conflict-fallback path (a configured chord can be owned by another app
+    /// or by Windows itself, doc 07 §6).
+    pub fn set_chord(&mut self, chord: hotkey::HotkeyChord) {
+        self.config.chord = chord;
+    }
+
+    /// Whether a PTT capture is in flight (between `ptt_down` and `ptt_up`).
+    pub fn is_recording(&self) -> bool {
+        self.recorder.is_some()
+    }
+
+    /// Elapsed live-capture time, or `None` when not recording — the shell's
+    /// loop compares this to [`MAX_UTTERANCE`] to enforce the 30 s ceiling.
+    pub fn recording_elapsed(&self) -> Option<Duration> {
+        self.recorder.as_ref().map(|r| r.elapsed())
+    }
+
+    /// Non-blocking drain of the registered chord's press/release queue —
+    /// `None` when voice is disabled or no event is pending. The composition
+    /// root's voice loop polls this alongside its Win32 message pump.
+    pub fn try_next_ptt_event(&mut self) -> Option<hotkey::PttEvent> {
+        self.hotkey.as_mut()?.try_next_event()
+    }
+
     /// Key-down: start WASAPI capture into a native buffer; the shell shows the
     /// "listening" pill (doc 07 §2, doc 11). The 30 s ceiling ([`MAX_UTTERANCE`])
     /// is enforced by the caller comparing [`audio_capture::Recorder::elapsed`].

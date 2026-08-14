@@ -10,11 +10,17 @@
 //  events via `.surface-interactive`.
 
 import { useEffect, useState } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import {
   getConsent,
+  onDashboardOpen,
+  onPreviewRequest,
   onVoiceSurface,
+  previewCancel,
   requestPreview,
+  resetOverlayInteractivity,
+  voiceRunTranscript,
   type ConsentState,
   type ContextPayload,
   type Intent,
@@ -22,13 +28,24 @@ import {
   type VoiceSurfaceEvent,
 } from "./lib/ipc";
 import { startGpuBusyWatch } from "./state/gpuBusy";
+import { useHitTestRects } from "./state/useHitTestRects";
 
 import { BubbleContainer } from "./components/BubbleContainer";
 import { CaptureIndicator } from "./components/CaptureIndicator";
 import { ContextPreviewPanel } from "./components/ContextPreviewPanel";
+import { Dashboard } from "./components/Dashboard";
 import { FirstRunConsent } from "./components/FirstRunConsent";
+import { Hud } from "./components/Hud";
 import { PrivacyPanel } from "./components/PrivacyPanel";
 import { VoiceSurfaces } from "./components/VoiceSurfaces";
+
+// Which monitor's overlay is this root running in? The primary window keeps
+// the config label `overlay`; per-monitor clones are `overlay-1`, `overlay-2`…
+// (overlay.rs `plan_overlays`). Secondary monitors render only the passive
+// ambient surfaces (bubbles + voice); the HUD, panels, preview, and first-run
+// belong to the primary alone — duplicating controls per monitor meant
+// duplicate dialogs and double settings writes (doc 11 §2, M8 cleanup).
+const IS_PRIMARY_OVERLAY = getCurrentWindow().label === "overlay";
 
 export default function App() {
   // The previewed payload, or null when no panel is open. Editing this object
@@ -43,17 +60,39 @@ export default function App() {
   // user who already consented.
   const [consent, setConsent] = useState<ConsentState | null>(null);
   const [privacyOpen, setPrivacyOpen] = useState(false);
+  const [dashboardOpen, setDashboardOpen] = useState(false);
+
+  // Publish interactive-surface rects so the click-through overlay accepts
+  // input over bubbles/indicator/voice chips (doc 11 §2). Modal surfaces keep
+  // their own coarser `useModalSurface` switch; the core composes both.
+  useHitTestRects();
 
   // Wire the global gpu_busy degrade watch + the voice surface stream once.
   useEffect(() => {
     const unlisteners: UnlistenFn[] = [];
     let cancelled = false;
 
+    // A fresh mount means no modal is open: reset any interactivity state a
+    // previous page (crashed/reloaded WebView) left behind (doc 11 §7).
+    void resetOverlayInteractivity().catch(() => {});
+
     void startGpuBusyWatch().then((u) => {
       if (cancelled) u();
       else unlisteners.push(u);
     });
     void onVoiceSurface(setVoice).then((u) => {
+      if (cancelled) u();
+      else unlisteners.push(u);
+    });
+    // The tray (left-click / "Open Dashboard") and a second app launch both
+    // land here — the overlay is the only surface that can show the dashboard.
+    void onDashboardOpen(() => setDashboardOpen(true)).then((u) => {
+      if (cancelled) u();
+      else unlisteners.push(u);
+    });
+    // The core staged a payload (Claude Desktop's gated search, ADR-037):
+    // open the trust surface on it so the user decides what leaves.
+    void onPreviewRequest((p) => setPreview(p)).then((u) => {
       if (cancelled) u();
       else unlisteners.push(u);
     });
@@ -94,8 +133,10 @@ export default function App() {
   }
 
   // First run owns the whole overlay: privacy setup precedes every other surface
-  // (doc 13 §8), and capture is OFF behind it regardless.
+  // (doc 13 §8), and capture is OFF behind it regardless. It is answered ONCE,
+  // on the primary monitor — a copy per monitor was N dialogs for one question.
   if (consent && !consent.first_run_completed) {
+    if (!IS_PRIMARY_OVERLAY) return null;
     return (
       <FirstRunConsent
         dbEncrypted={consent.db_encrypted}
@@ -116,40 +157,72 @@ export default function App() {
         event={voice}
         onAskClaude={(actionRef) => void openPreview("answer_query", actionRef)}
         onDismiss={() => setVoice({ surface: "hidden" })}
-        onRun={(_transcript) => {
-          // TODO(M6-followup): a `voice_run_transcript` core command re-issues the
-          // confirmed transcript through the query path. For now, confirming clears
-          // the chip so the low-confidence surface is never a stuck dead-end (review #8).
-          setVoice({ surface: "hidden" });
+        onRun={(transcript) => {
+          // Re-issue the confirmed transcript through the query path (doc 07
+          // §4.4); the resulting answer/empty surface arrives via voice_surface.
+          void voiceRunTranscript(transcript).catch((e) =>
+            console.error("voice_run_transcript failed:", e),
+          );
         }}
       />
 
-      {/* Capture state + activity pulse; OFF reflects VRAM->~0 (<3s). */}
-      <CaptureIndicator />
-
-      {/* Activity & Privacy (doc 13 §7, ADR-040): the audit trail, exclusions,
-          and Purge All. Reachable from the capture indicator. */}
-      <button
-        className="privacy-open surface-interactive"
-        aria-label="Open activity and privacy"
-        title="Activity & Privacy"
-        onClick={() => setPrivacyOpen(true)}
-      >
-        🛡
-      </button>
+      {/* Everything below is the primary monitor's alone: the HUD's controls,
+          the panels, and the preview must exist exactly once. */}
+      {IS_PRIMARY_OVERLAY && (
+      <>
+      {/* The HUD cluster: capture indicator + dashboard + privacy, draggable
+          to any corner or edge (persisted in ui.hud_anchor). */}
+      <Hud>
+        <CaptureIndicator />
+        <div className="hud__buttons">
+          <button
+            className="privacy-open"
+            aria-label={dashboardOpen ? "Close the Aperture dashboard" : "Open the Aperture dashboard"}
+            aria-pressed={dashboardOpen}
+            title="Dashboard — history, patterns, everything it knows"
+            onClick={() => setDashboardOpen((v) => !v)}
+          >
+            ◎
+          </button>
+          <button
+            className="privacy-open"
+            aria-label={privacyOpen ? "Close activity and privacy" : "Open activity and privacy"}
+            aria-pressed={privacyOpen}
+            title="Activity & Privacy"
+            onClick={() => setPrivacyOpen((v) => !v)}
+          >
+            🛡
+          </button>
+        </div>
+      </Hud>
       {privacyOpen && (
         <PrivacyPanel
           dbEncrypted={consent?.db_encrypted ?? false}
           onClose={() => setPrivacyOpen(false)}
         />
       )}
+      {dashboardOpen && (
+        <Dashboard
+          onClose={() => setDashboardOpen(false)}
+          onOpenPrivacy={() => setPrivacyOpen(true)}
+        />
+      )}
+      </>
+      )}
 
-      {/* The trust surface. Edits mutate `preview`; Send transmits exact bytes. */}
+      {/* The trust surface — rendered on WHICHEVER monitor opened it (a bubble
+          or voice "Ask Claude" click sets this window's local state). Edits
+          mutate `preview`; Send transmits exact bytes. */}
       {preview && (
         <ContextPreviewPanel
           payload={preview}
           onChange={setPreview}
-          onClose={() => setPreview(null)}
+          onClose={(result) => {
+            // Cancel (no result): tell the core to drop its in-process session
+            // — zero residue (doc 13 §3). After a Send the session is consumed.
+            if (!result) void previewCancel(preview.payload_id).catch(() => {});
+            setPreview(null);
+          }}
         />
       )}
     </>
