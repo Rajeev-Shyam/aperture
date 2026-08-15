@@ -177,7 +177,9 @@ export function ContextPreviewPanel({ payload, onChange, onClose }: Props) {
       if (isMcpPull) {
         // Approved: Claude Desktop's next `aperture_get_context` call receives
         // exactly these bytes (audited core-side). Nothing is pushed from here.
-        onClose();
+        // Close WITH an (empty) outcome — a bare close is Cancel in App.tsx and
+        // would previewCancel() the approval we just made (review 2026-08-14).
+        onClose({});
         return;
       }
       // Transmit the approved object (hash-bound core-side, doc 03 §4).

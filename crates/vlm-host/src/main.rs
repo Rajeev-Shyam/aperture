@@ -200,8 +200,8 @@ impl LlamaChild {
         } else {
             args.child_port
         };
-        let child = tokio::process::Command::new(&args.llama_bin)
-            .arg("-m")
+        let mut cmd = tokio::process::Command::new(&args.llama_bin);
+        cmd.arg("-m")
             .arg(&args.model)
             .arg("--mmproj")
             .arg(&args.mmproj)
@@ -213,9 +213,12 @@ impl LlamaChild {
             .arg(child_port.to_string())
             .arg("-ngl")
             .arg("99") // offload all layers to the GPU [VERIFY per model/VRAM]
-            .kill_on_drop(true) // invariant 3: kill => VRAM release
-            .spawn()
-            .map_err(|e| HostError::Spawn(e.to_string()))?;
+            .kill_on_drop(true); // invariant 3: kill => VRAM release
+        // CREATE_NO_WINDOW: llama-server is a console app; without this it
+        // flashes a terminal at the user on every cold spawn (2026-08-14).
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000);
+        let child = cmd.spawn().map_err(|e| HostError::Spawn(e.to_string()))?;
 
         let base_url = format!("http://127.0.0.1:{child_port}");
         let client = reqwest::Client::builder()

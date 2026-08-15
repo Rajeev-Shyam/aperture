@@ -191,6 +191,37 @@ render bubbles + voice only; HUD/panels/first-run are primary-only; the preview
 panel renders on whichever monitor opened it (MCP-staged previews target the
 primary via `emit_preview_request`).
 
+## ⚠️ SESSION END STATE (2026-08-15, read FIRST next session)
+
+The user hit the session limit mid-fix-application. Exact state:
+
+- **36-agent review ran: 31 CONFIRMED findings** — full list + fix sketches in
+  `review-findings-2026-08-14.md`. Two HIGH privacy bugs in the MCP gate
+  (search-history oracle leak; get_context transport binding), one HIGH data-loss
+  crash window in the SQLCipher migration, one HIGH sidecar tree-kill gap
+  (killing a host orphans the llama/whisper grandchild — use Job Objects;
+  also fixes tray-Quit orphaning), one HIGH: STT WAV-as-JSON exceeds axum's
+  2 MB default body limit (utterances >~18 s FAIL — add DefaultBodyLimit to
+  stt-host/vlm-host routers).
+- **Fixed in the WORKING TREE (committed 2026-08-15) but NOT yet in the
+  installed app**: the MCP "Approve for Claude" self-cancel (App.tsx onClose({})
+  — was killing the approval it just made), CREATE_NO_WINDOW on all three
+  sidecar spawn sites (terminal-flash fix — this IS in the installed build),
+  dark near-opaque glass tokens (also installed).
+- **Installed build** = CREATE_NO_WINDOW + dark glass + adaptive VAD + gain;
+  it still has the broken MCP approve and all other review findings.
+- **NEXT SESSION, in order**: (1) apply the 5 HIGH fixes + the quick mediums
+  per review-findings doc (triage notes: constant-response + LIKE-escape +
+  per-search audit row for search_history; migration resume-from-.encrypting
+  + gated backup deletion; Job Objects in os_spawn; body limits; transport
+  binding in get_context/list_recent), (2) rebuild sidecars + `tauri build`
+  (NEVER bare cargo build into the install dir — dev-cfg bricks the screen),
+  (3) reinstall + verify, (4) work the completeness list (snooze UI, bubble
+  menu no-ops, 👍/👎 thumbs, MCP submit→bubbles, enrichment stubs — remove or
+  implement, gate harnesses).
+- **v2 prep is DONE**: `v2-kickoff-2026-08-14.md` maps shipped v1 onto Doc 22,
+  marks overtaken assumptions + which Q-V2 questions have empirical answers.
+
 ## Still open after this session
 
 1. **Gate harnesses** SC3/SC4/PresentMon/SC5-byte-monitor + `sc6` bodies stay
