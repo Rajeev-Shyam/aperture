@@ -209,6 +209,10 @@ impl WhisperChild {
             (Backend::WhisperCpp, Device::Gpu) => {}
         }
         cmd.kill_on_drop(true); // invariant 3: kill => VRAM release
+        // CREATE_NO_WINDOW: whisper-server is a console app; without this it
+        // flashes a terminal at the user on every cold spawn (2026-08-14).
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000);
         let child = cmd.spawn().map_err(|e| HostError::Spawn(e.to_string()))?;
 
         let base_url = format!("http://127.0.0.1:{child_port}");

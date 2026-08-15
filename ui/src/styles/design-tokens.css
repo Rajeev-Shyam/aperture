@@ -22,10 +22,15 @@
   /* ---- Color (doc 14 §2) ---------------------------------------------- */
   --canvas-0: #0b0c0e; /* conceptual base behind glass */
 
-  /* Surface fills — rgba alpha, NEVER `opacity`. */
-  --glass-1: rgba(255, 255, 255, 0.06);
-  --glass-2: rgba(255, 255, 255, 0.1); /* the bubble default fill */
-  --glass-3: rgba(255, 255, 255, 0.15); /* hover lift target */
+  /* Surface fills — rgba alpha, NEVER `opacity`.
+   * DARK, near-opaque glass (2026-08-14, user report): the original white-tint
+   * fills (α 0.06–0.15) put white ink on a white haze — unreadable over any
+   * light window/desktop. Surfaces must be legible on EVERY backdrop, so the
+   * fill carries the contrast itself; the backdrop blur is edge softness, not
+   * the legibility mechanism. */
+  --glass-1: rgba(17, 19, 26, 0.88);
+  --glass-2: rgba(17, 19, 26, 0.92); /* the bubble default fill */
+  --glass-3: rgba(24, 27, 36, 0.95); /* hover lift target */
 
   --border-hairline: rgba(255, 255, 255, 0.08);
   --border-hairline-hover: rgba(255, 255, 255, 0.2);

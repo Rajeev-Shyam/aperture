@@ -420,6 +420,10 @@ mod os_spawn {
     use super::*;
     use std::sync::atomic::{AtomicU16, Ordering};
 
+    /// `CREATE_NO_WINDOW` — spawn console-subsystem sidecars without flashing
+    /// a terminal window (user report 2026-08-14).
+    pub(super) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
     /// A running sidecar child + its loopback endpoint. Killing it reaps the
     /// transitive llama.cpp child (kill_on_drop), returning VRAM to the driver.
     pub(super) struct OsSidecar {
@@ -501,6 +505,11 @@ mod os_spawn {
                 cmd
             }
         };
+        // CREATE_NO_WINDOW: the hosts are console-subsystem binaries, and
+        // without this every voice press flashed a black terminal on screen
+        // (user report 2026-08-14). Children of a windowless parent still
+        // allocate their own console, so the hosts pass the flag on too.
+        cmd.creation_flags(CREATE_NO_WINDOW);
         let child = cmd
             .kill_on_drop(true) // invariant 3: kill => VRAM release
             .spawn()
