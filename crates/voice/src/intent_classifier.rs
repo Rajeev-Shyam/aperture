@@ -18,8 +18,10 @@
 //! [`classify`] is a **pure function** — no I/O, no GPU, no clock — so it is
 //! exhaustively unit-testable (doc 07 §4).
 
-/// Confidence below which the subsystem must confirm before acting (doc 07 §4.4)
-/// [ASSUMPTION].
+/// Default confidence below which the subsystem must confirm before acting
+/// (doc 07 §4.4) [ASSUMPTION]. The runtime value is the user-tunable
+/// `voice.intent_confidence_floor` setting (decision #27); this constant is the
+/// fallback when that key is missing or invalid.
 pub const CONFIRM_CONFIDENCE_FLOOR: f32 = 0.6;
 
 /// Leading verbs that mark a history query (doc 07 §4.1). Note `ask` is here for a
@@ -60,9 +62,18 @@ pub struct IntentResult {
 
 impl IntentResult {
     /// `true` when the subsystem must show the "Did you say: …?" confirm chip
-    /// instead of acting (doc 07 §4.4).
+    /// instead of acting (doc 07 §4.4), at the default floor.
     pub fn needs_confirmation(&self) -> bool {
-        self.confidence < CONFIRM_CONFIDENCE_FLOOR
+        self.needs_confirmation_at(CONFIRM_CONFIDENCE_FLOOR)
+    }
+
+    /// [`needs_confirmation`](Self::needs_confirmation) against a runtime floor
+    /// (decision #27: the `voice.intent_confidence_floor` setting). A floor of
+    /// `1.0` means "always confirm" — even a perfect-confidence transcription
+    /// shows the chip. That cannot loop: the chip's *Run* path re-classifies
+    /// without this check (the user just confirmed the words, doc 07 §4.4).
+    pub fn needs_confirmation_at(&self, floor: f32) -> bool {
+        floor >= 1.0 || self.confidence < floor
     }
 }
 
@@ -149,5 +160,20 @@ mod tests {
     fn low_confidence_needs_confirmation() {
         assert!(classify("find the doc", 0.5).needs_confirmation());
         assert!(!classify("find the doc", 0.8).needs_confirmation());
+    }
+
+    #[test]
+    fn runtime_floor_moves_the_confirm_boundary() {
+        // Decision #27: the floor is user-tunable, not welded to 0.6.
+        let r = classify("find the doc", 0.7);
+        assert!(r.needs_confirmation_at(0.9), "0.7 < a raised 0.9 floor");
+        assert!(!r.needs_confirmation_at(0.3), "0.7 clears a lowered 0.3 floor");
+        assert!(!r.needs_confirmation_at(0.0), "floor 0 never confirms");
+    }
+
+    #[test]
+    fn floor_of_one_always_confirms() {
+        // "Always confirm": even a perfect transcription shows the chip.
+        assert!(classify("find the doc", 1.0).needs_confirmation_at(1.0));
     }
 }

@@ -142,6 +142,19 @@ export type HudAnchor =
   | "bottom-center"
   | "bottom-right";
 
+/** The `voice` settings section (mirror of the seed's `voice` block). The
+ *  Dashboard Voice tab edits `intent_confidence_floor` (decision #27); writes
+ *  must merge the WHOLE section — `set_settings` replaces top-level keys. */
+export interface VoiceSettings {
+  ptt_hotkey?: string;
+  vad_speech_floor_ms?: number;
+  max_utterance_sec?: number;
+  /** Confirm-before-acting floor, clamped to [0,1] core-side; 1 = always
+   *  confirm (decision #27). */
+  intent_confidence_floor?: number;
+  [key: string]: unknown;
+}
+
 export interface Settings {
   ui?: UiSettings;
   reasoning?: {
@@ -149,8 +162,9 @@ export interface Settings {
     payload_size_warn_kb?: number;
     per_send_approval?: boolean;
   };
-  // …other sections (capture/loadout/voice/pattern_engine/privacy) are passed
-  // through untyped; the overlay only reads the `ui` + `reasoning` blocks.
+  voice?: VoiceSettings;
+  // …other sections (capture/loadout/pattern_engine/privacy) are passed
+  // through untyped; the overlay reads the `ui` + `reasoning` + `voice` blocks.
   [section: string]: unknown;
 }
 
@@ -182,7 +196,16 @@ export interface CaptureIndicatorEvent {
 /** `"voice_surface"` — drives the listening pill / transcript chip / answer
  *  bubble (doc 07, doc 11 §5). A tagged union keyed by `surface`. */
 export type VoiceSurfaceEvent =
-  | { surface: "listening"; level?: number }
+  | {
+      surface: "listening";
+      level?: number;
+      /** Elapsed hold time (ms), streamed from the core's own mic loop at
+       *  ~10 Hz — the same clock that enforces the force-finalize (decision
+       *  #28), so the pill's countdown can never drift from the cutoff. */
+      elapsed_ms?: number;
+      /** The force-finalize ceiling (ms) — `MAX_UTTERANCE`, 30 000. */
+      max_ms?: number;
+    }
   | { surface: "thinking" } // model swap latency (doc 07): show "thinking", don't fail
   | {
       surface: "transcript";
@@ -216,6 +239,35 @@ export type BubbleLifecycleState =
 export interface SuggestionLifecycleEvent {
   id: string;
   state: BubbleLifecycleState;
+}
+
+/** `"audit_alert"` — an audit-trail write failed (decision #41): what egressed
+ *  and what the `cloud_send` trail records now disagree. The primary overlay
+ *  renders a dismissible warning banner; it never auto-hides. */
+export interface AuditAlertEvent {
+  message: string;
+}
+
+/** `"dashboard_open"` / `"privacy_open"` / `"preview_claimed"` — a control
+ *  surface belongs to the window labeled `target` (decision #13). Broadcast:
+ *  the target window opens/keeps the surface, every other window closes its
+ *  copy — controls follow the cursor and exactly one instance exists. */
+export interface ControlOpenEvent {
+  target: string;
+}
+
+/** `"vlm_fetch"` — progress/terminal state of the user-initiated VLM weight
+ *  download (decision #30). Byte counts are OVERALL across both weight files,
+ *  so one progress bar renders directly. `done` means every file verified at
+ *  its expected size — VLM is live on its next use, no restart. `error` keeps
+ *  any resumable partial file, so retrying continues where it stopped. */
+export interface VlmFetchEvent {
+  phase: "downloading" | "done" | "error";
+  /** The artifact currently downloading (label under the bar). */
+  file?: string | null;
+  received_bytes: number;
+  total_bytes: number;
+  error?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -277,10 +329,26 @@ export function focusOverlay(): Promise<void> {
   return invoke("focus_overlay");
 }
 
-/** Open the Activity & Privacy panel on the primary overlay (exclusions
- *  manager) — reachable from any monitor's bubble overflow. */
+/** Open the Activity & Privacy panel on THIS window's monitor (decision #13:
+ *  controls follow the cursor — the calling window is where the click was).
+ *  The core broadcasts `privacy_open {target}`; any copy open on another
+ *  monitor closes. Callable from any monitor's bubble overflow / HUD. */
 export function openPrivacy(): Promise<void> {
   return invoke("open_privacy");
+}
+
+/** Open the Dashboard on THIS window's monitor (HUD ◎ — decision #13). Same
+ *  routing + single-instance contract as `openPrivacy`. */
+export function openDashboard(): Promise<void> {
+  return invoke("open_dashboard");
+}
+
+/** Tell the core this window's Context-Preview panel opened/closed (decision
+ *  #13). Open makes this window THE preview host — core-staged MCP requests
+ *  route (and queue) here — and broadcasts `preview_claimed` so every other
+ *  window folds its copy. Call on every panel open/close transition. */
+export function setPreviewHost(open: boolean): Promise<void> {
+  return invoke("set_preview_host", { open });
 }
 
 /** Ask the core to BUILD a Context Payload for preview (doc 03 §4). The returned
@@ -454,6 +522,37 @@ export function getAutostart(): Promise<boolean> {
   return invoke<boolean>("get_autostart");
 }
 
+/** One VLM weight artifact's install state (decision #30). `present` means the
+ *  file exists at the spawner's resolved path AT its expected byte size — a
+ *  wrong-size file honestly reads as missing (corrupt/partial). */
+export interface VlmArtifactStatus {
+  file: string;
+  expected_bytes: number;
+  present: boolean;
+}
+
+/** The VLM install picture the Overview's notice renders (decision #30):
+ *  without the ~3.3 GB weights the app silently ran OCR-only — now the state
+ *  is visible and fixable in place. */
+export interface VlmStatus {
+  installed: boolean;
+  downloading: boolean;
+  missing_bytes: number;
+  files: VlmArtifactStatus[];
+}
+
+export function vlmStatus(): Promise<VlmStatus> {
+  return invoke<VlmStatus>("vlm_status");
+}
+
+/** Start the VLM weight download (decision #30). USER-INITIATED ONLY — this is
+ *  the app's one sanctioned model-ingress path and it must never be called
+ *  without an explicit click (no surprise network activity). Progress streams
+ *  on the `vlm_fetch` event; the command returns immediately. */
+export function vlmDownload(): Promise<void> {
+  return invoke("vlm_download");
+}
+
 /** Register/unregister start-at-login; the choice persists as `ui.autostart`. */
 export function setAutostart(on: boolean): Promise<void> {
   return invoke("set_autostart", { on });
@@ -599,17 +698,39 @@ export const onVoiceSurface = (h: (e: VoiceSurfaceEvent) => void) =>
 export const onSuggestionLifecycle = (h: (e: SuggestionLifecycleEvent) => void) =>
   on<SuggestionLifecycleEvent>("suggestion_lifecycle", h);
 
-/** `"dashboard_open"` — the tray (left-click / menu) or a second app launch
- *  asks this window to open the Dashboard. Targeted at the primary overlay. */
-export const onDashboardOpen = (h: () => void) => on<null>("dashboard_open", () => h());
+/** `"audit_alert"` — an audit write failed (decision #41); the primary overlay
+ *  shows the dismissible warning banner. */
+export const onAuditAlert = (h: (e: AuditAlertEvent) => void) =>
+  on<AuditAlertEvent>("audit_alert", h);
 
-/** `"privacy_open"` — a bubble's "Exclusions…" (any monitor) asks the primary
- *  overlay to open the Activity & Privacy panel. */
-export const onPrivacyOpen = (h: () => void) => on<null>("privacy_open", () => h());
+/** `"vlm_fetch"` — VLM weight download progress (decision #30); the Dashboard
+ *  Overview renders the progress bar + terminal state. */
+export const onVlmFetch = (h: (e: VlmFetchEvent) => void) =>
+  on<VlmFetchEvent>("vlm_fetch", h);
+
+/** `"dashboard_open"` — the tray (left-click / menu), a second app launch, or
+ *  the HUD asks the `target` window to open the Dashboard; every other window
+ *  closes its copy (decision #13). */
+export const onDashboardOpen = (h: (target: string) => void) =>
+  on<ControlOpenEvent>("dashboard_open", (e) => h(e.target));
+
+/** `"privacy_open"` — a bubble's "Exclusions…" / the HUD asks the `target`
+ *  window to open the Activity & Privacy panel; every other window closes its
+ *  copy (decision #13). */
+export const onPrivacyOpen = (h: (target: string) => void) =>
+  on<ControlOpenEvent>("privacy_open", (e) => h(e.target));
+
+/** `"preview_claimed"` — the `target` window's preview panel just opened; any
+ *  OTHER window folds its own panel, cancelling its sessions core-side, so
+ *  exactly one preview exists across monitors (decision #13). */
+export const onPreviewClaimed = (h: (target: string) => void) =>
+  on<ControlOpenEvent>("preview_claimed", (e) => h(e.target));
 
 /** `"preview_request"` — the core staged a payload (MCP gated search, ADR-037)
- *  and asks this window to open the preview panel on it. The user's explicit
- *  "Approve for Claude" is the ONLY way its content ever leaves. */
+ *  and asks this window to open the preview panel on it. Targeted at the
+ *  current preview-host window, else the cursor's monitor (decision #13). The
+ *  user's explicit "Approve for Claude" is the ONLY way its content ever
+ *  leaves. */
 export const onPreviewRequest = (h: (p: ContextPayload) => void) =>
   on<ContextPayload>("preview_request", h);
 

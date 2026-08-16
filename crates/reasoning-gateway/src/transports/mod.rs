@@ -20,7 +20,44 @@ pub mod api;
 pub mod cli;
 pub mod mcp;
 
-use aperture_contracts::{ContextPayload, PayloadItem};
+use aperture_contracts::{ContextPayload, PayloadItem, TransportError, TransportId};
+
+/// Human name for errors that must say WHICH transport refused (decision #42).
+pub fn transport_name(id: TransportId) -> &'static str {
+    match id {
+        TransportId::ClaudeCli => "Claude CLI",
+        TransportId::ClaudeDesktopMcp => "Claude Desktop (MCP)",
+        TransportId::MessagesApi => "Messages API",
+    }
+}
+
+/// The per-transport HARD wire-byte cap (decision #42) — a distinct mechanism
+/// from the 50 KB soft preview warning (doc 09 §5). Each constant documents its
+/// source where it is defined, next to the transport it bounds.
+pub fn hard_cap_bytes(id: TransportId) -> usize {
+    match id {
+        TransportId::ClaudeCli => cli::CLI_STDIN_MAX_BYTES,
+        TransportId::ClaudeDesktopMcp => mcp::MCP_RESULT_MAX_BYTES,
+        TransportId::MessagesApi => api::API_BODY_MAX_BYTES,
+    }
+}
+
+/// Enforce a transport's hard cap on `len` wire bytes (decision #42): exactly at
+/// the cap passes, the first byte over is a hard stop naming the transport, the
+/// size, and the cap — never an auto-shrink (decision #40 keeps oversize a hard
+/// error). Shared by the gateway's pre-egress check and each push transport's
+/// own self-guard so the two can never disagree on the boundary.
+pub fn check_hard_cap(id: TransportId, len: usize) -> Result<(), TransportError> {
+    let cap = hard_cap_bytes(id);
+    if len > cap {
+        return Err(TransportError::PayloadTooLarge(format!(
+            "{len} B exceeds the {} hard cap of {cap} B (decision #42; shrink the payload — \
+             no auto-truncation, decision #40)",
+            transport_name(id)
+        )));
+    }
+    Ok(())
+}
 
 /// The system framing shared by the push transports (doc 09 §4): the model is a
 /// suggestion *function*, and only connectors act on its output.
@@ -123,5 +160,33 @@ mod tests {
         assert_eq!(extract_json("sure:\n```json\n{\"a\":1}\n```"), Some(r#"{"a":1}"#));
         assert_eq!(extract_json(r#"{"t":"a }{ b"}"#), Some(r#"{"t":"a }{ b"}"#));
         assert_eq!(extract_json("no json"), None);
+    }
+
+    #[test]
+    fn c42_hard_caps_are_exact_boundaries_naming_the_transport() {
+        for id in [
+            TransportId::ClaudeCli,
+            TransportId::ClaudeDesktopMcp,
+            TransportId::MessagesApi,
+        ] {
+            let cap = hard_cap_bytes(id);
+            assert!(check_hard_cap(id, cap).is_ok(), "exactly at the cap passes");
+            let err = check_hard_cap(id, cap + 1).unwrap_err();
+            assert!(matches!(err, TransportError::PayloadTooLarge(_)), "{err:?}");
+            assert!(
+                err.to_string().contains(transport_name(id)),
+                "the error names the transport: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn c42_cap_values_match_the_documented_limits() {
+        // API: 32 MB body rejection line minus base64/envelope margin ⇒ 20 MB.
+        assert_eq!(hard_cap_bytes(TransportId::MessagesApi), 20 * 1024 * 1024);
+        // CLI: the documented headless ~10 MB stdin/arg cap (doc 09 §3).
+        assert_eq!(hard_cap_bytes(TransportId::ClaudeCli), 10 * 1024 * 1024);
+        // MCP: conservative 1 MB tool-result policy for Claude Desktop.
+        assert_eq!(hard_cap_bytes(TransportId::ClaudeDesktopMcp), 1024 * 1024);
     }
 }

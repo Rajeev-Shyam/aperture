@@ -6,9 +6,11 @@
 //! component but the gateway touches the network** (doc 12 §1, doc 02 §8).
 //!
 //! The three invariants this crate enforces:
-//! 1. **8 GB VRAM ceiling / single GPU mutex** — [`gpu_scheduler`] holds one
-//!    `Semaphore` permit; [`budget_enforcer`] admits only `<= 7.0 GB` projected,
-//!    **counting co-resident weights** (doc 04 §4, R1, ADR-030).
+//! 1. **VRAM ceiling / single GPU mutex** — [`gpu_scheduler`] holds one
+//!    `Semaphore` permit; [`budget_enforcer`] admits only projections under the
+//!    ceiling (auto-scaled to the installed GPU at startup, decision #43;
+//!    7.0 GB fallback on the 8 GB reference card), **counting co-resident
+//!    weights** (doc 04 §4, R1, ADR-030).
 //! 2. **Two-emitter transparency gate** — this crate opens **no** network
 //!    sockets; the *only* `std::process::Command` it runs is the local sidecar
 //!    spawn in [`model_lifecycle`] (doc 13 §2). Explicit reasoning is *routed*
@@ -18,6 +20,7 @@
 
 pub mod budget_enforcer;
 pub mod gpu_scheduler;
+pub mod model_fetch;
 pub mod model_lifecycle;
 pub mod telemetry;
 pub mod tier_router;
@@ -89,7 +92,15 @@ impl OrchestratedSystem {
         let telemetry = Arc::new(Telemetry::new());
         let lifecycle =
             lifecycle.unwrap_or_else(|| Arc::new(TokioMutex::new(ModelLifecycle::default())));
-        let enforcer = BudgetEnforcer::new(VramTable::seeded());
+        // Decision #43 (reverses ADR-030's locked 7.0): the projection ceiling
+        // auto-scales to the installed GPU. Detected ONCE per process at
+        // startup — this constructor is the shell's composition path, never a
+        // per-request one — and fixed thereafter; detection failure falls back
+        // to the 7.0 GB constant.
+        let enforcer = BudgetEnforcer::with_ceiling(
+            VramTable::seeded(),
+            budget_enforcer::startup_projection_ceiling_gb(),
+        );
         let scheduler = Arc::new(GpuScheduler::new(
             enforcer,
             Arc::clone(&lifecycle),

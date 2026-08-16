@@ -8,16 +8,32 @@
 //  it renders outside the stack.
 //
 //  Publishing is diff-gated (stringified compare) so the IPC only fires when the
-//  layout actually changed. A 250 ms interval catches CSS-animation drift that
-//  MutationObserver cannot see (transform animations mutate no attributes);
-//  the observer makes mount/unmount latency imperceptible.
+//  layout actually changed. Latency layers (decision #11):
+//    - MutationObserver → rAF: mount/unmount and class/style flips publish on
+//      the next frame;
+//    - animation/transition start+end events: bubbles move via transform
+//      animations that mutate no attributes, so their settled rects publish the
+//      moment the animation finishes instead of waiting out the interval;
+//    - the interval is the last-resort net for MID-flight drift the events
+//      bracket but don't cover; 100 ms keeps a moving rect at most one bubble
+//      edge stale.
+//  The Rust side reconciles immediately on every publish (no poll-tick wait).
 
 import { useEffect } from "react";
 
 import { setHitTestRects } from "../lib/ipc";
 
 const SELECTOR = ".surface-interactive, .bubble__overflow";
-const REMEASURE_MS = 250;
+const REMEASURE_MS = 100;
+
+/** Animation boundaries that settle/relocate rects without touching the DOM
+ *  tree — remeasure immediately instead of waiting for the interval. */
+const MOTION_EVENTS = [
+  "animationstart",
+  "animationend",
+  "transitionstart",
+  "transitionend",
+] as const;
 
 export function useHitTestRects(): void {
   useEffect(() => {
@@ -57,11 +73,15 @@ export function useHitTestRects(): void {
       attributes: true,
       attributeFilter: ["class", "style"],
     });
+    // schedule() coalesces via rAF and measure() diff-gates, so per-property
+    // event chatter costs one extra compare, not extra IPC.
+    MOTION_EVENTS.forEach((name) => document.addEventListener(name, schedule));
 
     return () => {
       cancelAnimationFrame(raf);
       clearInterval(interval);
       observer.disconnect();
+      MOTION_EVENTS.forEach((name) => document.removeEventListener(name, schedule));
       // Unmounting the overlay root means nothing is interactive anymore.
       void setHitTestRects([]).catch(() => {});
     };

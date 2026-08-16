@@ -15,7 +15,11 @@
 //! logic testable without the real llama.cpp binary + GGUF weights.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
+
+use tokio::sync::Mutex as TokioMutex;
 
 use crate::vram_table::ModelId;
 
@@ -134,18 +138,84 @@ struct LoadedSidecar {
     loaded_at_ms: i64,
     /// For `IDLE_UNLOAD` (doc 04 §5).
     last_job_at_ms: i64,
-    /// Warm-keep pin (ADR-030/Q36: >=2 PTT/5 min pins STT). M6 sets it; the idle
-    /// sweep honors it.
-    warm_kept: bool,
+}
+
+/// One sidecar kind's slot + crash-ladder state, behind that kind's **own**
+/// async lock (decision #45): a VLM cold-load (15–60 s) holds only the VLM
+/// lock, so an STT acquire never waits behind it.
+#[derive(Default)]
+struct KindState {
+    slot: Option<LoadedSidecar>,
+    restart_attempts: u8,
+    fallback: Option<Fallback>,
+}
+
+/// The state every [`ModelLifecycle`] clone shares. Locking discipline
+/// (decision #45):
+/// - `vlm` / `stt` are **per-kind** locks — the only locks ever held across a
+///   model load or kill, and never both at once from one holder (multi-kind
+///   walks lock sequentially, VLM then STT).
+/// - `resident` is the shared VRAM-budget index: a plain mutex held for map
+///   ops only, **never across a load** — the R1 co-resident read stays instant
+///   while a cold load is in flight.
+/// - warm-keep pins are atomics so the voice thread's sync [`ModelLifecycle::set_warm_kept`]
+///   never waits at all.
+struct Shared {
+    spawner: Arc<dyn Spawner>,
+    vlm: TokioMutex<KindState>,
+    stt: TokioMutex<KindState>,
+    /// Committed-resident models (kind -> model) — the budget's co-resident
+    /// set. Updated only when a slot is actually inserted/removed, so it
+    /// reflects processes that really hold VRAM.
+    resident: StdMutex<HashMap<SidecarKind, ModelId>>,
+    /// Warm-keep pins (ADR-030/Q36: >=2 PTT/5 min pins STT), kind-level so a
+    /// pin survives a reload and never blocks on a loading slot.
+    vlm_warm: AtomicBool,
+    stt_warm: AtomicBool,
+}
+
+impl Shared {
+    fn kind(&self, kind: SidecarKind) -> &TokioMutex<KindState> {
+        match kind {
+            SidecarKind::VlmHost => &self.vlm,
+            SidecarKind::SttHost => &self.stt,
+        }
+    }
+
+    fn warm(&self, kind: SidecarKind) -> &AtomicBool {
+        match kind {
+            SidecarKind::VlmHost => &self.vlm_warm,
+            SidecarKind::SttHost => &self.stt_warm,
+        }
+    }
+
+    fn register(&self, kind: SidecarKind, model: ModelId) {
+        self.resident.lock().expect("resident index").insert(kind, model);
+    }
+
+    fn unregister(&self, kind: SidecarKind) {
+        self.resident.lock().expect("resident index").remove(&kind);
+    }
 }
 
 /// Owns both sidecars and their warm-keep / swap policy (doc 04 §5, doc 12 §5).
 /// Never resident with two heavyweight models in the same slot (invariant 1).
+///
+/// A cheaply **cloneable handle** over shared per-kind state (decision #45):
+/// clones see one set of slots, but each sidecar kind is guarded by its own
+/// lock, so a slow VLM cold-load can never stall an unrelated STT acquire.
+/// The scheduler clones this out from under the shell's facade mutex before a
+/// load (see `acquire_endpoint` in [`crate::gpu_scheduler`]).
 pub struct ModelLifecycle {
-    spawner: Box<dyn Spawner>,
-    slots: HashMap<SidecarKind, LoadedSidecar>,
-    restart_attempts: HashMap<SidecarKind, u8>,
-    fallbacks: HashMap<SidecarKind, Fallback>,
+    shared: Arc<Shared>,
+}
+
+impl Clone for ModelLifecycle {
+    fn clone(&self) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+        }
+    }
 }
 
 impl ModelLifecycle {
@@ -153,76 +223,116 @@ impl ModelLifecycle {
     /// processless fake. No sidecars are loaded until first demanded (doc 12 §6).
     pub fn new(spawner: Box<dyn Spawner>) -> Self {
         Self {
-            spawner,
-            slots: HashMap::new(),
-            restart_attempts: HashMap::new(),
-            fallbacks: HashMap::new(),
+            shared: Arc::new(Shared {
+                spawner: Arc::from(spawner),
+                vlm: TokioMutex::new(KindState::default()),
+                stt: TokioMutex::new(KindState::default()),
+                resident: StdMutex::new(HashMap::new()),
+                vlm_warm: AtomicBool::new(false),
+                stt_warm: AtomicBool::new(false),
+            }),
         }
     }
 
     /// The models currently resident (the scheduler's co-resident set for the R1
-    /// projection, ADR-030).
+    /// projection, ADR-030). Reads the committed-resident index — instant even
+    /// while a cold load holds a kind lock (decision #45).
     pub fn loaded_models(&self) -> Vec<ModelId> {
-        self.slots.values().map(|s| s.model).collect()
+        self.shared
+            .resident
+            .lock()
+            .expect("resident index")
+            .values()
+            .copied()
+            .collect()
     }
 
     /// Ensure `model` is loaded and ready; return its loopback endpoint. Reuses a
     /// ready slot holding the same model, else swaps (kills a different model in
     /// that slot, spawns the requested one). Demand-load on first job (doc 04 §5).
     /// Stamps `last_job_at` so the idle sweep sees fresh activity.
+    ///
+    /// Holds only **this kind's** lock across the (possibly 15–60 s) cold load
+    /// (decision #45): the other sidecar kind stays acquirable throughout.
     pub async fn ensure_loaded(
         &mut self,
         model: ModelId,
         now_ms: i64,
     ) -> Result<String, LifecycleError> {
         let kind = SidecarKind::of(model);
+        let mut state = self.shared.kind(kind).lock().await;
+        Self::ensure_loaded_locked(&self.shared, kind, &mut state, model, now_ms).await
+    }
+
+    /// The load body, with `kind`'s lock already held (shared by
+    /// [`Self::ensure_loaded`] and [`Self::handle_crash`], which must not
+    /// re-lock the non-reentrant kind mutex).
+    async fn ensure_loaded_locked(
+        shared: &Shared,
+        kind: SidecarKind,
+        state: &mut KindState,
+        model: ModelId,
+        now_ms: i64,
+    ) -> Result<String, LifecycleError> {
         // Reuse a ready slot holding the same model.
-        if let Some(slot) = self.slots.get_mut(&kind) {
+        if let Some(slot) = state.slot.as_mut() {
             if slot.model == model && slot.process.is_ready().await {
                 slot.last_job_at_ms = now_ms;
                 return Ok(slot.process.endpoint().to_string());
             }
             // Wrong model (or unhealthy) in this slot — swap it out first.
-            let mut old = self.slots.remove(&kind).expect("slot present");
-            let _ = old.process.kill().await;
+            let _ = Self::kill_locked(shared, kind, state).await;
         }
-        let process = self.spawner.spawn(model).await?;
+        let process = shared.spawner.spawn(model).await?;
         let endpoint = process.endpoint().to_string();
-        self.restart_attempts.remove(&kind);
-        self.fallbacks.remove(&kind);
-        self.slots.insert(
-            kind,
-            LoadedSidecar {
-                process,
-                model,
-                loaded_at_ms: now_ms,
-                last_job_at_ms: now_ms,
-                warm_kept: false,
-            },
-        );
+        state.restart_attempts = 0;
+        state.fallback = None;
+        state.slot = Some(LoadedSidecar {
+            process,
+            model,
+            loaded_at_ms: now_ms,
+            last_job_at_ms: now_ms,
+        });
+        // Commit to the resident index only once the slot is real: the budget's
+        // co-resident set reflects processes that actually hold VRAM. (Admission
+        // and loads are serialized by the scheduler's single running slot, so
+        // no load can race the projection read — doc 12 §3.)
+        shared.register(kind, model);
         Ok(endpoint)
     }
 
-    /// Kill one sidecar — the unload primitive (process death = guaranteed VRAM
-    /// release, doc 12 §5). Idempotent: killing an empty slot is a no-op.
-    pub async fn kill_sidecar(&mut self, kind: SidecarKind) -> Result<(), LifecycleError> {
-        if let Some(mut slot) = self.slots.remove(&kind) {
+    /// Kill the slot under an already-held kind lock, unregistering it from the
+    /// resident index first (map op only — never held across the kill itself).
+    async fn kill_locked(
+        shared: &Shared,
+        kind: SidecarKind,
+        state: &mut KindState,
+    ) -> Result<(), LifecycleError> {
+        if let Some(mut slot) = state.slot.take() {
+            shared.unregister(kind);
             slot.process.kill().await?;
         }
         Ok(())
     }
 
+    /// Kill one sidecar — the unload primitive (process death = guaranteed VRAM
+    /// release, doc 12 §5). Idempotent: killing an empty slot is a no-op.
+    pub async fn kill_sidecar(&mut self, kind: SidecarKind) -> Result<(), LifecycleError> {
+        let mut state = self.shared.kind(kind).lock().await;
+        Self::kill_locked(&self.shared, kind, &mut state).await
+    }
+
     /// Kill **both** sidecars immediately — step 4 of the toggle-OFF sequence
     /// (doc 12 §6). No graceful drain on OFF: the 3 s SLA wins (invariant 3).
-    /// Best-effort: a failed kill on one slot never blocks the other.
+    /// Best-effort: a failed kill on one slot never blocks the other. Kind
+    /// locks are taken sequentially (VLM then STT), never both at once.
     pub async fn kill_all_sidecars(&mut self) -> Result<(), LifecycleError> {
         let mut first_err = None;
         for kind in [SidecarKind::VlmHost, SidecarKind::SttHost] {
-            if let Some(mut slot) = self.slots.remove(&kind) {
-                if let Err(e) = slot.process.kill().await {
-                    tracing::error!(?kind, %e, "sidecar kill failed on OFF");
-                    first_err.get_or_insert(e);
-                }
+            let mut state = self.shared.kind(kind).lock().await;
+            if let Err(e) = Self::kill_locked(&self.shared, kind, &mut state).await {
+                tracing::error!(?kind, %e, "sidecar kill failed on OFF");
+                first_err.get_or_insert(e);
             }
         }
         match first_err {
@@ -231,17 +341,22 @@ impl ModelLifecycle {
         }
     }
 
-    /// Ping a sidecar's health endpoint (doc 12 §5).
+    /// Ping a sidecar's health endpoint (doc 12 §5). Non-blocking on a busy
+    /// kind (decision #45): a held kind lock means a load or crash-restart is
+    /// in flight, which reports as `Loading` rather than waiting behind it.
     pub async fn health(&self, kind: SidecarKind) -> SidecarHealth {
-        if let Some(fb) = self.fallbacks.get(&kind) {
-            return SidecarHealth::Degraded(*fb);
+        let Ok(state) = self.shared.kind(kind).try_lock() else {
+            return SidecarHealth::Loading;
+        };
+        if let Some(fb) = state.fallback {
+            return SidecarHealth::Degraded(fb);
         }
-        if let Some(attempt) = self.restart_attempts.get(&kind) {
-            if *attempt > 0 {
-                return SidecarHealth::Restarting { attempt: *attempt };
-            }
+        if state.restart_attempts > 0 {
+            return SidecarHealth::Restarting {
+                attempt: state.restart_attempts,
+            };
         }
-        match self.slots.get(&kind) {
+        match &state.slot {
             Some(slot) if slot.process.is_ready().await => SidecarHealth::Ready,
             Some(_) => SidecarHealth::Loading,
             None => SidecarHealth::Down,
@@ -251,58 +366,61 @@ impl ModelLifecycle {
     /// On a crash, restart with exponential backoff; after `MAX_RESTART_ATTEMPTS`
     /// mark `Degraded` and fall back (VLM->OCR-only, STT->CPU, doc 12 §5). Returns
     /// the resulting health so the caller (scheduler) can route the degrade.
+    ///
+    /// The backoff + respawn hold only this kind's lock (decision #45): a
+    /// crashing VLM never stalls an STT acquire, and vice versa.
     pub async fn handle_crash(&mut self, kind: SidecarKind, model: ModelId, now_ms: i64) -> SidecarHealth {
+        let mut state = self.shared.kind(kind).lock().await;
         // Drop the dead slot.
-        if let Some(mut slot) = self.slots.remove(&kind) {
-            let _ = slot.process.kill().await;
-        }
-        let attempt = self.restart_attempts.entry(kind).or_insert(0);
-        *attempt += 1;
-        if *attempt > MAX_RESTART_ATTEMPTS {
+        let _ = Self::kill_locked(&self.shared, kind, &mut state).await;
+        state.restart_attempts += 1;
+        if state.restart_attempts > MAX_RESTART_ATTEMPTS {
             let fb = match kind {
                 SidecarKind::VlmHost => Fallback::OcrOnly,
                 SidecarKind::SttHost => Fallback::CpuWhisper,
             };
-            self.fallbacks.insert(kind, fb);
+            state.fallback = Some(fb);
             tracing::error!(?kind, "sidecar degraded after {MAX_RESTART_ATTEMPTS} restarts");
             return SidecarHealth::Degraded(fb);
         }
-        let this_attempt = *attempt;
+        let this_attempt = state.restart_attempts;
         // Exponential backoff before the respawn (doc 12 §5). Callers race this
         // against the job deadline — a slow respawn simply times the job out.
         let backoff = Duration::from_millis(250 * (1u64 << (this_attempt - 1)));
         tokio::time::sleep(backoff).await;
-        match self.ensure_loaded(model, now_ms).await {
-            Ok(_) => {
-                self.restart_attempts.remove(&kind);
-                SidecarHealth::Ready
-            }
+        match Self::ensure_loaded_locked(&self.shared, kind, &mut state, model, now_ms).await {
+            // Success resets the counter inside `ensure_loaded_locked`.
+            Ok(_) => SidecarHealth::Ready,
             Err(_) => SidecarHealth::Restarting { attempt: this_attempt },
         }
     }
 
     /// Idle-unload sweep: kill any sidecar idle > `IDLE_UNLOAD` (doc 04 §5).
     /// Honors the warm-keep policy (ADR-030/Q36: a warm-kept STT is pinned).
+    /// A kind whose lock is held is mid-load — busy, not idle — so the sweep
+    /// `try_lock`s and never queues behind a cold load (decision #45).
     pub async fn idle_sweep(&mut self, now_ms: i64) {
         let idle_ms = IDLE_UNLOAD.as_millis() as i64;
-        let to_kill: Vec<SidecarKind> = self
-            .slots
-            .iter()
-            .filter(|(_, s)| !s.warm_kept && now_ms - s.last_job_at_ms >= idle_ms)
-            .map(|(k, _)| *k)
-            .collect();
-        for kind in to_kill {
-            tracing::info!(?kind, "idle-unload after 60 s (doc 04 §5)");
-            let _ = self.kill_sidecar(kind).await;
+        for kind in [SidecarKind::VlmHost, SidecarKind::SttHost] {
+            let Ok(mut state) = self.shared.kind(kind).try_lock() else {
+                continue;
+            };
+            let idle = !self.shared.warm(kind).load(Ordering::SeqCst)
+                && matches!(&state.slot, Some(s) if now_ms - s.last_job_at_ms >= idle_ms);
+            if idle {
+                tracing::info!(?kind, "idle-unload after 60 s (doc 04 §5)");
+                let _ = Self::kill_locked(&self.shared, kind, &mut state).await;
+            }
         }
     }
 
     /// Pin/unpin a sidecar's warm-keep (ADR-030/Q36 — >=2 PTT/5 min pins STT).
     /// M6 drives this from the PTT counter; exposed now so `idle_sweep` honors it.
+    /// Kind-level and atomic (decision #45): the voice thread never waits on a
+    /// loading slot, and the pin survives a reload (the PTT-frequency policy is
+    /// about the kind, not one process instance).
     pub fn set_warm_kept(&mut self, kind: SidecarKind, warm: bool) {
-        if let Some(slot) = self.slots.get_mut(&kind) {
-            slot.warm_kept = warm;
-        }
+        self.shared.warm(kind).store(warm, Ordering::SeqCst);
     }
 
     /// L2 only: evict the resident VLM so an arriving STT job can load into the
@@ -316,14 +434,15 @@ impl ModelLifecycle {
     /// VLM's VRAM (doc 12 §5), so the STT load that follows fits under 7.0 GB
     /// (ADR-030). The caller then loads STT via [`ensure_loaded`](Self::ensure_loaded).
     pub async fn l2_swap_to_stt(&mut self, now_ms: i64) -> Result<SwapOutcome, LifecycleError> {
-        let thrash_risk = match self.slots.get(&SidecarKind::VlmHost) {
+        let mut state = self.shared.kind(SidecarKind::VlmHost).lock().await;
+        let thrash_risk = match &state.slot {
             Some(slot) => {
                 let resident_ms = now_ms.saturating_sub(slot.loaded_at_ms);
                 resident_ms < L2_MIN_RESIDENCY.as_millis() as i64
             }
             None => return Ok(SwapOutcome::SlotAlreadyFree),
         };
-        self.kill_sidecar(SidecarKind::VlmHost).await?;
+        Self::kill_locked(&self.shared, SidecarKind::VlmHost, &mut state).await?;
         Ok(SwapOutcome::Swapped { thrash_risk })
     }
 }
@@ -604,8 +723,9 @@ mod os_spawn {
         while tokio::time::Instant::now() < deadline {
             // A host that already exited (port collision, missing binary or
             // model) can never become healthy — fail fast instead of burning
-            // the full cold-load window while the lifecycle mutex blocks the
-            // voice thread and every VLM job (2026-08-15 review).
+            // the full cold-load window while this kind's lifecycle lock
+            // blocks every job of the same kind (2026-08-15 review; the lock
+            // is per-kind since decision #45).
             if let Ok(Some(status)) = sidecar.child.try_wait() {
                 return Err(LifecycleError::Spawn(format!(
                     "sidecar exited during cold load: {status}"
@@ -797,6 +917,69 @@ mod tests {
         let outcome = life.l2_swap_to_stt(50_000).await.unwrap();
         assert_eq!(outcome, SwapOutcome::SlotAlreadyFree);
         assert!(!spawner.vlm_killed.load(Ordering::SeqCst));
+    }
+
+    /// Decision #45: per-kind locking — a slow VLM cold-load must never stall
+    /// an unrelated STT acquire. Under the old single lifecycle lock this test
+    /// deadlines out; with split kind locks the STT acquire completes while
+    /// the VLM spawn is still parked.
+    #[tokio::test]
+    async fn an_in_flight_vlm_cold_load_never_blocks_an_stt_acquire() {
+        use tokio::sync::Notify;
+
+        /// VLM spawns park until released (a simulated 15–60 s cold load);
+        /// STT spawns return immediately.
+        struct GatedSpawner {
+            vlm_started: Arc<Notify>,
+            release_vlm: Arc<Notify>,
+        }
+        #[async_trait::async_trait]
+        impl Spawner for GatedSpawner {
+            async fn spawn(&self, model: ModelId) -> Result<Box<dyn SidecarProcess>, LifecycleError> {
+                if SidecarKind::of(model) == SidecarKind::VlmHost {
+                    self.vlm_started.notify_one();
+                    self.release_vlm.notified().await;
+                }
+                Ok(Box::new(FakeSidecar {
+                    endpoint: "http://127.0.0.1:9999".into(),
+                    killed: Arc::new(AtomicBool::new(false)),
+                }))
+            }
+        }
+
+        let vlm_started = Arc::new(Notify::new());
+        let release_vlm = Arc::new(Notify::new());
+        let life = ModelLifecycle::new(Box::new(GatedSpawner {
+            vlm_started: Arc::clone(&vlm_started),
+            release_vlm: Arc::clone(&release_vlm),
+        }));
+
+        let mut vlm_life = life.clone();
+        let vlm_task =
+            tokio::spawn(async move { vlm_life.ensure_loaded(ModelId::Vlm3b, 0).await });
+        // The VLM load is now in flight, holding the VLM kind lock.
+        vlm_started.notified().await;
+
+        let mut stt_life = life.clone();
+        let stt = tokio::time::timeout(
+            Duration::from_secs(1),
+            stt_life.ensure_loaded(ModelId::FasterWhisperSmall, 0),
+        )
+        .await
+        .expect("STT acquire must not wait behind the VLM cold load (decision #45)");
+        assert!(stt.is_ok());
+        assert_eq!(
+            life.loaded_models(),
+            vec![ModelId::FasterWhisperSmall],
+            "only the committed STT is resident while the VLM still loads"
+        );
+
+        // Release the parked VLM load; both end up resident.
+        release_vlm.notify_one();
+        vlm_task.await.unwrap().unwrap();
+        let loaded = life.loaded_models();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.contains(&ModelId::Vlm3b));
     }
 
     /// Adapts an `Arc<FakeSpawner>` to the `Spawner` trait (tests share the

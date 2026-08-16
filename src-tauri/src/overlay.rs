@@ -62,6 +62,88 @@ pub struct OverlayPlacement {
     pub height: u32,
 }
 
+/// The overlay window label for monitor-enumeration index `i` — the single
+/// naming rule shared by [`plan_overlays`] (window creation) and the
+/// cursor→window routing (decision #13), so they can never disagree.
+pub fn overlay_label(i: usize) -> String {
+    if i == 0 {
+        OVERLAY_LABEL.to_string()
+    } else {
+        format!("{OVERLAY_LABEL}-{i}")
+    }
+}
+
+/// Index of the monitor containing `pos` (physical px), or `None` when no
+/// monitor does (a cursor mid-transition, a stale enumeration). Pure. Bounds
+/// are half-open (`[x, x+w)`) so a shared edge belongs to exactly one monitor.
+pub fn monitor_index_at(pos: (i32, i32), monitors: &[MonitorInfo]) -> Option<usize> {
+    let (cx, cy) = pos;
+    monitors.iter().position(|m| {
+        cx >= m.x
+            && cx < m.x + m.width as i32
+            && cy >= m.y
+            && cy < m.y + m.height as i32
+    })
+}
+
+/// The overlay window under the cursor RIGHT NOW — where a summoned control
+/// surface should open (decision #13: controls follow the user). Falls back to
+/// the primary [`OVERLAY_LABEL`] whenever the cursor/monitor query fails or the
+/// mapped window does not exist (e.g. the per-monitor fan-out failed at setup).
+pub fn cursor_overlay_label(app: &AppHandle) -> String {
+    use tauri::Manager;
+    let mapped = crate::hit_test::cursor_pos().and_then(|cursor| {
+        let monitors = app.available_monitors().ok()?;
+        let infos: Vec<MonitorInfo> = monitors.iter().map(monitor_info).collect();
+        monitor_index_at(cursor, &infos).map(overlay_label)
+    });
+    match mapped {
+        Some(label) if app.get_webview_window(&label).is_some() => label,
+        _ => OVERLAY_LABEL.to_string(),
+    }
+}
+
+/// Which overlay window currently shows the Context-Preview panel, if any —
+/// the routing target for core-staged preview requests (decision #13): a new
+/// MCP request must QUEUE behind the panel the user may be mid-edit in, never
+/// open a second panel on another monitor. Set/cleared by the UI via the
+/// `set_preview_host` command as its panel opens/closes; claiming broadcasts
+/// `preview_claimed` so every other window folds its copy (exactly one
+/// instance across monitors — the 08-15 dismissal-convergence pattern).
+#[derive(Default)]
+pub struct PreviewHost(std::sync::Mutex<Option<String>>);
+
+impl PreviewHost {
+    /// `label`'s panel is now open — it becomes the routing target.
+    pub fn claim(&self, label: &str) {
+        *self.lock() = Some(label.to_string());
+    }
+
+    /// `label`'s panel closed. Only the current host may clear the slot: a
+    /// displaced window's teardown must not un-claim the window that took over.
+    pub fn release(&self, label: &str) {
+        let mut host = self.lock();
+        if host.as_deref() == Some(label) {
+            *host = None;
+        }
+    }
+
+    pub fn get(&self) -> Option<String> {
+        self.lock().clone()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+/// Map a `tauri::Monitor` to the pure [`MonitorInfo`] descriptor.
+fn monitor_info(m: &tauri::Monitor) -> MonitorInfo {
+    let p = m.position();
+    let s = m.size();
+    MonitorInfo { x: p.x, y: p.y, width: s.width, height: s.height }
+}
+
 /// Plan one overlay per monitor (doc 11 §2), **pure**: the primary (index 0)
 /// reuses [`OVERLAY_LABEL`] (the config window, Q42); each subsequent monitor gets
 /// `overlay-1`, `overlay-2`, … Every overlay exactly covers its monitor in
@@ -71,11 +153,7 @@ pub fn plan_overlays(monitors: &[MonitorInfo]) -> Vec<OverlayPlacement> {
         .iter()
         .enumerate()
         .map(|(i, m)| OverlayPlacement {
-            label: if i == 0 {
-                OVERLAY_LABEL.to_string()
-            } else {
-                format!("{OVERLAY_LABEL}-{i}")
-            },
+            label: overlay_label(i),
             x: m.x,
             y: m.y,
             width: m.width,
@@ -98,14 +176,7 @@ pub fn create_overlays(app: &AppHandle) -> Result<Vec<WebviewWindow>, OverlayErr
     let monitors = app
         .available_monitors()
         .map_err(|e| OverlayError::MonitorEnum(e.to_string()))?;
-    let infos: Vec<MonitorInfo> = monitors
-        .iter()
-        .map(|m| {
-            let p = m.position();
-            let s = m.size();
-            MonitorInfo { x: p.x, y: p.y, width: s.width, height: s.height }
-        })
-        .collect();
+    let infos: Vec<MonitorInfo> = monitors.iter().map(monitor_info).collect();
 
     let mut windows = Vec::with_capacity(infos.len());
     for placement in plan_overlays(&infos) {
@@ -321,5 +392,72 @@ mod tests {
     #[test]
     fn no_monitors_means_no_overlays() {
         assert!(plan_overlays(&[]).is_empty());
+    }
+
+    // --- decision #13: cursor -> monitor -> overlay-window routing ---------
+
+    #[test]
+    fn cursor_maps_to_its_containing_monitor_incl_negative_origins() {
+        let monitors = [
+            mon(0, 0, 2560, 1440),
+            mon(2560, 0, 1920, 1080),
+            mon(-1920, 200, 1920, 1080),
+        ];
+        assert_eq!(monitor_index_at((100, 100), &monitors), Some(0));
+        assert_eq!(monitor_index_at((3000, 500), &monitors), Some(1));
+        assert_eq!(monitor_index_at((-500, 300), &monitors), Some(2));
+    }
+
+    #[test]
+    fn monitor_bounds_are_half_open_so_shared_edges_pick_one_monitor() {
+        let monitors = [mon(0, 0, 2560, 1440), mon(2560, 0, 1920, 1080)];
+        // x = 2560 is the first pixel OF the second monitor, not the last of
+        // the first — a cursor on the seam maps to exactly one window.
+        assert_eq!(monitor_index_at((2559, 0), &monitors), Some(0));
+        assert_eq!(monitor_index_at((2560, 0), &monitors), Some(1));
+        // Bottom/right edges are exclusive.
+        assert_eq!(monitor_index_at((2560, 1080), &monitors), None);
+    }
+
+    #[test]
+    fn a_cursor_on_no_monitor_maps_to_none() {
+        assert_eq!(monitor_index_at((5000, 5000), &[mon(0, 0, 2560, 1440)]), None);
+        assert_eq!(monitor_index_at((0, 0), &[]), None);
+    }
+
+    #[test]
+    fn routing_labels_agree_with_the_planned_window_labels() {
+        let monitors = [mon(0, 0, 2560, 1440), mon(2560, 0, 1920, 1080)];
+        let plan = plan_overlays(&monitors);
+        for (i, placement) in plan.iter().enumerate() {
+            assert_eq!(overlay_label(i), placement.label);
+        }
+        let idx = monitor_index_at((2700, 40), &monitors).expect("second monitor");
+        assert_eq!(overlay_label(idx), "overlay-1");
+    }
+
+    // --- decision #13: single preview host across windows ------------------
+
+    #[test]
+    fn preview_host_claim_and_release() {
+        let host = PreviewHost::default();
+        assert_eq!(host.get(), None);
+        host.claim("overlay");
+        assert_eq!(host.get(), Some("overlay".to_string()));
+        host.release("overlay");
+        assert_eq!(host.get(), None);
+    }
+
+    #[test]
+    fn a_displaced_windows_release_cannot_unclaim_the_new_host() {
+        let host = PreviewHost::default();
+        host.claim("overlay");
+        // The user summons the panel on monitor 1; the primary's teardown
+        // (its close effect) races in afterwards and must be a no-op.
+        host.claim("overlay-1");
+        host.release("overlay");
+        assert_eq!(host.get(), Some("overlay-1".to_string()));
+        host.release("overlay-1");
+        assert_eq!(host.get(), None);
     }
 }

@@ -12,8 +12,13 @@
 //!      it arrives here as a `media_state` event — the primary, reliable source;
 //!   2. `t=` present in the observed URL (e.g. after "copy at current time") —
 //!      exact fallback;
-//!   3. otherwise unknown ⇒ `position_s = null` ⇒ "from the start".
+//!   3. an **estimate** (decision #36): the last rung-1/2 position this connector
+//!      observed for the *same video* (within the video staleness TTL), rewound
+//!      a safety margin — honest-labeled `estimated`, never invented;
+//!   4. truly nothing known ⇒ `position_s = null` ⇒ "from the start".
 
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use aperture_contracts::connector::ConnectorError;
@@ -54,6 +59,10 @@ pub enum PositionSource {
     /// From the extension content script's `video.currentTime` (rung 1, ADR-027)
     /// riding a `media_state` event — the primary, reliable source.
     MediaState,
+    /// Estimated (rung 3, decision #36): the last rung-1/2 position observed for
+    /// this video, rewound by [`ESTIMATE_REWIND_S`]. Approximate by construction
+    /// — bubble copy must say "near where you left off", not claim precision.
+    Estimated,
     /// Unknown — `position_s` is null.
     #[default]
     None,
@@ -61,14 +70,87 @@ pub enum PositionSource {
 
 /// The YouTube connector — **built first at M4** (Q75) since it exercises the
 /// whole extension + native-messaging path earliest.
-#[derive(Debug, Default, Clone)]
-pub struct YoutubeConnector;
+#[derive(Debug, Default)]
+pub struct YoutubeConnector {
+    /// `video_id` → last *known* (rung-1/2) position, feeding the rung-3
+    /// estimate (decision #36). In-memory only — a restart just loses the
+    /// estimate rung until positions are observed again; already-persisted
+    /// rows keep theirs. Bounded at [`POSITION_MEMORY_CAP`] with
+    /// oldest-observation eviction, never clear-all (the #35 lesson).
+    last_positions: Mutex<HashMap<String, ObservedPosition>>,
+}
 
-const TTL_7D: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// A rung-1/2 position observation remembered for rung-3 estimates (decision #36).
+#[derive(Debug, Clone, Copy)]
+struct ObservedPosition {
+    position_s: u32,
+    observed_ts: i64,
+}
+
+/// Decision #37 (per-connector-type staleness): video goes stale *fast* — a
+/// paused video is picked back up within a few days or effectively abandoned,
+/// and a days-old position is likelier to be wrong (finished, or re-watched
+/// elsewhere) than useful. 3 d, down from the flat 7 d [ASSUMPTION doc 10 §3]
+/// the audit flagged.
+const TTL_3D: Duration = Duration::from_secs(3 * 24 * 60 * 60);
+
+/// Rung-3 rewind (decision #36): resume this far *before* the last-observed
+/// position so the user re-orients, and so an over-estimate never skips
+/// content they haven't seen. 30 s ≈ one spoken thought.
+const ESTIMATE_REWIND_S: u32 = 30;
+
+/// Bound on the rung-3 position memory. 256 distinct videos per app run is
+/// generous for a per-video watch memory.
+const POSITION_MEMORY_CAP: usize = 256;
 
 impl YoutubeConnector {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Feed the rung-3 memory with a rung-1/2 (known) position observation.
+    /// Estimates are never fed back — no compounding drift.
+    fn remember_position(&self, video_id: &str, position_s: u32, observed_ts: i64) {
+        // Poisoned lock ⇒ skip: the memory is best-effort; losing it only means
+        // falling to the honest "from the start" floor, never a wrong position.
+        let Ok(mut map) = self.last_positions.lock() else {
+            return;
+        };
+        if map.len() >= POSITION_MEMORY_CAP && !map.contains_key(video_id) {
+            // Evict only the oldest observation (#35 lesson: wholesale clears
+            // silently drop still-useful entries).
+            if let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, o)| o.observed_ts)
+                .map(|(id, _)| id.clone())
+            {
+                map.remove(&oldest);
+            }
+        }
+        map.insert(
+            video_id.to_string(),
+            ObservedPosition {
+                position_s,
+                observed_ts,
+            },
+        );
+    }
+
+    /// Rung 3 (decision #36): estimate a resume position from the last-observed
+    /// known position for this video, rewound by [`ESTIMATE_REWIND_S`]. `None`
+    /// when nothing (trustworthy) was ever observed — the honest floor.
+    fn estimate_position(&self, video_id: &str, now_ts: i64) -> Option<u32> {
+        let ttl_ms = self.staleness_ttl().as_millis() as i64;
+        let map = self.last_positions.lock().ok()?;
+        let obs = map.get(video_id)?;
+        // Out-of-order delivery is real (media ticks race UIA navigations), so
+        // a "future" observation is fine; only one older than the video
+        // staleness TTL is dropped — past it our own staleness policy says the
+        // position is no longer trustworthy.
+        if now_ts - obs.observed_ts > ttl_ms {
+            return None;
+        }
+        Some(obs.position_s.saturating_sub(ESTIMATE_REWIND_S))
     }
 
     /// Parse `(video_id, position_s)` from a watch URL, honoring the position
@@ -233,6 +315,20 @@ impl Connector for YoutubeConnector {
             _ => return None,
         };
 
+        // Rung 3 (decision #36): a known position feeds the last-observed
+        // memory; an unknown one consults it for a rewound estimate. A miss
+        // stays the honest `null` ⇒ "from the start" floor (rung 4).
+        let (position_s, position_source) = match position_s {
+            Some(p) => {
+                self.remember_position(&video_id, p, ev.ts);
+                (Some(p), position_source)
+            }
+            None => match self.estimate_position(&video_id, ev.ts) {
+                Some(est) => (Some(est), PositionSource::Estimated),
+                None => (None, PositionSource::None),
+            },
+        };
+
         let title = payload_str(ev, "title")
             .filter(|t| !t.is_empty())
             .map(str::to_string)
@@ -256,8 +352,9 @@ impl Connector for YoutubeConnector {
     }
 
     fn staleness_ttl(&self) -> Duration {
-        // TTL 7 d (doc 10 §3 [ASSUMPTION]).
-        TTL_7D
+        // Decision #37: per-type TTL — see [`TTL_3D`] for why video is shortest
+        // after browser.
+        TTL_3D
     }
 
     fn reconstruct(&self, st: &ConnectorState) -> Result<ResumeArtifact, ConnectorError> {
@@ -438,7 +535,8 @@ mod tests {
         let st = c.capture(&ev).expect("captured");
         assert_eq!(st.connector_type, "youtube");
         assert_eq!(st.payload_version, 1);
-        assert_eq!(st.stale_after_ts, Some(ev.ts + 7 * 24 * 60 * 60 * 1000));
+        // Decision #37: video TTL is 3 d (goes stale fast).
+        assert_eq!(st.stale_after_ts, Some(ev.ts + 3 * 24 * 60 * 60 * 1000));
         let p: YoutubePayloadV1 = serde_json::from_value(st.reconstruct_payload).unwrap();
         assert_eq!(p.position_s, None);
         assert_eq!(p.position_source, PositionSource::None);
@@ -457,10 +555,13 @@ mod tests {
             }
             other => panic!("expected Url, got {other:?}"),
         }
-        let st = c
+        // Fresh connector: the instance above now *remembers* 754 for this video
+        // and would estimate (rung 3, decision #36) — covered by its own tests.
+        let c2 = YoutubeConnector::new();
+        let st = c2
             .capture(&nav_event("https://www.youtube.com/watch?v=dQw4w9WgXcQ", None))
             .unwrap();
-        match c.reconstruct(&st).unwrap() {
+        match c2.reconstruct(&st).unwrap() {
             ResumeArtifact::Url(u) => assert_eq!(u, "https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
             other => panic!("expected Url, got {other:?}"),
         }
@@ -486,6 +587,130 @@ mod tests {
         // Missing/garbage id → button withheld.
         assert!(c.validate(&json!({ "position_s": 90 })).is_none());
         assert!(c.validate(&json!({ "video_id": "***" })).is_none());
+    }
+
+    #[test]
+    fn position_unknown_estimates_from_last_observed_position() {
+        // Rung 3 (decision #36): a later position-less capture of the same video
+        // resumes near the last rung-1 observation, rewound the safety margin.
+        let c = YoutubeConnector::new();
+        c.capture(&media_event("dQw4w9WgXcQ", "https://youtu.be/dQw4w9WgXcQ", Some(754.0)))
+            .expect("rung-1 capture");
+        let mut ev = nav_event("https://www.youtube.com/watch?v=dQw4w9WgXcQ", None);
+        ev.ts = 3_000_000; // later, extension gone quiet
+        let st = c.capture(&ev).expect("captured");
+        let p: YoutubePayloadV1 =
+            serde_json::from_value(st.reconstruct_payload.clone()).unwrap();
+        assert_eq!(p.position_s, Some(754 - ESTIMATE_REWIND_S));
+        assert_eq!(p.position_source, PositionSource::Estimated);
+        // And the estimate flows into the resume URL like any position.
+        match c.reconstruct(&st).unwrap() {
+            ResumeArtifact::Url(u) => assert!(u.ends_with("&t=724s"), "got {u}"),
+            other => panic!("expected Url, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn url_t_param_feeds_the_estimate_memory() {
+        // Rung 2 observations count as "last observed" too.
+        let c = YoutubeConnector::new();
+        c.capture(&nav_event("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=100", None))
+            .expect("rung-2 capture");
+        // Position-less media event whose URL has no t= ⇒ rung 3.
+        let mut ev = media_event("dQw4w9WgXcQ", "https://www.youtube.com/watch?v=dQw4w9WgXcQ", None);
+        ev.ts = 1_500_000;
+        let st = c.capture(&ev).expect("captured");
+        let p: YoutubePayloadV1 = serde_json::from_value(st.reconstruct_payload).unwrap();
+        assert_eq!(p.position_s, Some(100 - ESTIMATE_REWIND_S));
+        assert_eq!(p.position_source, PositionSource::Estimated);
+    }
+
+    #[test]
+    fn estimate_rewind_clamps_at_zero() {
+        let c = YoutubeConnector::new();
+        c.capture(&media_event("dQw4w9WgXcQ", "https://youtu.be/dQw4w9WgXcQ", Some(10.0)))
+            .expect("rung-1 capture");
+        let mut ev = nav_event("https://www.youtube.com/watch?v=dQw4w9WgXcQ", None);
+        ev.ts = 3_000_000;
+        let p: YoutubePayloadV1 =
+            serde_json::from_value(c.capture(&ev).unwrap().reconstruct_payload).unwrap();
+        assert_eq!(p.position_s, Some(0));
+        assert_eq!(p.position_source, PositionSource::Estimated);
+    }
+
+    #[test]
+    fn estimate_never_crosses_videos() {
+        let c = YoutubeConnector::new();
+        c.capture(&media_event("dQw4w9WgXcQ", "https://youtu.be/dQw4w9WgXcQ", Some(754.0)))
+            .expect("rung-1 capture");
+        // A *different* video with no position stays the honest floor (rung 4).
+        let st = c
+            .capture(&nav_event("https://www.youtube.com/watch?v=oHg5SJYRHA0", None))
+            .expect("captured");
+        let p: YoutubePayloadV1 = serde_json::from_value(st.reconstruct_payload).unwrap();
+        assert_eq!(p.position_s, None);
+        assert_eq!(p.position_source, PositionSource::None);
+    }
+
+    #[test]
+    fn estimate_expires_with_the_video_ttl() {
+        // An observation older than the video staleness TTL is no longer
+        // trustworthy by our own policy ⇒ honest "from the start" floor.
+        let c = YoutubeConnector::new();
+        c.capture(&media_event("dQw4w9WgXcQ", "https://youtu.be/dQw4w9WgXcQ", Some(754.0)))
+            .expect("rung-1 capture"); // observed at ts 2_000_000
+        let mut ev = nav_event("https://www.youtube.com/watch?v=dQw4w9WgXcQ", None);
+        ev.ts = 2_000_000 + 3 * 24 * 60 * 60 * 1000 + 1;
+        let p: YoutubePayloadV1 =
+            serde_json::from_value(c.capture(&ev).unwrap().reconstruct_payload).unwrap();
+        assert_eq!(p.position_s, None);
+        assert_eq!(p.position_source, PositionSource::None);
+    }
+
+    #[test]
+    fn estimates_do_not_compound() {
+        // Estimates never feed back into the memory: repeated position-less
+        // captures rewind from the same observation, not from each other.
+        let c = YoutubeConnector::new();
+        c.capture(&media_event("dQw4w9WgXcQ", "https://youtu.be/dQw4w9WgXcQ", Some(754.0)))
+            .expect("rung-1 capture");
+        for ts in [3_000_000, 4_000_000] {
+            let mut ev = nav_event("https://www.youtube.com/watch?v=dQw4w9WgXcQ", None);
+            ev.ts = ts;
+            let p: YoutubePayloadV1 =
+                serde_json::from_value(c.capture(&ev).unwrap().reconstruct_payload).unwrap();
+            assert_eq!(p.position_s, Some(754 - ESTIMATE_REWIND_S));
+        }
+    }
+
+    #[test]
+    fn position_memory_is_bounded_with_oldest_eviction() {
+        let c = YoutubeConnector::new();
+        // Fill the memory: distinct plausible ids, strictly increasing ts.
+        for i in 0..POSITION_MEMORY_CAP {
+            let id = format!("vid{i:08}");
+            let mut ev = media_event(&id, "", Some(60.0));
+            ev.ts = 1_000_000 + i as i64;
+            c.capture(&ev).expect("captured");
+        }
+        // One more evicts exactly the oldest observation (vid00000000)…
+        let mut ev = media_event("overflow0000", "", Some(60.0));
+        ev.ts = 2_000_000;
+        c.capture(&ev).expect("captured");
+        let now = 2_100_000;
+        assert_eq!(c.estimate_position("vid00000000", now), None, "oldest evicted");
+        // …while the second-oldest and the newcomer both survive.
+        assert_eq!(c.estimate_position("vid00000001", now), Some(30));
+        assert_eq!(c.estimate_position("overflow0000", now), Some(30));
+    }
+
+    #[test]
+    fn position_source_estimated_serializes_snake_case() {
+        // Additive payload field (doc 15 §6): the new variant's wire form.
+        assert_eq!(
+            serde_json::to_value(PositionSource::Estimated).unwrap(),
+            json!("estimated")
+        );
     }
 
     #[test]

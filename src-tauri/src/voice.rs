@@ -166,11 +166,20 @@ fn run(app: tauri::AppHandle, mut deps: VoiceDeps) {
 
         // 4b. Live mic level for the listening pill at ~10 Hz — without it the
         // "waveform" sat frozen for the whole hold, indistinguishable from a
-        // dead mic (2026-08-15 review).
+        // dead mic (2026-08-15 review). The same event carries elapsed/max so
+        // the pill can count down to the 30 s force-finalize (decision #28) off
+        // the ONE clock that actually enforces it — UI and core cannot drift.
         if let Some(level) = vs.live_level() {
             if last_level_emit.elapsed() >= Duration::from_millis(100) {
                 last_level_emit = std::time::Instant::now();
-                emit(&app, serde_json::json!({ "surface": "listening", "level": level }));
+                let elapsed_ms =
+                    vs.recording_elapsed().map(|e| e.as_millis() as u64).unwrap_or(0);
+                emit(&app, serde_json::json!({
+                    "surface": "listening",
+                    "level": level,
+                    "elapsed_ms": elapsed_ms,
+                    "max_ms": MAX_UTTERANCE.as_millis() as u64,
+                }));
             }
         }
 
@@ -318,15 +327,19 @@ fn finish_utterance(
             emit(app, serde_json::json!({
                 "surface": "transcript",
                 "text": transcript,
-                // The chip exists BECAUSE confidence was below the 0.6 floor
-                // (doc 07 §4.4); the UI renders the "Did you say…?" affordance,
-                // not the number.
+                // The chip exists BECAUSE confidence was below the configured
+                // floor (voice.intent_confidence_floor, decision #27; doc 07
+                // §4.4); the UI renders the "Did you say…?" affordance, not the
+                // number.
                 "confidence": 0.0,
             }));
         }
         Ok(UtteranceOutcome::Answer(bubble)) => emit_answer(app, &bubble),
-        Ok(UtteranceOutcome::EscalationDraft { transcript }) => {
-            remember(deps, &transcript);
+        Ok(UtteranceOutcome::EscalationDraft { transcript, query }) => {
+            // Seed the preview's user_addition with the actual QUESTION, not
+            // the "ask claude" prefix (decision #29); a bare "ask claude"
+            // falls back to the whole transcript.
+            remember(deps, query.as_deref().unwrap_or(&transcript));
             // NEVER auto-sent (doc 07 §4.2): surface an answer card whose only
             // affordance is "Ask Claude" — that opens the preview→Send gate.
             emit(app, serde_json::json!({

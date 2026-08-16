@@ -44,6 +44,15 @@ pub const TOOL_SEARCH_HISTORY: &str = "aperture_search_history";
 /// Claude Desktop) to the RUNNING app, where the approval gate lives.
 pub const MCP_PIPE_NAME: &str = r"\\.\pipe\aperture-mcp-v1";
 
+/// Hard cap on one released MCP payload (decision #42). Source: the MCP spec
+/// (JSON-RPC 2.0 over stdio) defines **no** message-size limit (researched
+/// 2026-08), but Claude Desktop degrades on large tool results — 1 MB is a
+/// conservative local policy that still dwarfs everything the current tools
+/// stage (gated search: ≤ 20 rows × ≤ 300 chars). Enforced at the app-side
+/// release gate (`mcp_bridge::get_context`); hard stop, never auto-shrink
+/// (decision #40).
+pub const MCP_RESULT_MAX_BYTES: usize = 1024 * 1024;
+
 /// The MCP server executable Claude Desktop launches for Aperture. The startup
 /// registration passes the resolved absolute path instead (see `register_with_command`).
 const MCP_SERVER_COMMAND: &str = "aperture-mcp";

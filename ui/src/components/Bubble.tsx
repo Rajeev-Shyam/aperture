@@ -223,9 +223,9 @@ export function Bubble({
               role="menuitem"
               onClick={() => {
                 setOverflowOpen(false);
-                // Opens the exclusion manager on the primary overlay — the
-                // bubble doesn't know its source process, so the user picks
-                // the app there (doc 13 §4). The bubble stays.
+                // Opens the exclusion manager on THIS monitor (decision #13)
+                // — the bubble doesn't know its source process, so the user
+                // picks the app there (doc 13 §4). The bubble stays.
                 void openPrivacy().catch(() => {});
               }}
             >

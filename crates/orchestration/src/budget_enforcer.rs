@@ -1,10 +1,11 @@
 //! The R1 projection check + the R3 degrade ladder (doc 04 §6, doc 12 §4).
 //!
-//! Invariant (1): the 8 GB VRAM ceiling. Every load/job is admitted **iff**
+//! Invariant (1): the VRAM ceiling. Every load/job is admitted **iff**
 //! ```text
 //! projected = active(weights + mmproj + kv_est(ctx_tokens) + img_act(n_images))
 //!           + framework + co_resident_weights      // ADR-030: co-resident weights ARE counted
-//! projected <= 7.0 GB        // 1.0 GB margin under the 8 GB ceiling (doc 04 R1)
+//! projected <= ceiling_gb    // detected total VRAM − 1.0 GB headroom (decision #43);
+//!                            // falls back to the 7.0 GB constant (doc 04 R1, 8 GB GPU)
 //! ```
 //! On refusal the caller is hung off the R3 degrade ladder (doc 04 §6) rather
 //! than left guessing — the projection rides back in
@@ -18,9 +19,87 @@
 
 use crate::vram_table::{ModelId, VramTable};
 
-/// The hard projection ceiling: 1.0 GB under the 8 GB GPU (doc 04 R1, ADR-030;
-/// amended from R1's 7.2 — the projection now counts co-resident weights).
+/// The **fallback** projection ceiling: 1.0 GB under the 8 GB GPU (doc 04 R1,
+/// ADR-030; amended from R1's 7.2 — the projection now counts co-resident
+/// weights). ADR-030 documented 7.0 as locked; **decision #43 reversed that**:
+/// the production ceiling auto-scales to the installed GPU (see
+/// [`startup_projection_ceiling_gb`]), and this constant remains only as the
+/// detection-failure fallback (and the deterministic default for tests).
 pub const PROJECTION_CEILING_GB: f32 = 7.0;
+
+/// OS/compositor VRAM headroom subtracted from the detected total (decision
+/// #43) — the same 1.0 GB margin doc 04 R1 kept under the 8 GB GPU.
+const VRAM_HEADROOM_GB: f32 = 1.0;
+/// Sane clamp bounds for a *detected* ceiling (decision #43). The floor guards
+/// an absurd parse, not usability — a 2 GB budget honestly refuses every model,
+/// which beats projecting against garbage. The cap covers the largest consumer
+/// card (32 GB) minus headroom.
+const DETECTED_CEILING_MIN_GB: f32 = 2.0;
+const DETECTED_CEILING_MAX_GB: f32 = 31.0;
+
+/// Derive the projection ceiling from a detected total-VRAM figure (MiB):
+/// total − [`VRAM_HEADROOM_GB`], clamped to the sane bounds above (decision
+/// #43). Pure so the derivation is testable without a GPU; an 8192 MiB card
+/// yields exactly the historical 7.0.
+fn ceiling_from_total_mib(total_mib: u64) -> f32 {
+    (total_mib as f32 / 1024.0 - VRAM_HEADROOM_GB)
+        .clamp(DETECTED_CEILING_MIN_GB, DETECTED_CEILING_MAX_GB)
+}
+
+/// Parse `nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits`
+/// output: one MiB integer per line, one line per GPU. The first line is GPU 0
+/// — the device llama.cpp/CTranslate2 load onto by default.
+fn parse_total_mib(stdout: &str) -> Option<u64> {
+    stdout.lines().next()?.trim().parse::<u64>().ok()
+}
+
+/// Query the installed GPU's total VRAM (MiB) via `nvidia-smi` — the same
+/// measurement precedent as the SC6/M5 gate harnesses. A local measurement
+/// `Command` in a lint-emitters SANCTIONED crate (doc 13 §2), never a socket.
+/// **Startup only** (decision #43): callers cache the result; this must never
+/// sit on a per-request path.
+fn detect_total_vram_mib() -> Option<u64> {
+    let mut cmd = std::process::Command::new("nvidia-smi");
+    cmd.args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"]);
+    #[cfg(windows)]
+    {
+        // CREATE_NO_WINDOW — mirror the sidecar spawn: nvidia-smi is a console
+        // binary and would otherwise flash a terminal at app launch.
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_total_mib(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The process-wide projection ceiling (decision #43): detected once at
+/// startup (`OnceLock` — exactly one `nvidia-smi` spawn per process, never on
+/// a request path), **fixed thereafter**, falling back to
+/// [`PROJECTION_CEILING_GB`] when detection fails (no NVIDIA GPU, no
+/// `nvidia-smi` on PATH, unparseable output).
+pub fn startup_projection_ceiling_gb() -> f32 {
+    static CEILING: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *CEILING.get_or_init(|| match detect_total_vram_mib() {
+        Some(mib) => {
+            let ceiling = ceiling_from_total_mib(mib);
+            tracing::info!(
+                total_mib = mib,
+                ceiling_gb = ceiling,
+                "VRAM ceiling auto-scaled to the installed GPU (decision #43)"
+            );
+            ceiling
+        }
+        None => {
+            tracing::warn!(
+                "VRAM detection failed; falling back to the {PROJECTION_CEILING_GB} GB ceiling (decision #43)"
+            );
+            PROJECTION_CEILING_GB
+        }
+    })
+}
 
 /// Context-shrink ladder rungs (doc 04 R3 step 2): 8K -> 4K -> 2K.
 const CTX_SHRINK_HIGH: u32 = 4096;
@@ -87,6 +166,9 @@ pub enum Admission {
 #[derive(Debug)]
 pub struct BudgetEnforcer {
     table: VramTable,
+    /// The projection ceiling this enforcer admits under. Set once at
+    /// construction (decision #43: fixed after startup — no setter).
+    ceiling_gb: f32,
 }
 
 fn is_stt(model: ModelId) -> bool {
@@ -97,9 +179,23 @@ fn is_stt(model: ModelId) -> bool {
 }
 
 impl BudgetEnforcer {
-    /// Construct over a (seeded or measured) VRAM table.
+    /// Construct over a (seeded or measured) VRAM table, at the deterministic
+    /// [`PROJECTION_CEILING_GB`] fallback ceiling. Production construction goes
+    /// through [`Self::with_ceiling`] + [`startup_projection_ceiling_gb`]
+    /// (decision #43) in `OrchestratedSystem::with_runner`.
     pub fn new(table: VramTable) -> Self {
-        Self { table }
+        Self::with_ceiling(table, PROJECTION_CEILING_GB)
+    }
+
+    /// Construct with an explicit projection ceiling (decision #43: the
+    /// startup-detected value; fixed for the enforcer's lifetime).
+    pub fn with_ceiling(table: VramTable, ceiling_gb: f32) -> Self {
+        Self { table, ceiling_gb }
+    }
+
+    /// The ceiling this enforcer admits under (GB).
+    pub fn ceiling_gb(&self) -> f32 {
+        self.ceiling_gb
     }
 
     /// Read access to the table (the scheduler reports the VRAM peak the M5 gate
@@ -149,7 +245,7 @@ impl BudgetEnforcer {
         let projected = p.weights_gb + p.mmproj_gb + kv + img + self.table.framework_gb + co;
         Projection {
             projected_gb: projected,
-            admit: projected <= PROJECTION_CEILING_GB,
+            admit: projected <= self.ceiling_gb,
         }
     }
 
@@ -228,6 +324,61 @@ mod tests {
 
     fn enforcer() -> BudgetEnforcer {
         BudgetEnforcer::new(VramTable::seeded())
+    }
+
+    // --- decision #43: ceiling auto-scale ---------------------------------
+
+    #[test]
+    fn ceiling_derivation_subtracts_headroom_and_clamps() {
+        // The RTX 5060's 8192 MiB reproduces the historical 7.0 exactly.
+        assert!((ceiling_from_total_mib(8_192) - 7.0).abs() < 1e-4);
+        // A 16 GB card gets 15.0; a 6 GB card gets 5.0.
+        assert!((ceiling_from_total_mib(16_384) - 15.0).abs() < 1e-4);
+        assert!((ceiling_from_total_mib(6_144) - 5.0).abs() < 1e-4);
+        // Absurd parses clamp instead of poisoning the projection.
+        assert_eq!(ceiling_from_total_mib(1_024), DETECTED_CEILING_MIN_GB);
+        assert_eq!(ceiling_from_total_mib(10_000_000), DETECTED_CEILING_MAX_GB);
+    }
+
+    #[test]
+    fn nvidia_smi_total_output_parses_first_gpu_line_only() {
+        assert_eq!(parse_total_mib("8192\n"), Some(8192));
+        assert_eq!(parse_total_mib("8192\r\n"), Some(8192), "Windows CRLF");
+        assert_eq!(parse_total_mib(" 16384 \n8192\n"), Some(16384), "GPU 0 wins");
+        assert_eq!(parse_total_mib(""), None);
+        assert_eq!(parse_total_mib("N/A\n"), None);
+    }
+
+    #[test]
+    fn new_defaults_to_the_fallback_ceiling() {
+        assert_eq!(enforcer().ceiling_gb(), PROJECTION_CEILING_GB);
+    }
+
+    #[test]
+    fn a_larger_detected_ceiling_admits_what_7gb_refused() {
+        // 3B no-image + co-resident STT projects 7.27 GB: refused at 7.0 (see
+        // `co_resident_stt_is_counted_conditionally`), admitted on a 12 GB
+        // card's derived 11.0 ceiling (decision #43).
+        let e = BudgetEnforcer::with_ceiling(VramTable::seeded(), ceiling_from_total_mib(12_288));
+        let req = LoadRequest {
+            model: ModelId::Vlm3b,
+            ctx_tokens: 8192,
+            n_images: 0,
+        };
+        assert!(e.project(req, &[ModelId::FasterWhisperSmall]).admit);
+    }
+
+    #[test]
+    fn a_smaller_detected_ceiling_refuses_what_7gb_admitted() {
+        // Lone 3B + image projects 6.47 GB: fits at 7.0 (see
+        // `lone_3b_with_one_image_fits`), refused on a 6 GB card's 5.0 ceiling.
+        let e = BudgetEnforcer::with_ceiling(VramTable::seeded(), ceiling_from_total_mib(6_144));
+        let req = LoadRequest {
+            model: ModelId::Vlm3b,
+            ctx_tokens: 8192,
+            n_images: 1,
+        };
+        assert!(!e.project(req, &[]).admit);
     }
 
     #[test]

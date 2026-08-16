@@ -17,8 +17,18 @@ async-trait = { workspace = true }
 # Loopback HTTP to the LOCAL sidecars (vlm-host /infer, /health) + health polling
 # (doc 12 §5). 127.0.0.1 only — never reaches the public internet; orchestration
 # is a lint-emitters SANCTIONED crate (doc 13 §2). rustls avoids an OpenSSL build
-# dep on Windows MSVC.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }  # [VERIFY]
+# dep on Windows MSVC. "multipart": binary payloads (frame JPEG / WAV) ride as
+# raw multipart parts to the sidecar hosts (decision #33), not JSON number arrays.
+# ONE sanctioned exception to "loopback only": model_fetch.rs — the explicit,
+# user-click-initiated VLM weight INGRESS from Hugging Face (decision #30);
+# carries no user data, see its module doc.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart"] }  # [VERIFY]
+
+[dev-dependencies]
+# Loopback fakes only: the decision #33 round-trip test (a fake sidecar host
+# decoding the SidecarRunner's multipart leg) and the decision #30 model_fetch
+# tests (a fake Range-aware origin — the real 3 GB download stays #[ignore]d).
+axum = { version = "0.7", features = ["multipart"] }
 
 # --- platform / third-party (pinned; [VERIFY] at build time, doc 00 conventions) ---
 # Win32 TerminateProcess escalation when a sidecar kill fails (zombie escalation,
@@ -30,4 +40,5 @@ windows = { version = "0.58", features = [
     "Win32_System_Threading",        # OpenProcess / TerminateProcess
     "Win32_Foundation",              # HANDLE / CloseHandle
     "Win32_System_JobObjects",       # sidecar tree-kill (KILL_ON_JOB_CLOSE)
+    "Win32_Security",                # CreateJobObjectW's SECURITY_ATTRIBUTES param
 ] }  # [VERIFY] at build time

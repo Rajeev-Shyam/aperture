@@ -33,6 +33,7 @@ mod mcp_bridge;
 mod overlay;
 mod pipeline;
 mod tray;
+mod vlm_fetch;
 mod voice;
 
 use std::sync::Arc;
@@ -88,9 +89,17 @@ fn main() {
     // 4. orchestration — capture starts OFF until consent (doc 13 §8). The
     //    lifecycle gets the RESOLVED sidecar paths (dev checkout vs installed
     //    layout) instead of the crate's bare-name defaults.
+    let sidecar_config = sidecar_config();
+    // Decision #30: the VLM install surface shares the spawner's resolved
+    // weight paths — where `vlm_status` checks and `vlm_download` writes is,
+    // by construction, where the next VLM spawn reads (no restart needed).
+    let vlm_fetch = Arc::new(vlm_fetch::VlmFetchState::new(
+        sidecar_config.vlm_model_gguf.clone(),
+        sidecar_config.vlm_mmproj_gguf.clone(),
+    ));
     let lifecycle = Arc::new(tokio::sync::Mutex::new(
         aperture_orchestration::model_lifecycle::ModelLifecycle::new(Box::new(
-            aperture_orchestration::model_lifecycle::OsSpawner::new(sidecar_config()),
+            aperture_orchestration::model_lifecycle::OsSpawner::new(sidecar_config),
         )),
     ));
     let orchestration = Arc::new(tokio::sync::Mutex::new(
@@ -121,10 +130,15 @@ fn main() {
         Arc::clone(&orchestration),
         Arc::clone(&embedder),
     );
-    // ADR-029/Q15: defaults ship EMPTY; the user's confirmed rules come from
-    // the encrypted `exclusion_list` table (doc 13 §4, M9). The handle is kept:
-    // every clone shares one swappable rule set, so `add_exclusion` hot-reloads
-    // the running matcher through `AppState.exclusions`.
+    // Decision #20 (amending ADR-029/Q15): curated defaults (password managers,
+    // banking patterns) are seeded ONCE into the durable `exclusion_list` table,
+    // where the user can disable or delete them like any rule — never resurrected.
+    // Must run before load_exclusions so a fresh install starts protected.
+    seed_default_exclusions(&db);
+    // The user's confirmed rules come from the encrypted `exclusion_list` table
+    // (doc 13 §4, M9). The handle is kept: every clone shares one swappable rule
+    // set, so `add_exclusion` hot-reloads the running matcher through
+    // `AppState.exclusions`.
     let exclusions = load_exclusions(&db);
     let capture = aperture_capture::CaptureSubsystem::new(
         aperture_capture::CaptureConfig::default(),
@@ -180,6 +194,7 @@ fn main() {
         push_target,
         voice_handle,
         exclusions,
+        vlm_fetch,
     );
     run_tauri(state, feedback_rx, current_session, voice_deps, &rt);
 }
@@ -474,6 +489,49 @@ fn sync_autostart(app: &tauri::AppHandle, state: &AppState) {
     }
 }
 
+/// Seed the curated default exclusion rules (decision #20, amending ADR-029)
+/// into the durable `exclusion_list` table, once per install.
+///
+/// Additive-only and never fail-open: on ANY read error we log and return —
+/// existing rules are never touched, and the seed simply retries next launch.
+/// The seeded flag is written only after every insert succeeds, so an
+/// interrupted seed resumes idempotently (`defaults_needing_seed` skips rows
+/// already present — including disabled ones, so a retry can never re-enable a
+/// rule the user turned off). Once the flag is set the seeder never runs again:
+/// a default the user deletes stays deleted.
+fn seed_default_exclusions(db: &aperture_db::Db) {
+    use aperture_capture::exclusion::{defaults_needing_seed, EXCLUSION_DEFAULTS_SEEDED_KEY};
+    let seeded = match db.get_setting(EXCLUSION_DEFAULTS_SEEDED_KEY) {
+        Ok(flag) => flag.is_some(),
+        Err(e) => {
+            tracing::error!(%e, "exclusion-defaults seed: flag read failed; retrying next launch");
+            return;
+        }
+    };
+    let rows = match db.read_exclusion_list() {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(%e, "exclusion-defaults seed: list read failed; retrying next launch");
+            return;
+        }
+    };
+    let pending = defaults_needing_seed(seeded, &rows);
+    for (kind, pattern) in &pending {
+        if let Err(e) = db.add_exclusion_rule(kind, pattern) {
+            // Flag deliberately NOT written: the remaining rows seed next launch.
+            tracing::error!(%e, kind, pattern, "exclusion-defaults seed: insert failed; will retry");
+            return;
+        }
+    }
+    if let Err(e) = db.set_setting(EXCLUSION_DEFAULTS_SEEDED_KEY, "\"2026-08-16\"") {
+        tracing::error!(%e, "exclusion-defaults seed: flag write failed; will retry (idempotent)");
+        return;
+    }
+    if !pending.is_empty() {
+        tracing::info!(count = pending.len(), "default exclusion rules seeded (decision #20)");
+    }
+}
+
 /// Compile the user's confirmed exclusion rules out of the encrypted
 /// `exclusion_list` table into the capture gate's matcher (doc 13 §4, M9).
 ///
@@ -533,8 +591,11 @@ fn build_embedder() -> Arc<dyn aperture_embedding::Embedder> {
 /// workspace target dir (cargo puts `aperture-stt-host.exe` beside
 /// `aperture.exe`) with `src-tauri\binaries\whisper` + `models\` under the
 /// repo-root CWD. First existing candidate wins; the crate default (bare name,
-/// PATH lookup) is the last resort. VLM paths keep their defaults — no llama
-/// weights ship yet, and that spawn failure soft-degrades to OCR-only (doc 06 §6).
+/// PATH lookup) is the last resort — EXCEPT the VLM weights (decision #30):
+/// when absent, their paths resolve to the canonical download destination
+/// (`vlm_download_dir`) instead of the bare crate default, so the Dashboard
+/// fetch lands exactly where the next spawn reads and VLM comes up without a
+/// restart. Until then the spawn failure soft-degrades to OCR-only (doc 06 §6).
 fn sidecar_config() -> aperture_orchestration::model_lifecycle::SidecarConfig {
     use std::path::PathBuf;
     let exe_dir = std::env::current_exe()
@@ -561,17 +622,28 @@ fn sidecar_config() -> aperture_orchestration::model_lifecycle::SidecarConfig {
         llama_bins.insert(0, dir.join("llama").join("llama-server.exe"));
         stt_models.push(dir.join("models").join("ggml-base.en.bin"));
         // The VLM weights are ~3 GB — too big for the NSIS installer (2 GB
-        // cap), so installed layouts fetch them out-of-band into the app dir.
-        vlm_models.push(dir.join("models").join("qwen2.5-vl-3b-q4_k_m.gguf"));
-        vlm_mmprojs.push(dir.join("models").join("qwen2.5-vl-3b-mmproj-f16.gguf"));
+        // cap), so installed layouts fetch them via the Dashboard (decision #30).
+        vlm_models.push(dir.join("models").join(vlm_fetch::VLM_MODEL_FILE));
+        vlm_mmprojs.push(dir.join("models").join(vlm_fetch::VLM_MMPROJ_FILE));
     }
     config.stt_host_bin = pick(&stt_bins, config.stt_host_bin);
     config.vlm_host_bin = pick(&vlm_bins, config.vlm_host_bin);
     config.whisper_bin = pick(&whisper_bins, config.whisper_bin);
     config.llama_bin = pick(&llama_bins, config.llama_bin);
     config.stt_model = pick(&stt_models, config.stt_model);
-    config.vlm_model_gguf = pick(&vlm_models, config.vlm_model_gguf);
-    config.vlm_mmproj_gguf = pick(&vlm_mmprojs, config.vlm_mmproj_gguf);
+    // Weights absent ⇒ resolve to where the Dashboard download will land, so
+    // the spawner's stored path becomes valid the moment the fetch finishes.
+    let dl_dir = vlm_download_dir(exe_dir.as_deref());
+    config.vlm_model_gguf = pick(&vlm_models, dl_dir.join(vlm_fetch::VLM_MODEL_FILE));
+    config.vlm_mmproj_gguf = pick(&vlm_mmprojs, dl_dir.join(vlm_fetch::VLM_MMPROJ_FILE));
+    if !config.vlm_model_gguf.exists() || !config.vlm_mmproj_gguf.exists() {
+        // Not silent (decision #30): the Dashboard mirrors this as the
+        // "OCR-only mode" notice with the download button.
+        tracing::warn!(
+            "VLM weights not installed — screen understanding runs OCR-only until the \
+             Dashboard download completes (decision #30)"
+        );
+    }
     tracing::info!(
         stt_host = %config.stt_host_bin.display(),
         whisper = %config.whisper_bin.display(),
@@ -582,6 +654,21 @@ fn sidecar_config() -> aperture_orchestration::model_lifecycle::SidecarConfig {
         "sidecar paths resolved"
     );
     config
+}
+
+/// The canonical VLM weight destination (decision #30): the installed layout's
+/// `models\` next to the exe when it exists (absolute — correct regardless of
+/// how the app was launched: Start menu CWD = install dir, autostart CWD =
+/// system32), else the checkout's `models/` (the dev path — cargo runs from
+/// the repo root, and `target\debug\models` never exists).
+fn vlm_download_dir(exe_dir: Option<&std::path::Path>) -> std::path::PathBuf {
+    if let Some(dir) = exe_dir {
+        let installed = dir.join("models");
+        if installed.is_dir() {
+            return installed;
+        }
+    }
+    std::path::PathBuf::from("models")
 }
 
 /// Where the embedding weights live (doc 03 §5): the repo's `models/` when run
@@ -726,7 +813,7 @@ fn retention_policy_from_settings(db: &aperture_db::Db) -> aperture_db::retentio
     let Ok(Some(raw)) = db.get_setting("privacy") else { return policy };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else { return policy };
     let Some(days) = v.get("retention_days") else { return policy };
-    let mut read = |key: &str, dst: &mut u32| {
+    let read = |key: &str, dst: &mut u32| {
         if let Some(n) = days.get(key).and_then(serde_json::Value::as_u64) {
             if n >= 1 {
                 *dst = n.min(u32::MAX as u64) as u32;
@@ -769,6 +856,8 @@ fn run_tauri(
         ))
         .manage(state)
         .manage(hit_test::HitTestState::default())
+        // Which window hosts the preview panel (decision #13 routing).
+        .manage(overlay::PreviewHost::default())
         .invoke_handler(tauri::generate_handler![
             commands::toggle_capture,
             commands::list_suggestions,
@@ -788,6 +877,9 @@ fn run_tauri(
             commands::voice_dismiss,
             commands::focus_overlay,
             commands::open_privacy,
+            // Decision #13 — control surfaces follow the cursor's monitor.
+            commands::open_dashboard,
+            commands::set_preview_host,
             commands::get_settings,
             commands::set_settings,
             commands::get_autostart,
@@ -797,6 +889,9 @@ fn run_tauri(
             commands::list_events,
             commands::list_patterns,
             commands::list_suggestion_history,
+            // Decision #30 — VLM weight install (status + user-initiated fetch).
+            commands::vlm_status,
+            commands::vlm_download,
             // M9 — privacy surface (doc 13).
             commands::set_overlay_interactive,
             commands::set_hit_test_rects,

@@ -110,6 +110,48 @@ pub enum SampleTrigger {
     Heartbeat,
 }
 
+/// Cap on the window-identity cache (decision #35). LRU-evicted, never bulk
+/// cleared: the old clear-at-cap silently dropped close-events for every
+/// pre-clear window during heavy window/tab churn.
+const IDENTITY_CACHE_CAP: usize = 512;
+
+/// Fixed-capacity LRU map of hwnd → [`WindowIdentity`]. Recency is a monotonic
+/// touch counter (no new dep, no per-touch allocation); the O(capacity) victim
+/// scan runs only when a *new* key arrives at capacity, and hook traffic is
+/// human-rate.
+struct IdentityCache {
+    entries: HashMap<isize, (u64, WindowIdentity)>,
+    tick: u64,
+    capacity: usize,
+}
+
+impl IdentityCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::with_capacity(capacity),
+            tick: 0,
+            capacity,
+        }
+    }
+
+    /// Insert or refresh; either way the entry becomes most-recent. A new key
+    /// at capacity evicts the least-recently-touched entry first.
+    fn insert(&mut self, hwnd: isize, identity: WindowIdentity) {
+        if self.entries.len() >= self.capacity && !self.entries.contains_key(&hwnd) {
+            let oldest = self.entries.iter().min_by_key(|(_, v)| v.0).map(|(&k, _)| k);
+            if let Some(k) = oldest {
+                self.entries.remove(&k);
+            }
+        }
+        self.tick += 1;
+        self.entries.insert(hwnd, (self.tick, identity));
+    }
+
+    fn remove(&mut self, hwnd: isize) -> Option<WindowIdentity> {
+        self.entries.remove(&hwnd).map(|(_, identity)| identity)
+    }
+}
+
 /// The capture subsystem facade. Owns the hook thread (via the toggle), the WGC
 /// sampler, the debouncer/heartbeat, and the normalizer, wiring them to the bus.
 ///
@@ -131,8 +173,9 @@ pub struct CaptureSubsystem {
     foreground: Arc<Mutex<ForegroundContext>>,
     /// hwnd → identity for windows seen alive. `EVENT_OBJECT_DESTROY` arrives
     /// after the hwnd is gone (all win32 lookups fail), so `window_close`
-    /// events resolve their identity from here instead.
-    identity_cache: Mutex<HashMap<isize, WindowIdentity>>,
+    /// events resolve their identity from here instead. LRU-bounded at
+    /// [`IDENTITY_CACHE_CAP`] (decision #35).
+    identity_cache: Mutex<IdentityCache>,
     /// Drain + heartbeat tasks, aborted on drop.
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -188,7 +231,7 @@ impl CaptureSubsystem {
             normalizer,
             nm_bridge: bridge,
             foreground,
-            identity_cache: Mutex::new(HashMap::new()),
+            identity_cache: Mutex::new(IdentityCache::new(IDENTITY_CACHE_CAP)),
             tasks: Mutex::new(Vec::new()),
         });
 
@@ -230,17 +273,16 @@ impl CaptureSubsystem {
         // Unknown hwnds (child windows, never-seen top-levels) are dropped
         // rather than persisted as anonymous rows.
         if matches!(raw, HookEvent::WindowClosed { .. }) {
-            match self.identity_cache.lock().expect("identity cache lock").remove(&hwnd) {
+            match self.identity_cache.lock().expect("identity cache lock").remove(hwnd) {
                 Some(cached) => identity = cached,
                 None if identity.process.is_none() => return,
                 None => {}
             }
         } else if identity.process.is_some() {
-            let mut cache = self.identity_cache.lock().expect("identity cache lock");
-            if cache.len() >= 512 && !cache.contains_key(&hwnd) {
-                cache.clear(); // crude bound; repopulates from live focus traffic
-            }
-            cache.insert(hwnd, identity.clone());
+            self.identity_cache
+                .lock()
+                .expect("identity cache lock")
+                .insert(hwnd, identity.clone());
         }
 
         let normalized = self.normalizer.normalize_hook(&raw, identity.clone(), now);
@@ -328,5 +370,53 @@ impl Drop for CaptureSubsystem {
         for t in self.tasks.lock().expect("tasks lock").drain(..) {
             t.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ident(n: isize) -> WindowIdentity {
+        WindowIdentity {
+            app: Some(format!("App{n}")),
+            process: Some(format!("app{n}.exe")),
+            ..WindowIdentity::default()
+        }
+    }
+
+    /// Decision #35: filling past capacity evicts ONLY the oldest entry — the
+    /// newest [`IDENTITY_CACHE_CAP`] survive, and a close-event for any of
+    /// them still resolves its cached identity (the pre-fix bulk clear
+    /// dropped ALL of these).
+    #[test]
+    fn identity_cache_evicts_oldest_only_past_capacity() {
+        let mut cache = IdentityCache::new(IDENTITY_CACHE_CAP);
+        for n in 0..=IDENTITY_CACHE_CAP as isize {
+            cache.insert(n, ident(n));
+        }
+        assert_eq!(cache.entries.len(), IDENTITY_CACHE_CAP);
+        assert!(cache.remove(0).is_none(), "oldest entry should have been evicted");
+        for n in 1..=IDENTITY_CACHE_CAP as isize {
+            assert_eq!(cache.remove(n), Some(ident(n)), "window {n} lost its identity");
+        }
+        assert!(cache.entries.is_empty());
+    }
+
+    /// A touched (re-inserted) entry becomes most-recent, so the eviction
+    /// victim at capacity is the least-recently-touched key, not the
+    /// least-recently-inserted one.
+    #[test]
+    fn identity_cache_touch_refreshes_recency() {
+        let mut cache = IdentityCache::new(3);
+        cache.insert(1, ident(1));
+        cache.insert(2, ident(2));
+        cache.insert(3, ident(3));
+        cache.insert(1, ident(1)); // touch: 1 is now most-recent, 2 is oldest
+        cache.insert(4, ident(4));
+        assert!(cache.remove(2).is_none(), "least-recently-touched should evict");
+        assert_eq!(cache.remove(1), Some(ident(1)));
+        assert_eq!(cache.remove(3), Some(ident(3)));
+        assert_eq!(cache.remove(4), Some(ident(4)));
     }
 }

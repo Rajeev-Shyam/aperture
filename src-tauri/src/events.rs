@@ -29,16 +29,34 @@ pub const CAPTURE_INDICATOR: &str = "capture_indicator";
 pub const VOICE_SURFACE: &str = "voice_surface";
 /// Bubble lifecycle transition (queued/entering/idle/clicked/dismissed/expired, doc 11 §3).
 pub const SUGGESTION_LIFECYCLE: &str = "suggestion_lifecycle";
-/// Ask the primary overlay's WebView to open the Dashboard (tray click, second
-/// app launch). Targeted — never broadcast: every monitor runs its own React
-/// root, and a broadcast would open one dashboard per monitor.
+/// Open the Dashboard on the overlay window named in the payload's `target`
+/// (tray click, second app launch, HUD button). Broadcast with a target
+/// (decision #13): the named window opens, every OTHER window closes its copy
+/// — controls follow the cursor and exactly one instance exists at a time.
 pub const DASHBOARD_OPEN: &str = "dashboard_open";
-/// Ask the primary overlay to open the Context-Preview panel for a payload the
-/// core staged (the MCP gated-search flow, ADR-037). Carries the full payload.
+/// Ask ONE overlay to open the Context-Preview panel for a payload the core
+/// staged (the MCP gated-search flow, ADR-037). Carries the full payload.
+/// Targeted (`emit_to`) at the window already hosting a preview panel — so the
+/// request queues there, never clobbering a mid-edit review — else at the
+/// cursor's monitor (decision #13).
 pub const PREVIEW_REQUEST: &str = "preview_request";
-/// Ask the primary overlay to open the Activity & Privacy panel (bubble
-/// overflow "Exclusions…" — the panel exists exactly once, on the primary).
+/// Open the Activity & Privacy panel on the payload's `target` window (bubble
+/// overflow "Exclusions…", HUD button). Broadcast with a target, same
+/// convergence contract as [`DASHBOARD_OPEN`].
 pub const PRIVACY_OPEN: &str = "privacy_open";
+/// A window's Context-Preview panel just opened (`set_preview_host`): every
+/// other window folds its own panel — cancelling its sessions core-side — so
+/// exactly one preview exists across monitors (decision #13; the 08-15
+/// dismissal-convergence pattern).
+pub const PREVIEW_CLAIMED: &str = "preview_claimed";
+/// An audit-trail write failed (decision #41): what egressed and what the
+/// `cloud_send` trail records now disagree — the overlay shows a dismissible
+/// warning banner, because the trail is the sole answer to "what left this
+/// machine?" (doc 13 §3).
+pub const AUDIT_ALERT: &str = "audit_alert";
+/// VLM weight download progress/terminal state (decision #30): the Dashboard's
+/// user-initiated ~3.3 GB fetch streams `{ phase, file, bytes }` here.
+pub const VLM_FETCH: &str = "vlm_fetch";
 
 /// The capture-indicator state the overlay/tray render (doc 12 §6).
 /// `Releasing` covers the <3 s toggle-OFF window (doc 12 §6 step 5). Internal
@@ -115,27 +133,93 @@ pub fn emit_voice_surface(app: &AppHandle, payload: &serde_json::Value) -> tauri
     app.emit(VOICE_SURFACE, payload)
 }
 
-/// Ask the primary overlay to open the Dashboard (tray left-click / menu item,
-/// or a second instance launch handing off to the running one).
-pub fn emit_dashboard_open(app: &AppHandle) -> tauri::Result<()> {
-    app.emit_to(crate::overlay::OVERLAY_LABEL, DASHBOARD_OPEN, ())
+/// The `dashboard_open` / `privacy_open` / `preview_claimed` wire payload
+/// (matches the UI's `ControlOpenEvent`): which window the surface belongs to.
+#[derive(Debug, Clone, Serialize)]
+pub struct ControlOpenPayload {
+    pub target: String,
 }
 
-/// Ask the primary overlay to open the preview panel on a core-staged payload
-/// (MCP gated search, ADR-037): the user must SEE what Claude asked for before
+/// Open the Dashboard on the cursor's monitor (decision #13) — tray left-click
+/// / menu item, or a second instance launch handing off to the running one.
+/// The cursor is where the user just acted, so the surface lands with them.
+pub fn emit_dashboard_open(app: &AppHandle) -> tauri::Result<()> {
+    emit_dashboard_open_on(app, &crate::overlay::cursor_overlay_label(app))
+}
+
+/// Open the Dashboard on a specific overlay window — used by the `open_dashboard`
+/// command, where the calling window IS the cursor's monitor (the click proves
+/// it). Broadcast: every non-target window closes its copy.
+pub fn emit_dashboard_open_on(app: &AppHandle, target: &str) -> tauri::Result<()> {
+    app.emit(DASHBOARD_OPEN, ControlOpenPayload { target: target.to_string() })
+}
+
+/// Ask ONE overlay to open the preview panel on a core-staged payload (MCP
+/// gated search, ADR-037): the user must SEE what Claude asked for before
 /// anything can be approved, and approval releases it via `aperture_get_context`.
+///
+/// Routing (decision #13): the window already hosting a preview panel, if any
+/// — the request must QUEUE behind a possibly-mid-edit review, never open a
+/// second panel elsewhere — otherwise the cursor's monitor, falling back to
+/// the primary.
 pub fn emit_preview_request(
     app: &AppHandle,
     payload: &aperture_contracts::ContextPayload,
 ) -> tauri::Result<()> {
-    app.emit_to(crate::overlay::OVERLAY_LABEL, PREVIEW_REQUEST, payload)
+    use tauri::Manager;
+    let host = app
+        .try_state::<crate::overlay::PreviewHost>()
+        .and_then(|h| h.get())
+        .filter(|label| app.get_webview_window(label).is_some());
+    let target = host.unwrap_or_else(|| crate::overlay::cursor_overlay_label(app));
+    app.emit_to(&target, PREVIEW_REQUEST, payload)
 }
 
-/// Ask the primary overlay to open the Activity & Privacy panel (exclusions
-/// manager). Targeted like `dashboard_open` — a broadcast would open one panel
-/// per monitor.
-pub fn emit_privacy_open(app: &AppHandle) -> tauri::Result<()> {
-    app.emit_to(crate::overlay::OVERLAY_LABEL, PRIVACY_OPEN, ())
+/// Open the Activity & Privacy panel on a specific overlay window (exclusions
+/// manager — bubble overflow "Exclusions…", HUD button, dashboard link; the
+/// calling window is the cursor's monitor). Broadcast, same convergence
+/// contract as [`emit_dashboard_open_on`].
+pub fn emit_privacy_open_on(app: &AppHandle, target: &str) -> tauri::Result<()> {
+    app.emit(PRIVACY_OPEN, ControlOpenPayload { target: target.to_string() })
+}
+
+/// Announce that `target`'s preview panel just opened (decision #13): every
+/// other window cancels + closes its own panel so exactly one exists.
+pub fn emit_preview_claimed(app: &AppHandle, target: &str) -> tauri::Result<()> {
+    app.emit(PREVIEW_CLAIMED, ControlOpenPayload { target: target.to_string() })
+}
+
+/// The `audit_alert` wire payload (matches the UI's `AuditAlertEvent`).
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditAlertPayload {
+    pub message: String,
+}
+
+/// Warn that an audit write failed (decision #41). Broadcast; only the primary
+/// overlay renders the banner (App.tsx) — same split as the HUD, so one failure
+/// never yields one banner per monitor.
+pub fn emit_audit_alert(app: &AppHandle, message: &str) -> tauri::Result<()> {
+    app.emit(AUDIT_ALERT, AuditAlertPayload { message: message.to_string() })
+}
+
+/// The `vlm_fetch` wire payload (matches the UI's `VlmFetchEvent`). `phase` is
+/// `"downloading" | "done" | "error"`; byte counts are OVERALL across both
+/// weight files so the Dashboard renders one progress bar.
+#[derive(Debug, Clone, Serialize)]
+pub struct VlmFetchPayload {
+    pub phase: String,
+    /// The artifact currently downloading (label under the bar).
+    pub file: Option<String>,
+    pub received_bytes: u64,
+    pub total_bytes: u64,
+    pub error: Option<String>,
+}
+
+/// Stream VLM download progress / the terminal state to the Dashboard
+/// (decision #30). Broadcast; only the primary overlay renders the Dashboard,
+/// same split as `audit_alert`.
+pub fn emit_vlm_fetch(app: &AppHandle, payload: &VlmFetchPayload) -> tauri::Result<()> {
+    app.emit(VLM_FETCH, payload.clone())
 }
 
 /// Emit a suggestion-lifecycle transition (doc 11 §3). The matching

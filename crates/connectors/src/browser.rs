@@ -36,6 +36,10 @@ pub struct BrowserPayloadV1 {
 #[derive(Debug, Default, Clone)]
 pub struct BrowserConnector;
 
+/// Decision #37 (per-connector-type staleness): already differentiated before
+/// the decision — a generic page's resume value decays within a day (history
+/// and open tabs cover re-finding it after that), so the browser keeps the
+/// shortest TTL of all connectors. 24 h unchanged (doc 10 §2 [ASSUMPTION], Q57).
 const TTL_24H: Duration = Duration::from_secs(24 * 60 * 60);
 
 impl BrowserConnector {
@@ -108,7 +112,7 @@ impl Connector for BrowserConnector {
     }
 
     fn staleness_ttl(&self) -> Duration {
-        // TTL 24 h (doc 10 §2 [ASSUMPTION], Q57 unchanged).
+        // Decision #37: per-type TTL — see [`TTL_24H`]; deliberately kept 24 h.
         TTL_24H
     }
 

@@ -106,6 +106,11 @@ pub struct AppState {
     /// the capture sampler/normalizer hold, so `add_exclusion`/`set_exclusion`
     /// hot-swap the compiled rules without a restart.
     pub exclusions: ExclusionList,
+
+    /// VLM weight install state (decision #30): the resolved weight paths the
+    /// spawner uses (= where a download lands) + the in-flight guard. Read by
+    /// `vlm_status`; `vlm_download` runs the user-initiated fetch against it.
+    pub vlm_fetch: Arc<crate::vlm_fetch::VlmFetchState>,
 }
 
 impl AppState {
@@ -128,6 +133,7 @@ impl AppState {
         push_target: aperture_contracts::TransportTarget,
         voice: crate::voice::VoiceHandle,
         exclusions: ExclusionList,
+        vlm_fetch: Arc<crate::vlm_fetch::VlmFetchState>,
     ) -> Self {
         Self {
             bus,
@@ -143,6 +149,7 @@ impl AppState {
             push_target,
             voice,
             exclusions,
+            vlm_fetch,
         }
     }
 }

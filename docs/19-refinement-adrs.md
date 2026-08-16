@@ -25,11 +25,13 @@ These ADRs record the **load-bearing** decisions made during the R2 architecture
 ---
 
 ### ADR-026 — Scoped "always-allow" with the transparency gate preserved  ⚠️ INVARIANT
-**Status:** [DECIDED] R2 (Q12, Q13, Q17). **Supersedes:** ADR-012's "per-call approval only, no always-allow in v1." **Amends:** SC5; the transparency invariant.
+**Status:** [DECIDED] R2 (Q12, Q13, Q17); **[AMENDED 2026-08-16] v2-only — descoped from v1** (owner decision #21, Doc 24). **Supersedes:** ADR-012's "per-call approval only, no always-allow in v1." **Amends:** SC5; the transparency invariant.
 **Context/forces:** Per-call approval is the safest reading of locked decision 9, but adds friction for repeated, trusted sends. A naïve "always-allow" would let cloud egress happen with no preview — breaking decision 9 / ADR-012 / SC5.
 **Rationale:** Relax *deliberately and minimally*. A scoped allow is **per app+intent**, but under it the system **still renders the exact payload, still shows a cancel window (default 3 s, user-configurable), and still writes the `cloud_send` audit row**. Only the manual *Send click* is skipped; the auto-send fires when the cancel window elapses unless cancelled.
 **Consequences:** SC5 is reworded: *"zero egress on the proactive path; cloud egress only via an explicit Send **or** an active user-granted scoped allow — under a scoped allow the exact payload is still displayed, a cancel window precedes egress, and the SHA-256 is audit-logged."* Decision 9 ("display the exact payload before any cloud call") survives intact; only the explicit-Send half is relaxed. Doc 13 §8's "no always-allow in v1" assumption is removed.
 **Rejected:** Fully-silent scoped allow (no preview/cancel) — breaks decision 9; revert to strict per-call (rejected for friction).
+
+> **Amendment (2026-08-16, owner decision #21 / Doc 24).** Scoped always-allow was **never built in v1** and is formally **descoped to v2**. The dead `scoped_allow_*` settings keys were removed in the 2026-08-15 review so v1 settings only advertise built behavior; **v1 ships strict per-send approval** (every cloud egress is an explicit Send on the exact rendered payload), and SC5's v1 reading is the strict form: zero user-data egress until an explicit Send. The design above is retained unchanged as the spec for **v2's per-task approval** (Doc 22 §4.1, milestone V2-M3). Doc 00's clarified decision E is amended to match.
 
 ---
 
@@ -57,6 +59,8 @@ These ADRs record the **load-bearing** decisions made during the R2 architecture
 **Rationale:** Honour the choice, but constrain *use* and correct the docs' *claims*. **Broad permission, narrow use:** the extension reads **URLs + video position only — never page DOM/content.** Exclusions + incognito still gate it; URLs run through redaction; the broad permission is disclosed plainly at install.
 **Consequences:** (a) **Doc 13 §1's "data minimization" claim is reworded** — with empty default exclusions *and* broad extension reach, "minimization by default" is an overclaim. The honest framing is: **minimal *defaults* + user-driven minimization + transparent disclosure.** (The architecture still makes *silent* exfiltration impossible; it no longer claims aggressive default *collection*-minimization.) (b) Doc 13 §4's "shipped defaults: password managers, banking" line is **removed**; defaults ship empty. (c) Onboarding compensates (ADR-040): consent → detect-and-suggest sensitive apps → extension install → enable. (d) The `url_pattern` exclusion kind + bubble "exclude this domain" (Q94) are the ongoing controls.
 **Rejected:** Minimal youtube-only scope; auto-blocking sensitive domains by default (both rejected by the user's choices, with the risk flagged and accepted).
+
+> **Amendment (2026-08-16, owner decision #20 / Doc 24).** Consequence (b) is **superseded**: exclusions no longer ship empty. A curated default set (common password managers + generic banking-style URL/title patterns — `SHIPPED_DEFAULT_RULES` in `crates/capture/src/exclusion.rs`) is **seeded once** into the durable `exclusion_list` on first launch, guarded by a settings flag so a default the user deletes never resurrects. The seeded rows are ordinary rules — visible, disableable, and permanently deletable in the exclusion manager — so the "max user control" stance survives; only the fresh-install exposure window (Q61) is closed. Broad-permission/narrow-use (extension reads URLs + video position only), detect-and-suggest onboarding, and the honesty reframing of Doc 13 §1 are unchanged.
 
 ---
 
@@ -181,10 +185,10 @@ These ADRs record the **load-bearing** decisions made during the R2 architecture
 |---|---|---|---|
 | 024 | STT backend split | ADR-019; amends ADR-003 | — |
 | 025 | MCP-primary transport | refines ADR-010 | — |
-| 026 | Scoped always-allow | ADR-012; SC5 | ⚠️ transparency |
+| 026 | Scoped always-allow *(amended 2026-08-16: v2-only, descoped from v1)* | ADR-012; SC5 | ⚠️ transparency |
 | 027 | Browser extension in v1 | Q6; RK3/RK4 | — |
 | 028 | Native-messaging transport | Doc 13 §2 | (clarifies) |
-| 029 | Broad host access + honesty reframe | Doc 13 §1/§4 | (privacy posture) |
+| 029 | Broad host access + honesty reframe *(amended 2026-08-16: curated default exclusions seeded)* | Doc 13 §1/§4 | (privacy posture) |
 | 030 | 7.0 GB cap + conditional L1 | Doc 04 R1/R3, Doc 12 §4 | ⚠️ 8 GB ceiling |
 | 031 | Four-tier priorities | Doc 12 §3 | — |
 | 032 | Adaptive parameters | Docs 05/06/08/12 | — |

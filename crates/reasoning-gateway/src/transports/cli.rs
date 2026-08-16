@@ -33,15 +33,18 @@ use aperture_contracts::{
 };
 
 use crate::suggestion_validator::parse_response;
-use crate::transports::{extract_json, render_prompt, SYSTEM_FRAMING};
+use crate::transports::{check_hard_cap, extract_json, render_prompt, SYSTEM_FRAMING};
 
 /// Below this prompt length we pass via `-p`; at/above it, large-context spill to a
 /// temp file is the intended mechanism (~7k-char small-stdin caveat, doc 09 §3).
 /// // [VERIFY] the real threshold + spill flag for the installed CLI version.
 pub const CLI_STDIN_COMPACT_CHARS: usize = 7_000;
 
-/// The CLI's hard stdin cap (~10 MB, doc 09 §3). The payload builder hard-stops
-/// before this on the CLI transport (doc 09 §6). // [VERIFY] at build time.
+/// The CLI transport's hard cap (decision #42). Source: the documented headless
+/// behavior's ~10 MB stdin/argument cap (doc 09 §3) — kept as the enforced
+/// limit even though newer CLI builds report no protocol cap (the real bound is
+/// model context), because it is the conservative, in-repo-documented number.
+/// Hard stop, never auto-shrink (decision #40). // [VERIFY] at build time.
 pub const CLI_STDIN_MAX_BYTES: usize = 10 * 1024 * 1024;
 
 /// The headless `--output-format json` result envelope (doc 09 §3).
@@ -115,13 +118,9 @@ impl ReasoningTransport for CliTransport {
             ));
         }
         let prompt = self.build_prompt(payload);
-        if prompt.len() >= CLI_STDIN_MAX_BYTES {
-            return Err(TransportError::PayloadTooLarge(format!(
-                "{} B exceeds the CLI cap of {} B",
-                prompt.len(),
-                CLI_STDIN_MAX_BYTES
-            )));
-        }
+        // Decision #42 self-guard: shares `check_hard_cap` with the gateway's
+        // pre-egress check so the two enforce one boundary.
+        check_hard_cap(TransportId::ClaudeCli, prompt.len())?;
         if prompt.len() >= CLI_STDIN_COMPACT_CHARS {
             tracing::warn!(
                 len = prompt.len(),

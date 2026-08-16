@@ -294,6 +294,14 @@ pub fn spawn_pattern_task(
             .unwrap_or(1);
         let mut engine = PatternEngine::with_next_session_id(next_session);
 
+        // Decision #17: the engine's tunables come from the `pattern_engine`
+        // settings block (seeded from settings.default.json), constants as
+        // fallback. Re-read on the daily maintenance tick below — the same
+        // per-pass cadence the retention job uses; the shell has no push-style
+        // settings-reload path yet.
+        let mut engine_cfg = engine_config_from_settings(&db);
+        engine.set_config(engine_cfg.clone());
+
         // CONN-M2: hydrate the decay/mute ladder from the persisted `patterns`
         // table so a dismissed/muted suggestion stays suppressed across a restart
         // (doc 08 §7). Without this the engine re-mines every signature cold
@@ -327,18 +335,33 @@ pub fn spawn_pattern_task(
         match hydrated {
             Ok(rows) => {
                 let n = rows.len();
-                engine.hydrate(rows);
+                let unparseable = engine.hydrate(rows);
                 if n > 0 {
                     tracing::info!(patterns = n, "hydrated decay/mute ladder from disk (CONN-M2)");
+                }
+                // Rows the engine could not parse can never fire, take feedback,
+                // or decay — and the engine prune (the sole patterns deleter,
+                // decision #18) only sees cached rows, so drop them here or they
+                // linger forever.
+                if !unparseable.is_empty() {
+                    let n = unparseable.len();
+                    if let Err(e) = delete_pattern_rows(&db, &unparseable) {
+                        tracing::error!(%e, "unparseable pattern cleanup failed");
+                    } else {
+                        tracing::warn!(dropped = n, "unparseable persisted patterns deleted");
+                    }
                 }
             }
             Err(e) => tracing::error!(%e, "pattern hydrate read failed; engine starts cold"),
         }
 
-        // Weekly pattern-table maintenance (doc 08 §9) — checked daily; the
-        // engine's own support-decay math decides what is actually stale.
-        // This hook had NO caller before 2026-08-15: stale signatures
-        // accumulated forever and re-hydrated at every restart.
+        // Pattern-table maintenance (doc 08 §9) — checked daily; the engine's
+        // own support-decay math decides what is actually stale. This decay
+        // prune + its DB mirror is the ONE owner of `patterns` deletion (owner
+        // decision #18, 2026-08-16): the retention job's independent age-based
+        // pattern prune was removed (crates/db/src/retention.rs), so the two
+        // timers can no longer disagree. The same tick re-reads the engine's
+        // settings block (#17).
         let mut prune_tick = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
         prune_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         prune_tick.tick().await; // consume the immediate first tick
@@ -350,23 +373,17 @@ pub fn spawn_pattern_task(
                     if !doomed.is_empty() {
                         // Mirror to the patterns table or they re-hydrate.
                         let n = doomed.len();
-                        let res = db.with_conn(|c| {
-                            for sig in &doomed {
-                                // Suggestion history outlives its pattern: detach
-                                // the FK, then drop the pattern row.
-                                c.execute(
-                                    "UPDATE suggestions SET pattern_id = NULL WHERE pattern_id IN \
-                                     (SELECT id FROM patterns WHERE signature = ?1)",
-                                    [sig],
-                                )?;
-                                c.execute("DELETE FROM patterns WHERE signature = ?1", [sig])?;
-                            }
-                            Ok(())
-                        });
-                        match res {
+                        match delete_pattern_rows(&db, &doomed) {
                             Ok(()) => tracing::info!(pruned = n, "stale patterns pruned (doc 08 §9)"),
                             Err(e) => tracing::error!(%e, "pattern prune DB mirror failed"),
                         }
+                    }
+                    // Decision #17: pick up settings edits at the daily cadence.
+                    let fresh_cfg = engine_config_from_settings(&db);
+                    if fresh_cfg != engine_cfg {
+                        tracing::info!("pattern_engine settings changed; reconfiguring engine (#17)");
+                        engine.set_config(fresh_cfg.clone());
+                        engine_cfg = fresh_cfg;
                     }
                 }
                 state = capture_rx.recv() => {
@@ -440,14 +457,36 @@ pub fn spawn_pattern_task(
                     // suggestions.pattern_id is an FK into patterns — inserting
                     // an unflushed id is a guaranteed constraint failure.
                     let remap = flush_patterns(&db, &mut engine);
-                    for cand in candidates {
+                    for mut cand in candidates {
                         let pattern_id =
                             remap.get(&cand.pattern_id).copied().unwrap_or(cand.pattern_id);
                         // Resolve the candidate's connector_state row for
-                        // rendering (doc 03 §3).
-                        let Ok(Some(state)) = db.read_connector_state(&cand.connector_id) else {
-                            tracing::warn!(connector_id = %cand.connector_id, "candidate without connector_state row");
-                            continue;
+                        // rendering (doc 03 §3). A "switch to X" candidate
+                        // (decision #15) carries a sentinel ref instead of a row
+                        // id — synthesize + persist its `app_focus` state row so
+                        // the bubble rides the identical pipeline: FK-valid
+                        // suggestions row, queued-resurface via
+                        // `list_suggestions`, and Path B click-resolve
+                        // (`bubble_click` dispatches `app_focus` rows itself).
+                        let state = match aperture_pattern_engine::app_focus_target(
+                            &cand.connector_id,
+                        ) {
+                            Some(process) => {
+                                let state = app_focus_state(process, now_ms);
+                                if let Err(e) = db.insert_connector_state(&state) {
+                                    tracing::error!(%e, "app_focus state persist failed");
+                                    continue;
+                                }
+                                cand.connector_id = state.id.clone();
+                                state
+                            }
+                            None => match db.read_connector_state(&cand.connector_id) {
+                                Ok(Some(state)) => state,
+                                _ => {
+                                    tracing::warn!(connector_id = %cand.connector_id, "candidate without connector_state row");
+                                    continue;
+                                }
+                            },
                         };
                         let spec = aperture_suggestion_generator::render(&cand, &state, now_ms);
                         // ADR-040/Q95: while snoozed, rows queue (learning
@@ -791,6 +830,66 @@ fn flush_patterns(
         }
     }
     remap
+}
+
+/// The engine's runtime tunables from the `pattern_engine` settings section
+/// (decision #17): seeded defaults with the crate constants as fallback —
+/// missing/invalid keys can never weaken the engine (same posture as
+/// `retention_policy_from_settings` in main.rs).
+fn engine_config_from_settings(db: &Db) -> aperture_pattern_engine::config::EngineConfig {
+    let section = db
+        .get_setting("pattern_engine")
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    aperture_pattern_engine::config::EngineConfig::from_settings(&section)
+}
+
+/// Delete pattern rows by signature, detaching suggestion history first
+/// (suggestions outlive their pattern). The ONLY policy-driven `patterns`
+/// deleter is the engine's decay prune mirrored through here (decision #18);
+/// hydrate-time cleanup of unparseable rows shares the path.
+fn delete_pattern_rows(db: &Db, signatures: &[String]) -> Result<(), aperture_db::DbError> {
+    db.with_conn(|c| {
+        for sig in signatures {
+            c.execute(
+                "UPDATE suggestions SET pattern_id = NULL WHERE pattern_id IN \
+                 (SELECT id FROM patterns WHERE signature = ?1)",
+                [sig],
+            )?;
+            c.execute("DELETE FROM patterns WHERE signature = ?1", [sig])?;
+        }
+        Ok(())
+    })
+}
+
+/// How long a synthetic `app_focus` state stays clickable. A "switch to X now"
+/// prompt is momentary — the row exists so the bubble can ride the normal
+/// suggestion pipeline (FK, resurface, Path B); retention reaps it once stale.
+const APP_FOCUS_TTL_MS: i64 = 24 * 3_600_000;
+
+/// Synthesize the connector-state row backing one "switch to X" bubble (owner
+/// decision #15, 2026-08-16). `connector_type = "app_focus"` is resolved by
+/// `bubble_click` itself (Path B analog — commands/mod.rs); the payload carries
+/// the raw process name to dispatch and the display name `{app}` the template
+/// expands.
+fn app_focus_state(process: &str, now_ms: i64) -> aperture_contracts::ConnectorState {
+    let stem = process.trim_end_matches(".exe").trim_end_matches(".EXE");
+    let mut display = String::with_capacity(stem.len());
+    let mut chars = stem.chars();
+    if let Some(first) = chars.next() {
+        display.extend(first.to_uppercase());
+        display.push_str(chars.as_str());
+    }
+    aperture_contracts::ConnectorState {
+        id: uuid::Uuid::new_v4().to_string(),
+        connector_type: "app_focus".to_string(),
+        reconstruct_payload: serde_json::json!({ "process": process, "app": display }),
+        payload_version: 1,
+        captured_ts: now_ms,
+        stale_after_ts: Some(now_ms + APP_FOCUS_TTL_MS),
+    }
 }
 
 /// Epoch ms for feedback/snooze timestamps (the event path uses `ev.ts`).

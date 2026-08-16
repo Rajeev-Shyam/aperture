@@ -30,6 +30,11 @@ interface Props {
   onRun: (transcript: string) => void;
 }
 
+/** Decision #28: with ≤ this much of the 30 s hold left (i.e. from 25 s in),
+ *  the listening pill turns urgent and counts down to the force-finalize.
+ *  elapsed/max stream from the core's mic loop, so UI and cutoff can't drift. */
+const PTT_WARN_REMAINING_MS = 5_000;
+
 export function VoiceSurfaces({ event, onAskClaude, onDismiss, onRun }: Props) {
   // Move focus to the confirm chip when it appears (role="alertdialog" requires
   // it) so keyboard users land on the trust surface and Escape can dismiss it.
@@ -42,11 +47,26 @@ export function VoiceSurfaces({ event, onAskClaude, onDismiss, onRun }: Props) {
     case "hidden":
       return null;
 
-    case "listening":
+    case "listening": {
+      // Decision #28: the 30 s ceiling force-finalizes the hold; the last 5 s
+      // must be a visible countdown, never a silent cutoff.
+      const remainingMs = (event.max_ms ?? 30_000) - (event.elapsed_ms ?? 0);
+      const urgent = event.elapsed_ms !== undefined && remainingMs <= PTT_WARN_REMAINING_MS;
       return (
-        <div className="voice voice--pill surface-glass surface-interactive" role="status">
+        <div
+          className={`voice voice--pill surface-glass surface-interactive${
+            urgent ? " voice--urgent" : ""
+          }`}
+          role="status"
+        >
           <Waveform level={event.level ?? 0} />
-          <span>Listening… release to stop</span>
+          {urgent ? (
+            <span className="voice__countdown" aria-live="assertive">
+              30 s limit — auto-stop in {Math.max(1, Math.ceil(remainingMs / 1000))}s
+            </span>
+          ) : (
+            <span>Listening… release to stop</span>
+          )}
           {/* Mouse-summon PTT: hold to talk. The global hotkey path is owned by
               the Rust shell; this is the optional summon affordance (doc 11 §2). */}
           <button
@@ -60,6 +80,7 @@ export function VoiceSurfaces({ event, onAskClaude, onDismiss, onRun }: Props) {
           </button>
         </div>
       );
+    }
 
     case "thinking":
       return (

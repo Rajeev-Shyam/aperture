@@ -40,7 +40,12 @@ pub struct DocumentPayloadV1 {
 #[derive(Debug, Default, Clone)]
 pub struct DocumentConnector;
 
-const TTL_7D: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// Decision #37 (per-connector-type staleness): a document stays worth resuming
+/// far longer than media — a report parked for weeks is still the same edit
+/// target, and `reconstruct` re-checks existence at click anyway (missing ⇒
+/// folder degrade), so a long TTL can't produce a dead resume. 30 d, up from
+/// the flat 7 d the audit flagged.
+const TTL_30D: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 impl DocumentConnector {
     pub fn new() -> Self {
@@ -244,8 +249,8 @@ impl Connector for DocumentConnector {
     }
 
     fn staleness_ttl(&self) -> Duration {
-        // TTL 7 d (doc 10 §4).
-        TTL_7D
+        // Decision #37: per-type TTL — see [`TTL_30D`] for the reasoning.
+        TTL_30D
     }
 
     fn reconstruct(&self, st: &ConnectorState) -> Result<ResumeArtifact, ConnectorError> {
@@ -385,6 +390,8 @@ mod tests {
 
         let c = DocumentConnector::new();
         let st = c.capture(&doc_event(&path, "cap.txt - Notepad")).expect("captured");
+        // Decision #37: documents get the long 30 d TTL.
+        assert_eq!(st.stale_after_ts, Some(9_000 + 30 * 24 * 60 * 60 * 1000));
         match c.reconstruct(&st).unwrap() {
             ResumeArtifact::FileOpen { path: p, app_hint } => {
                 assert_eq!(p, path);

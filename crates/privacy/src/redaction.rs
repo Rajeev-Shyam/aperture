@@ -11,7 +11,7 @@
 //!
 //! | Order | [`RuleKind`]    | Mechanism (doc 13 §5)                              |
 //! |------:|-----------------|----------------------------------------------------|
-//! | 1     | `SecretKey`     | regex: AWS keys, `sk-…`, PEM headers, JWT          |
+//! | 1     | `SecretKey`     | regex: AWS keys, `sk-…`, GitHub PATs, Slack `xox…`, `Authorization: Bearer` headers, PEM/OPENSSH key bodies, JWT |
 //! | 2     | `PaymentCard`   | 13–19 digit runs passing the Luhn check            |
 //! | 3     | `Iban`          | country-prefixed IBAN regex                        |
 //! | 4     | `Email`         | RFC-lite regex                                     |
@@ -33,7 +33,8 @@ use crate::PrivacyError;
 /// truth for execution order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleKind {
-    /// 1 — secrets/keys: AWS access keys, `sk-…` tokens, PEM headers, JWTs.
+    /// 1 — secrets/keys: AWS access keys, `sk-…` tokens, GitHub PATs, Slack
+    /// tokens, `Authorization: Bearer` headers, PEM/OPENSSH key bodies, JWTs.
     SecretKey,
     /// 2 — payment cards: 13–19 digit runs passing Luhn.
     PaymentCard,
@@ -103,7 +104,8 @@ pub struct UserTerm {
 /// at M7; the M9-scoped privacy pieces (consent UI, key manager, audit-row DB
 /// persistence, exclusion manager) remain their `todo!("M9")` stubs.
 pub struct Redactor {
-    /// Rule 1 — secrets: AWS access keys, `sk-…` tokens, PEM headers, JWTs.
+    /// Rule 1 — secrets: AWS access keys, `sk-…` tokens, GitHub PATs, Slack
+    /// tokens, `Authorization: Bearer` headers, PEM/OPENSSH key bodies, JWTs.
     secret: Vec<Regex>,
     /// Rule 2 — candidate 13–19 digit runs (Luhn-filtered before redaction).
     card: Regex,
@@ -124,11 +126,31 @@ impl Redactor {
     /// and are `expect`-compiled (a failure would be a build-time bug, not runtime).
     pub fn new(user_terms: &[UserTerm]) -> Result<Self, PrivacyError> {
         let secret = vec![
+            // Full PEM/OPENSSH private-key BODIES must run before the header-only
+            // fallback: a complete key (header + base64 body + END line) collapses
+            // to a single placeholder; non-greedy so two keys stay two hits.
+            Regex::new(
+                r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
+            )
+            .expect("pem body regex"),
+            // Header-only fallback: a truncated capture (no END line) still redacts.
+            Regex::new(r"-----BEGIN [A-Z ]*PRIVATE KEY-----").expect("pem header regex"),
             Regex::new(r"AKIA[0-9A-Z]{16}").expect("aws key regex"),
             Regex::new(r"sk-[A-Za-z0-9]{16,}").expect("sk token regex"),
-            Regex::new(r"-----BEGIN [A-Z ]*PRIVATE KEY-----").expect("pem regex"),
             Regex::new(r"eyJ[A-Za-z0-9_-]{6,}\.eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}")
                 .expect("jwt regex"),
+            // GitHub PATs: classic (ghp_/gho_/ghu_/ghs_/ghr_ + 36 alnum) and
+            // fine-grained (github_pat_ + 82 [alnum_]); floors keep short
+            // prose like "ghp_test" from false-firing.
+            Regex::new(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}").expect("github pat regex"),
+            Regex::new(r"\bgithub_pat_[A-Za-z0-9_]{36,}").expect("github fg pat regex"),
+            // Slack tokens: xoxb-/xoxp-/xoxa-/xoxr-/xoxs- + digit/dash sections.
+            Regex::new(r"\bxox[abprs]-[A-Za-z0-9-]{10,}").expect("slack token regex"),
+            // `Authorization: Bearer <token>` — anchored to the literal header name
+            // (same line only) so prose containing the word "Bearer" never matches;
+            // token chars per RFC 6750 b64token, floored at 16.
+            Regex::new(r"(?i:authorization)[ \t]*:[ \t]*(?i:bearer)[ \t]+[A-Za-z0-9._~+/-]{16,}=*")
+                .expect("bearer header regex"),
         ];
         // A digit-started run of 13–19 digits allowing single space/dash separators;
         // Luhn filters false positives (long order/ID numbers) at replacement time.
@@ -397,6 +419,98 @@ mod tests {
     fn redacts_secret_keys_before_anything_else() {
         let (red, hits) = redactor().redact_text("key sk-ABCDEFGHIJKLMNOPQRSTUV live");
         assert!(red.contains("⟨secret#1⟩"), "got {red}");
+        assert_eq!(hits.iter().find(|h| h.rule == "secret_key").unwrap().count, 1);
+    }
+
+    #[test]
+    fn redacts_github_classic_and_fine_grained_pats() {
+        // Classic PAT: prefix + 36 alnum. All five classic prefixes share the rule;
+        // ghp_ and ghs_ stand in for the class.
+        let text = "push with ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij and \
+                    ghs_0123456789abcdefghijABCDEFGHIJ456789 done";
+        let (red, hits) = redactor().redact_text(text);
+        assert!(red.contains("⟨secret#1⟩") && red.contains("⟨secret#2⟩"), "got {red}");
+        assert!(!red.contains("ghp_") && !red.contains("ghs_"), "no raw PAT survives: {red}");
+        assert_eq!(hits.iter().find(|h| h.rule == "secret_key").unwrap().count, 2);
+        // Fine-grained PAT: github_pat_ + 22 alnum + `_` + 59 alnum.
+        let fg = "github_pat_11ABCDEFGHIJKLMNOPQRST_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456";
+        let (red, hits) = redactor().redact_text(&format!("token {fg} end"));
+        assert!(red.contains("⟨secret#1⟩") && !red.contains("github_pat_"), "got {red}");
+        assert_eq!(hits.iter().find(|h| h.rule == "secret_key").unwrap().count, 1);
+        // Negative: a short prose mention is not a token.
+        let (red, hits) = redactor().redact_text("set ghp_test as a placeholder name");
+        assert_eq!(red, "set ghp_test as a placeholder name");
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn redacts_slack_tokens() {
+        // Assembled at runtime: a source-literal Slack-shaped token trips
+        // GitHub push protection (it has no checksum to disprove realness).
+        let tok = format!("xoxb-{}-{}-{}", "123456789012", "1234567890123", "AbCdEfGhIjKlMnOpQrStUvWx");
+        let (red, hits) = redactor().redact_text(&format!("bot {tok}"));
+        assert!(red.contains("⟨secret#1⟩") && !red.contains("xoxb-"), "got {red}");
+        assert_eq!(hits.iter().find(|h| h.rule == "secret_key").unwrap().count, 1);
+        // Negative: the bare prefix with nothing token-like after it is left alone.
+        let (red, hits) = redactor().redact_text("the xoxb- prefix marks bot tokens");
+        assert_eq!(red, "the xoxb- prefix marks bot tokens");
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn redacts_authorization_bearer_header_but_not_prose_bearer() {
+        let (red, hits) =
+            redactor().redact_text("curl -H 'Authorization: Bearer mF_9.B5f-4.1JqM0aXk8ZZZZ' https://x");
+        assert!(red.contains("⟨secret#1⟩"), "got {red}");
+        assert!(!red.contains("mF_9.B5f-4"), "no raw bearer token survives: {red}");
+        assert_eq!(hits.iter().find(|h| h.rule == "secret_key").unwrap().count, 1);
+        // Lowercase header form (as seen in raw HTTP dumps) is caught too.
+        let (red, _) = redactor().redact_text("authorization: bearer abcdefghijklmnop0123");
+        assert!(red.contains("⟨secret#1⟩"), "lowercase header redacted: {red}");
+        // Negatives: ordinary prose with the word Bearer must not be nuked.
+        for prose in [
+            "the bearer of good news arrived unannounced",
+            "Bearer tokens are described in RFC 6750 at length",
+            "Authorization: Bearer auth",
+        ] {
+            let (red, hits) = redactor().redact_text(prose);
+            assert_eq!(red, prose, "prose untouched");
+            assert!(hits.is_empty());
+        }
+    }
+
+    #[test]
+    fn redacts_a_full_pem_private_key_body_as_one_hit() {
+        let text = "before\n-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA7x9z\nQWJjZGVmZ2hpamts\n-----END RSA PRIVATE KEY-----\nafter";
+        let (red, hits) = redactor().redact_text(text);
+        assert!(red.contains("⟨secret#1⟩"), "got {red}");
+        assert!(
+            !red.contains("MIIEpAIBAAKCAQEA7x9z") && !red.contains("QWJjZGVmZ2hpamts"),
+            "no base64 body line survives: {red}"
+        );
+        assert!(red.starts_with("before\n") && red.ends_with("\nafter"), "context kept: {red}");
+        // The whole body is ONE hit — the header-only fallback must not double-fire.
+        assert_eq!(hits.iter().find(|h| h.rule == "secret_key").unwrap().count, 1);
+    }
+
+    #[test]
+    fn redacts_an_openssh_key_body_and_keeps_two_keys_as_two_hits() {
+        let text = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEA\n-----END OPENSSH PRIVATE KEY-----\nand\n-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIB\n-----END EC PRIVATE KEY-----";
+        let (red, hits) = redactor().redact_text(text);
+        assert!(red.contains("⟨secret#1⟩") && red.contains("⟨secret#2⟩"), "got {red}");
+        assert!(
+            !red.contains("b3BlbnNzaC1rZXktdjEA") && !red.contains("MHcCAQEEIB"),
+            "no key material survives: {red}"
+        );
+        // Non-greedy body match: two keys are two hits, not one span across both.
+        assert_eq!(hits.iter().find(|h| h.rule == "secret_key").unwrap().count, 2);
+    }
+
+    #[test]
+    fn a_truncated_pem_header_without_an_end_line_still_redacts() {
+        let (red, hits) = redactor().redact_text("saw -----BEGIN PRIVATE KEY----- then the capture cut off");
+        assert!(red.contains("⟨secret#1⟩"), "got {red}");
+        assert!(!red.contains("BEGIN PRIVATE KEY"), "header line scrubbed: {red}");
         assert_eq!(hits.iter().find(|h| h.rule == "secret_key").unwrap().count, 1);
     }
 

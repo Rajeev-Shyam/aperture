@@ -425,7 +425,9 @@ impl Inner {
 
 /// Runs jobs by talking to the `vlm-host` sidecar over loopback (doc 06 §3, doc
 /// 12 §5). Ensures the model is loaded (spawning the sidecar on demand), POSTs
-/// `/infer`, and parses the structured scene JSON.
+/// `/infer`, and parses the structured scene JSON. Binary payloads (frame JPEG /
+/// WAV) ride as raw `multipart/form-data` parts (decision #33) — matching the
+/// hosts' `read_infer_multipart` / `read_transcribe_multipart` decode.
 pub struct SidecarRunner {
     client: reqwest::Client,
 }
@@ -480,7 +482,12 @@ async fn acquire_endpoint(
     model: ModelId,
     now_ms: i64,
 ) -> Result<String, JobError> {
-    let mut life = lifecycle.lock().await;
+    // Decision #45: clone the (shared-state) lifecycle handle out from under
+    // the facade mutex, so the cold load below holds only the per-kind lock
+    // inside `ModelLifecycle` — an in-flight VLM load can never block an STT
+    // acquire, the voice thread's warm-keep, or the shell's idle sweep. The
+    // facade mutex is held for the clone only, never across the load.
+    let mut life = lifecycle.lock().await.clone();
     if let Ok(endpoint) = life.ensure_loaded(model, now_ms).await {
         return Ok(endpoint);
     }
@@ -514,15 +521,22 @@ impl JobRunner for SidecarRunner {
         let endpoint = acquire_endpoint(&lifecycle, model, now_ms).await?;
         match &job.kind {
             GpuJobKind::Vlm { image_jpeg, prompt } => {
-                let body = serde_json::json!({
-                    "image_jpeg": image_jpeg,
-                    "prompt": prompt,
-                    "schema": serde_json::Value::Null,
-                });
+                // Decision #33: the frame rides as one raw multipart part — the
+                // JSON number-array encoding (~3.6 chars/byte) is gone on both
+                // sides (vlm-host decodes with `read_infer_multipart`). `schema`
+                // stays explicit so the wire shape is self-describing.
+                let part = reqwest::multipart::Part::bytes(image_jpeg.clone())
+                    .file_name("frame.jpg")
+                    .mime_str("image/jpeg")
+                    .expect("static mime type");
+                let form = reqwest::multipart::Form::new()
+                    .part("image_jpeg", part)
+                    .text("prompt", prompt.clone())
+                    .text("schema", "null");
                 let resp = self
                     .client
                     .post(format!("{endpoint}/infer"))
-                    .json(&body)
+                    .multipart(form)
                     .send()
                     .await
                     .map_err(|_| JobError::SidecarDown)?;
@@ -532,12 +546,19 @@ impl JobRunner for SidecarRunner {
             }
             GpuJobKind::Stt { wav } => {
                 // stt-host contract (crates/stt-host): POST /transcribe with the
-                // 16 kHz mono WAV; the response mirrors JobOutput::Stt. STT is
-                // never cancellable (doc 12 §3) — the deadline is the scheduler's.
+                // 16 kHz mono WAV as one raw multipart part named `wav`
+                // (decision #33; stt-host decodes with `read_transcribe_multipart`).
+                // The response mirrors JobOutput::Stt. STT is never cancellable
+                // (doc 12 §3) — the deadline is the scheduler's.
+                let part = reqwest::multipart::Part::bytes(wav.clone())
+                    .file_name("audio.wav")
+                    .mime_str("audio/wav")
+                    .expect("static mime type");
+                let form = reqwest::multipart::Form::new().part("wav", part);
                 let resp = self
                     .client
                     .post(format!("{endpoint}/transcribe"))
-                    .json(&serde_json::json!({ "wav": wav }))
+                    .multipart(form)
                     .send()
                     .await
                     .map_err(|_| JobError::SidecarDown)?;
@@ -859,6 +880,68 @@ mod tests {
         ));
     }
 
+    /// Decision #45: `acquire_endpoint` must not hold the facade mutex across a
+    /// cold load. With the old code (guard held through `ensure_loaded`) the
+    /// STT acquire below deadlocks behind the parked VLM spawn and the timeout
+    /// fires; with the per-kind split it completes immediately.
+    #[tokio::test]
+    async fn stt_acquire_endpoint_is_not_blocked_by_an_in_flight_vlm_cold_load() {
+        use crate::model_lifecycle::{LifecycleError, SidecarProcess, Spawner};
+        use tokio::sync::Notify;
+
+        struct GatedSpawner {
+            vlm_started: Arc<Notify>,
+            release_vlm: Arc<Notify>,
+        }
+        #[async_trait::async_trait]
+        impl Spawner for GatedSpawner {
+            async fn spawn(&self, model: ModelId) -> Result<Box<dyn SidecarProcess>, LifecycleError> {
+                struct P;
+                #[async_trait::async_trait]
+                impl SidecarProcess for P {
+                    fn endpoint(&self) -> &str {
+                        "http://127.0.0.1:2"
+                    }
+                    async fn is_ready(&self) -> bool {
+                        true
+                    }
+                    async fn kill(&mut self) -> Result<(), LifecycleError> {
+                        Ok(())
+                    }
+                }
+                if SidecarKind::of(model) == SidecarKind::VlmHost {
+                    self.vlm_started.notify_one();
+                    self.release_vlm.notified().await; // the simulated slow cold load
+                }
+                Ok(Box::new(P))
+            }
+        }
+
+        let vlm_started = Arc::new(Notify::new());
+        let release_vlm = Arc::new(Notify::new());
+        let lifecycle = Arc::new(TokioMutex::new(ModelLifecycle::new(Box::new(GatedSpawner {
+            vlm_started: Arc::clone(&vlm_started),
+            release_vlm: Arc::clone(&release_vlm),
+        }))));
+
+        let vlm_lifecycle = Arc::clone(&lifecycle);
+        let vlm = tokio::spawn(async move {
+            acquire_endpoint(&vlm_lifecycle, ModelId::Vlm3b, 0).await
+        });
+        vlm_started.notified().await; // the VLM cold load is now in flight
+
+        let stt = tokio::time::timeout(
+            Duration::from_secs(1),
+            acquire_endpoint(&lifecycle, ModelId::FasterWhisperSmall, 0),
+        )
+        .await
+        .expect("the facade mutex must be free during a VLM cold load (decision #45)");
+        assert!(stt.is_ok(), "STT acquires while the VLM still loads");
+
+        release_vlm.notify_one();
+        assert!(vlm.await.unwrap().is_ok(), "the parked VLM load still completes");
+    }
+
     #[tokio::test]
     async fn l2_stt_swaps_out_the_resident_7b_instead_of_refusing() {
         // A lifecycle holding the exclusive L2 7B (STT + resident 7B blows 7.0 GB).
@@ -888,5 +971,140 @@ mod tests {
             !lifecycle.lock().await.loaded_models().contains(&ModelId::Vlm7b),
             "the resident 7B was evicted by the L2 swap"
         );
+    }
+
+    /// A lifecycle whose sidecars all "run" at the given endpoint — points the
+    /// real [`SidecarRunner`] at a loopback test server.
+    fn lifecycle_at(endpoint: String) -> Arc<TokioMutex<ModelLifecycle>> {
+        use crate::model_lifecycle::{LifecycleError, SidecarProcess, Spawner};
+        struct At(String);
+        struct P(String);
+        #[async_trait::async_trait]
+        impl SidecarProcess for P {
+            fn endpoint(&self) -> &str {
+                &self.0
+            }
+            async fn is_ready(&self) -> bool {
+                true
+            }
+            async fn kill(&mut self) -> Result<(), LifecycleError> {
+                Ok(())
+            }
+        }
+        #[async_trait::async_trait]
+        impl Spawner for At {
+            async fn spawn(&self, _m: ModelId) -> Result<Box<dyn SidecarProcess>, LifecycleError> {
+                Ok(Box::new(P(self.0.clone())))
+            }
+        }
+        Arc::new(TokioMutex::new(ModelLifecycle::new(Box::new(At(endpoint)))))
+    }
+
+    /// Decision #33 round trip through the REAL client leg: `SidecarRunner`
+    /// posts multipart, a loopback fake host decodes it the way the real hosts'
+    /// `read_infer_multipart` / `read_transcribe_multipart` do, and the binary
+    /// payload must arrive byte-identically for both job kinds.
+    #[tokio::test]
+    async fn sidecar_runner_round_trips_binary_payloads_as_multipart() {
+        use axum::extract::Multipart;
+        use axum::routing::post;
+        use axum::{Json, Router};
+
+        let seen_vlm: Arc<StdMutex<Option<(Vec<u8>, String)>>> = Arc::new(StdMutex::new(None));
+        let seen_wav: Arc<StdMutex<Option<Vec<u8>>>> = Arc::new(StdMutex::new(None));
+
+        let sv = Arc::clone(&seen_vlm);
+        let sw = Arc::clone(&seen_wav);
+        let app = Router::new()
+            .route(
+                "/infer",
+                post(move |mut mp: Multipart| {
+                    let sv = Arc::clone(&sv);
+                    async move {
+                        let (mut image, mut prompt) = (Vec::new(), String::new());
+                        while let Some(f) = mp.next_field().await.unwrap() {
+                            match f.name() {
+                                Some("image_jpeg") => image = f.bytes().await.unwrap().to_vec(),
+                                Some("prompt") => prompt = f.text().await.unwrap(),
+                                _ => {}
+                            }
+                        }
+                        *sv.lock().unwrap() = Some((image, prompt));
+                        Json(serde_json::json!({ "scene": "ok" }))
+                    }
+                }),
+            )
+            .route(
+                "/transcribe",
+                post(move |mut mp: Multipart| {
+                    let sw = Arc::clone(&sw);
+                    async move {
+                        while let Some(f) = mp.next_field().await.unwrap() {
+                            if f.name() == Some("wav") {
+                                *sw.lock().unwrap() = Some(f.bytes().await.unwrap().to_vec());
+                            }
+                        }
+                        Json(serde_json::json!({
+                            "transcript": "hello",
+                            "avg_token_confidence": 0.9,
+                            "duration_ms": 12
+                        }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let lifecycle = lifecycle_at(endpoint);
+        let runner = SidecarRunner::new();
+
+        // Every byte value in the payloads, so nothing survives by accident.
+        let image: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        let out = runner
+            .run(
+                &GpuJob {
+                    kind: GpuJobKind::Vlm {
+                        image_jpeg: image.clone(),
+                        prompt: "describe the screen".into(),
+                    },
+                    priority: priority::VLM_PATTERN,
+                    deadline: Duration::from_secs(5),
+                },
+                ModelId::Vlm3b,
+                Arc::clone(&lifecycle),
+            )
+            .await
+            .expect("vlm round trip");
+        assert!(matches!(out, JobOutput::Vlm(_)));
+        let (img, prompt) = seen_vlm.lock().unwrap().take().expect("host saw the frame");
+        assert_eq!(img, image, "frame is byte-identical across the multipart leg");
+        assert_eq!(prompt, "describe the screen");
+
+        let wav: Vec<u8> = (0u8..=255).rev().cycle().take(4096).collect();
+        let out = runner
+            .run(
+                &GpuJob {
+                    kind: GpuJobKind::Stt { wav: wav.clone() },
+                    priority: priority::STT_VOICE,
+                    deadline: Duration::from_secs(5),
+                },
+                ModelId::FasterWhisperSmall,
+                lifecycle,
+            )
+            .await
+            .expect("stt round trip");
+        match out {
+            JobOutput::Stt { transcript, avg_token_confidence, duration_ms } => {
+                assert_eq!(transcript, "hello");
+                assert!((avg_token_confidence - 0.9).abs() < 1e-6);
+                assert_eq!(duration_ms, 12);
+            }
+            other => panic!("expected Stt output, got {other:?}"),
+        }
+        let seen = seen_wav.lock().unwrap().take().expect("host saw the wav");
+        assert_eq!(seen, wav, "wav is byte-identical across the multipart leg");
     }
 }

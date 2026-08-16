@@ -269,6 +269,38 @@
   font-size: 0.85rem;
 }
 
+/* VLM install notice + download progress (decision #30). Reuses the banner
+ * frame; the bar is token-only, no raw colors. */
+.dash__vlm {
+  margin-top: 14px;
+}
+
+.dash__vlm strong {
+  color: var(--ink-primary);
+}
+
+.dash__progress {
+  height: 8px;
+  border: 1px solid var(--border-hairline);
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--lift-1);
+}
+
+.dash__progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: inherit;
+  transition: width 200ms ease;
+}
+
+/* Outranks the `.dash__banner p` base rule without !important. */
+.dash__banner p.dash__progress-label {
+  margin: 6px 0 0;
+  color: var(--ink-faint);
+  font-size: 0.75rem;
+}
+
 /* Overview settings row (start-at-login). */
 .dash__setting {
   display: flex;
@@ -292,6 +324,13 @@
   color: var(--ink-faint);
   font-size: 0.75rem;
   line-height: 1.4;
+}
+
+/* Slider variant (decision #27: the voice confirm-floor control). */
+.dash__setting--slider input[type="range"] {
+  width: 150px;
+  flex-shrink: 0;
+  margin-top: 4px;
 }
 
 /* Search + row lists (History / Patterns / Suggestions / Voice) */

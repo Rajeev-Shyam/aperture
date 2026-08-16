@@ -97,17 +97,24 @@ pub enum UtteranceOutcome {
     /// Sub-300 ms of speech after VAD trim — discarded as an accidental tap
     /// (doc 07 §2). Still nothing is stored (no real utterance occurred).
     DiscardedTap,
-    /// Confidence < 0.6: show a transcript chip ("Did you say: …?") with Run/Dismiss;
-    /// never act on a guess (doc 07 §4.4). Always stored + embedded first.
+    /// Confidence below the configured floor (`voice.intent_confidence_floor`,
+    /// decision #27; default 0.6): show a transcript chip ("Did you say: …?") with
+    /// Run/Dismiss; never act on a guess (doc 07 §4.4). Always stored + embedded first.
     ConfirmChip { transcript: String },
     /// Query intent resolved to an answer bubble (doc 07 §5).
     Answer(AnswerBubble),
     /// `"ask claude …"` escalation: a payload draft is ready for the preview→Send
-    /// gate. NEVER auto-sent (doc 07 §4.2, §5).
+    /// gate. NEVER auto-sent (doc 07 §4.2, §5). The `ContextPayload` itself is
+    /// assembled by the shell's `request_preview` when the user clicks "Ask
+    /// Claude" (transcript + recent screen context, decision #29) — building it
+    /// here would need the gateway crate, and voice must stay outside the
+    /// two-emitter boundary (doc 13 §2).
     EscalationDraft {
         transcript: String,
-        // TODO(M7:) carry the assembled `aperture_contracts::ContextPayload` here
-        //           once the payload builder lands; the gateway owns the send.
+        /// The words after the `"ask claude"` prefix — the user's actual
+        /// question, which seeds the preview's `user_addition` (doc 07 §5).
+        /// `None` for a bare "ask claude".
+        query: Option<String>,
     },
     /// Telemetry-only utterance: stored + embedded, no UI (doc 07 §4.3).
     StoredSilently,
@@ -309,15 +316,17 @@ impl VoiceSubsystem {
             .map_err(|e| VoiceError::Logging(e.to_string()))?;
 
         // 5. Low confidence ⇒ confirm chip; never act on a guess (doc 07 §4.4).
-        if classified.needs_confirmation() {
+        //    The floor is user-tunable (decision #27); 1.0 = always confirm.
+        if classified.needs_confirmation_at(self.confirm_confidence_floor()) {
             return Ok(UtteranceOutcome::ConfirmChip { transcript: transcription.transcript });
         }
 
         // 6. Branch on intent (doc 07 §4-§5).
         match classified.intent {
-            intent_classifier::Intent::Escalation => {
-                Ok(UtteranceOutcome::EscalationDraft { transcript: transcription.transcript })
-            }
+            intent_classifier::Intent::Escalation => Ok(UtteranceOutcome::EscalationDraft {
+                transcript: transcription.transcript,
+                query: classified.escalation_query,
+            }),
             intent_classifier::Intent::Query => {
                 let bubble = retrieval::run(
                     &self.db,
@@ -331,6 +340,24 @@ impl VoiceSubsystem {
             }
             intent_classifier::Intent::Telemetry => Ok(UtteranceOutcome::StoredSilently),
         }
+    }
+
+    /// The confirm-before-acting floor (decision #27): `voice.intent_confidence_floor`
+    /// from the settings store, clamped to `[0, 1]`, falling back to
+    /// [`intent_classifier::CONFIRM_CONFIDENCE_FLOOR`] when the key is missing or
+    /// invalid — a typo can never silence the confirm chip below the shipped
+    /// default's intent. Read per utterance: one indexed row at PTT cadence is
+    /// free, and a Dashboard edit applies to the very next press without any
+    /// reload channel.
+    fn confirm_confidence_floor(&self) -> f32 {
+        self.db
+            .get_setting("voice")
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|v| v.get("intent_confidence_floor")?.as_f64())
+            .map(|f| (f as f32).clamp(0.0, 1.0))
+            .unwrap_or(intent_classifier::CONFIRM_CONFIDENCE_FLOOR)
     }
 }
 
@@ -406,8 +433,52 @@ mod tests {
     async fn ask_claude_is_an_escalation_draft_never_auto_sent() {
         let vs = subsystem("ask claude to summarize this", 0.9);
         let out = vs.process_utterance(speech_pcm(600), 1_000).await.unwrap();
-        assert!(matches!(out, UtteranceOutcome::EscalationDraft { .. }));
+        match out {
+            UtteranceOutcome::EscalationDraft { transcript, query } => {
+                assert_eq!(transcript, "ask claude to summarize this");
+                // Decision #29: the draft carries the actual question so the
+                // preview's user_addition is not prefixed with "ask claude".
+                assert_eq!(query.as_deref(), Some("to summarize this"));
+            }
+            other => panic!("expected an escalation draft, got {other:?}"),
+        }
         assert_eq!(event_count(&vs.db), 1);
+    }
+
+    #[tokio::test]
+    async fn confirm_floor_setting_is_read_at_runtime_and_clamped() {
+        // Decision #27: `voice.intent_confidence_floor` overrides the 0.6 const.
+        let vs = subsystem("find the doc", 0.7); // clears the 0.6 default
+        let set = |floor: &str| {
+            vs.db
+                .set_setting("voice", &format!(r#"{{"intent_confidence_floor":{floor}}}"#))
+                .unwrap()
+        };
+
+        // Raised floor: 0.7 < 0.9 ⇒ chip.
+        set("0.9");
+        let out = vs.process_utterance(speech_pcm(600), 1_000).await.unwrap();
+        assert!(matches!(out, UtteranceOutcome::ConfirmChip { .. }), "raised floor confirms");
+
+        // Lowered floor: 0.7 ≥ 0.2 ⇒ acts (query ⇒ answer).
+        set("0.2");
+        let out = vs.process_utterance(speech_pcm(600), 2_000).await.unwrap();
+        assert!(matches!(out, UtteranceOutcome::Answer(_)), "lowered floor acts");
+
+        // 1.0 = always confirm, even at high confidence.
+        set("1.0");
+        let out = vs.process_utterance(speech_pcm(600), 3_000).await.unwrap();
+        assert!(matches!(out, UtteranceOutcome::ConfirmChip { .. }), "1.0 always confirms");
+
+        // Out-of-range clamps to [0,1]: 7 ⇒ 1.0 ⇒ always confirm.
+        set("7");
+        let out = vs.process_utterance(speech_pcm(600), 4_000).await.unwrap();
+        assert!(matches!(out, UtteranceOutcome::ConfirmChip { .. }), "over-range clamps to 1.0");
+
+        // Invalid JSON falls back to the 0.6 default: 0.7 acts.
+        vs.db.set_setting("voice", "not json").unwrap();
+        let out = vs.process_utterance(speech_pcm(600), 5_000).await.unwrap();
+        assert!(matches!(out, UtteranceOutcome::Answer(_)), "invalid setting ⇒ 0.6 default");
     }
 
     #[tokio::test]

@@ -12,7 +12,7 @@ pub struct RetentionPolicy {
     pub events_days: u32,        // 90: events + ctx_vec (vec rows cascade)
     pub ocr_text_days: u32,      // 30: nullify ocr_text, keep event skeleton
     pub voice_days: u32,         // 30: voice_utterance transcript scrub
-    pub suggestions_days: u32,   // 180: suggestions + patterns
+    pub suggestions_days: u32,   // 180: suggestions (patterns have their own owner — see below)
     pub audit_days: u32,         // 30: capture_toggle + cloud_send survive purge this long
 }
 
@@ -36,7 +36,6 @@ pub struct PruneReport {
     pub ocr_text_nullified: usize,
     pub voice_scrubbed: usize,
     pub suggestions_deleted: usize,
-    pub patterns_deleted: usize,
     pub connector_state_deleted: usize,
 }
 
@@ -104,23 +103,43 @@ pub fn run_nightly_prune(db: &Db, now_ms: i64, policy: &RetentionPolicy) -> Resu
             [voice_floor],
         )?;
 
-        // 5. Suggestions + patterns (180 d).
+        // 5. Suggestions (180 d). `patterns` is deliberately NOT touched here:
+        //    the pattern engine's decay prune is the SOLE owner of pattern-row
+        //    deletion (owner decision #18, 2026-08-16) — the pattern task runs
+        //    it daily and mirrors the result to the DB (src-tauri pipeline.rs).
+        //    The age rule this job used to apply was strictly dominated by the
+        //    decay rule, and two uncoordinated deleters on two timers could
+        //    disagree. Purge-All still nukes patterns directly — that is the
+        //    user's explicit action, not a retention policy.
         report.suggestions_deleted = conn.execute(
             "DELETE FROM suggestions WHERE COALESCE(resolved_ts, shown_ts, 0) < ?1 \
                AND COALESCE(resolved_ts, shown_ts) IS NOT NULL",
             [sugg_floor],
         )?;
-        report.patterns_deleted = conn.execute(
-            "DELETE FROM patterns WHERE last_seen IS NOT NULL AND last_seen < ?1",
-            [sugg_floor],
-        )?;
 
         // 6. Stale connector state (per-connector TTL, doc 10): anything past its
-        //    own stale_after_ts by more than a grace day is dead weight.
+        //    own stale_after_ts by more than a grace day is dead weight. Detach
+        //    the longer-lived rows that reference it FIRST (events 90 d,
+        //    suggestions 180 d — and every decision-#15 `app_focus` row is born
+        //    referenced by its suggestion): with `foreign_keys=ON` a referenced
+        //    parent delete trips the FK and rolls back the whole pass.
+        let stale_floor = now_ms - DAY_MS;
+        conn.execute(
+            "UPDATE events SET connector_id = NULL WHERE connector_id IN \
+             (SELECT id FROM connector_state \
+              WHERE stale_after_ts IS NOT NULL AND stale_after_ts < ?1)",
+            [stale_floor],
+        )?;
+        conn.execute(
+            "UPDATE suggestions SET connector_id = NULL WHERE connector_id IN \
+             (SELECT id FROM connector_state \
+              WHERE stale_after_ts IS NOT NULL AND stale_after_ts < ?1)",
+            [stale_floor],
+        )?;
         report.connector_state_deleted = conn.execute(
             "DELETE FROM connector_state \
              WHERE stale_after_ts IS NOT NULL AND stale_after_ts < ?1",
-            [now_ms - DAY_MS],
+            [stale_floor],
         )?;
 
         // 7. v2 agent tables (Doc 22 §3.4): steps expire on the shorter OCR
@@ -211,6 +230,75 @@ mod tests {
             })
             .unwrap();
         assert_eq!(text, None, "ocr_text nullified");
+    }
+
+    #[test]
+    fn retention_never_touches_patterns_the_engine_prune_owns_them() {
+        // Owner decision #18 (2026-08-16): ONE pattern-prune owner — the
+        // engine's decay prune (mirrored by the pattern task). Even an
+        // ancient pattern row must survive the retention job.
+        let db = Db::open_in_memory().expect("open");
+        let now = 1_700_000_000_000 + 400 * DAY_MS;
+        let ancient = now - 365 * DAY_MS; // far past the old 180 d age rule
+        db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO patterns (signature, n, support, confidence, last_seen) \
+                 VALUES ('a:focus:x ⇒ b:focus:y', 2, 3, 0.9, ?1)",
+                [ancient],
+            )
+            .map(|_| ())
+        })
+        .unwrap();
+
+        run_nightly_prune(&db, now, &RetentionPolicy::default()).unwrap();
+
+        let survivors: i64 = db
+            .with_conn(|c| c.query_row("SELECT COUNT(*) FROM patterns", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(survivors, 1, "retention must leave patterns to the engine prune (#18)");
+    }
+
+    #[test]
+    fn stale_connector_state_prunes_even_when_referenced() {
+        // A stale connector row referenced by a younger suggestion row and
+        // event (the normal case: suggestions live 180 d, connector rows days —
+        // and every `app_focus` row from decision #15 is born referenced).
+        // The prune must detach the references and delete the row, not trip
+        // the FK and roll back the whole pass.
+        let db = Db::open_in_memory().expect("open");
+        let now = 1_700_000_000_000 + 100 * DAY_MS;
+        db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO connector_state (id, connector_type, reconstruct_payload, captured_ts, stale_after_ts) \
+                 VALUES ('cs-stale', 'app_focus', '{}', ?1, ?2)",
+                [now - 10 * DAY_MS, now - 5 * DAY_MS],
+            )?;
+            c.execute(
+                "INSERT INTO suggestions (connector_id, source, title, state, shown_ts) \
+                 VALUES ('cs-stale', 'local', 'Switch to X', 'shown', ?1)",
+                [now - 5 * DAY_MS],
+            )?;
+            c.execute(
+                "INSERT INTO events (ts, type, payload, connector_id) \
+                 VALUES (?1, 'suggestion_clicked', '{}', 'cs-stale')",
+                [now - 5 * DAY_MS],
+            )
+            .map(|_| ())
+        })
+        .unwrap();
+
+        let report = run_nightly_prune(&db, now, &RetentionPolicy::default())
+            .expect("prune must survive referenced stale connector rows");
+        assert_eq!(report.connector_state_deleted, 1);
+        let (sugg_ref, ev_ref): (Option<String>, Option<String>) = db
+            .with_conn(|c| {
+                let s = c.query_row("SELECT connector_id FROM suggestions", [], |r| r.get(0))?;
+                let e = c.query_row("SELECT connector_id FROM events", [], |r| r.get(0))?;
+                Ok((s, e))
+            })
+            .unwrap();
+        assert_eq!(sugg_ref, None, "suggestion detached, row kept");
+        assert_eq!(ev_ref, None, "event detached, row kept");
     }
 
     #[test]

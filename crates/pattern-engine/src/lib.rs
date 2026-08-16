@@ -3,7 +3,12 @@
 //! Turns the event stream into proactive [`SuggestionCandidate`]s through a
 //! fixed pipeline: normalize (§2) → sessionize (§3) → mine n-grams + temporal
 //! patterns (§4) → score (§5) → gate against the 7 trigger rules (§6); a
-//! feedback loop (§7) tunes it over time. The engine's output goes to the
+//! feedback loop (§7) tunes it over time. Both pattern kinds can fire: temporal
+//! (time-of-day) patterns trigger through the same gate as sequences (owner
+//! decision #16, 2026-08-16), and pure app-focus consequents produce the
+//! lighter "switch to X" candidate instead of staying silent (decision #15).
+//! Runtime tunables load from the `pattern_engine` settings block via
+//! [`PatternEngine::set_config`] (decision #17). The engine's output goes to the
 //! Suggestion Generator → Bubble UI; **it never makes a cloud call** (doc 08 §1,
 //! locked answer A) — only the reasoning-gateway crate may open sockets / spawn
 //! the Claude CLI (invariant 2, the transparency gate). When capture is OFF the
@@ -127,6 +132,9 @@ pub struct PatternEngine {
     sessionizer: Sessionizer,
     window: NGramWindow,
     gate: TriggerGate,
+    /// The runtime tunables (decision #17) — settings-loaded by the shell via
+    /// [`Self::set_config`]; compile-time constants until then.
+    config: config::EngineConfig,
     /// Whether capture is ON (trigger rule 7 / invariant 3). The orchestrator
     /// flips this; OFF ⇒ [`on_event`](Self::on_event) yields no candidates.
     capture_on: bool,
@@ -143,6 +151,15 @@ pub struct PatternEngine {
     last_focused: HashMap<String, i64>,
     /// The resource class currently foreground.
     foreground_resource: Option<String>,
+    /// app_class → last time it was foreground — the APP-level novelty ledger
+    /// for "switch to X" candidates (decision #15), which have no resource class.
+    last_focused_app: HashMap<String, i64>,
+    /// The app class currently foreground (decision #15).
+    foreground_app: Option<String>,
+    /// app_class → the most recently observed raw process name — the honest
+    /// launch target for a "switch to X" action (decision #15). In-memory only:
+    /// a class not observed since startup simply produces no switch bubble.
+    last_process: HashMap<String, String>,
     /// Synthetic id source for rows not yet persisted (negative; replaced by DB
     /// ids at flush via [`Self::mark_flushed`]).
     next_local_id: i64,
@@ -162,6 +179,7 @@ impl PatternEngine {
             sessionizer: Sessionizer::new(),
             window: NGramWindow::new(),
             gate: TriggerGate::new(),
+            config: config::EngineConfig::default(),
             capture_on: false,
             patterns: HashMap::new(),
             antecedent_index: HashMap::new(),
@@ -169,6 +187,9 @@ impl PatternEngine {
             temporal: HashMap::new(),
             last_focused: HashMap::new(),
             foreground_resource: None,
+            last_focused_app: HashMap::new(),
+            foreground_app: None,
+            last_process: HashMap::new(),
             next_local_id: -1,
             last_session: None,
         }
@@ -198,6 +219,18 @@ impl PatternEngine {
         self.capture_on = on;
     }
 
+    /// Apply the `pattern_engine` settings block (owner decision #17,
+    /// 2026-08-16): threads the runtime tunables into the trigger gate and the
+    /// sessionizer's cold-start gap, and stores the half-lives the scoring path
+    /// reads. Safe to call again on a settings re-read — the gate keeps an
+    /// adaptively-earned cap (re-clamped to the new band) rather than resetting.
+    pub fn set_config(&mut self, config: config::EngineConfig) {
+        self.gate.configure(&config);
+        self.sessionizer
+            .set_cold_start_gap_min(config.session_gap_cold_start_min);
+        self.config = config;
+    }
+
     /// Ingest one event and return any candidates that pass all 7 trigger rules
     /// (doc 08 §2-§6). Pure with respect to the network: **never a cloud call**.
     pub fn on_event(&mut self, ev: &Event, ctx: &EngineContext<'_>) -> Vec<SuggestionCandidate> {
@@ -220,15 +253,15 @@ impl PatternEngine {
             self.window.reset();
         }
 
-        // 3a. temporal mining (§4): a return visit to this resource. Weight 1 at
-        // observation; histogram mass ages via the read-side prune, and the
-        // TEMPORAL half-life governs periodic scoring (ADR-033).
+        // 3a. temporal mining (§4): a return visit to this resource. Existing
+        // mass ages to `ev.ts` with the TEMPORAL half-life (ADR-033, tunable —
+        // decision #17), then the visit adds weight 1.
         if let Some(res) = &token.resource_class {
             let hist = self
                 .temporal
                 .entry(res.clone())
                 .or_insert_with(|| TemporalHistogram::new(res.clone()));
-            hist.record_return(ev.ts, 1.0);
+            hist.record_return(ev.ts, self.config.half_life_temporal_days);
         }
 
         // 3b. n-gram mining (§4): credit every closing n-gram.
@@ -257,8 +290,9 @@ impl PatternEngine {
                 );
                 self.id_index.insert(id, sig.clone());
             }
+            let half_life = self.config.half_life_sequence_days;
             let row = self.patterns.get_mut(&sig).expect("inserted above");
-            row.stats.credit_occurrence(ctx.now_ms);
+            row.stats.credit_occurrence(ctx.now_ms, half_life);
             row.dirty = true;
 
             // Grow the `⇒ *` denominator of every sibling with this antecedent.
@@ -269,7 +303,7 @@ impl PatternEngine {
             for sibling in siblings.clone() {
                 if sibling != sig {
                     if let Some(other) = self.patterns.get_mut(&sibling) {
-                        other.stats.credit_antecedent_only(ctx.now_ms);
+                        other.stats.credit_antecedent_only(ctx.now_ms, half_life);
                         other.dirty = true;
                     }
                 }
@@ -287,6 +321,14 @@ impl PatternEngine {
             self.last_focused.insert(res.clone(), ev.ts);
         }
         self.foreground_resource = token.resource_class.clone();
+        // App-level novelty ledger for "switch to X" candidates (decision #15):
+        // every token carries an app_class; also remember the class's concrete
+        // process name so the switch action has a real launch target.
+        self.last_focused_app.insert(token.app_class.clone(), ev.ts);
+        self.foreground_app = Some(token.app_class.clone());
+        if let Some(p) = ev.process.as_deref() {
+            self.last_process.insert(token.app_class.clone(), p.to_string());
+        }
 
         // 4-5. candidate generation + scoring (§5) + gating (§6): match every
         // suffix of the current tail against pattern antecedents.
@@ -313,44 +355,83 @@ impl PatternEngine {
                     continue; // muted signatures stay silent (doc 08 §7)
                 }
 
-                let stats_now = row.stats.decayed_to(ctx.now_ms);
+                let stats_now = row
+                    .stats
+                    .decayed_to(ctx.now_ms, self.config.half_life_sequence_days);
                 let conf = stats_now.confidence();
 
-                // Rule 3 seam: a fresh, resumable connector state (doc 10 / M4;
-                // fakes in the M3 gate).
-                let state = (ctx.connector_lookup)(&consequent);
-                let fresh = state
-                    .as_ref()
-                    .map(|s| scorer::freshness(s, ctx.now_ms))
-                    .unwrap_or(0.0);
+                // Decision #15 (2026-08-16): a pure app-focus consequent (window
+                // focus/open, no resource class) has no resumable state by
+                // design — it takes the lighter "switch to X" path: rule 3
+                // exempt, freshness 1.0, novelty keyed on the APP. The launch
+                // target is the class's most recently observed process name; a
+                // class never observed since startup stays silent (nothing
+                // honest to launch).
+                let app_focus = consequent.resource_class.is_none()
+                    && matches!(consequent.action.as_str(), "focus" | "open");
+                let app_target = if app_focus {
+                    match self.last_process.get(&consequent.app_class) {
+                        Some(p) => Some(p.clone()),
+                        None => continue,
+                    }
+                } else {
+                    None
+                };
 
-                let cons_res = consequent.resource_class.as_deref();
-                let nov = scorer::novelty(
-                    cons_res,
-                    self.foreground_resource.as_deref(),
-                    cons_res.and_then(|r| self.last_focused.get(r).copied()),
-                    ctx.now_ms,
-                );
+                let (state, fresh, is_foreground, last_focused_ms) = if app_focus {
+                    let app = consequent.app_class.as_str();
+                    (
+                        None,
+                        1.0,
+                        self.foreground_app.as_deref() == Some(app),
+                        self.last_focused_app.get(app).copied(),
+                    )
+                } else {
+                    // Rule 3 seam: a fresh, resumable connector state
+                    // (doc 10 / M4; fakes in the M3 gate).
+                    let state = (ctx.connector_lookup)(&consequent);
+                    let fresh = state
+                        .as_ref()
+                        .map(|s| scorer::freshness(s, ctx.now_ms))
+                        .unwrap_or(0.0);
+                    let cons_res = consequent.resource_class.as_deref();
+                    (
+                        state,
+                        fresh,
+                        cons_res.is_some() && cons_res == self.foreground_resource.as_deref(),
+                        cons_res.and_then(|r| self.last_focused.get(r).copied()),
+                    )
+                };
+
+                let nov = if is_foreground {
+                    0.0
+                } else {
+                    scorer::novelty(None, None, last_focused_ms, ctx.now_ms)
+                };
                 let score = scorer::score(conf, stats_now.dismiss_decay, fresh, nov);
 
                 let input = TriggerInput {
                     score,
                     weighted_support: stats_now.weighted_support,
                     connector_state: state.as_ref(),
+                    requires_fresh_state: !app_focus,
                     signature: &sig,
                     dismissal_step: row.mute.dismissal_step(ctx.now_ms),
-                    consequent_is_foreground: cons_res.is_some()
-                        && cons_res == self.foreground_resource.as_deref(),
-                    consequent_last_focused_ms: cons_res
-                        .and_then(|r| self.last_focused.get(r).copied()),
+                    consequent_is_foreground: is_foreground,
+                    consequent_last_focused_ms: last_focused_ms,
                     now_ms: ctx.now_ms,
                 };
 
                 if self.gate.admit(&input, self.capture_on).is_ok() {
-                    let state = state.expect("rule 3 held");
+                    let connector_id = match app_target {
+                        // "Switch to X": the sentinel ref the shell resolves to
+                        // an app-focus dispatch (Path B analog, decision #15).
+                        Some(process) => format!("{APP_FOCUS_REF_PREFIX}{process}"),
+                        None => state.expect("rule 3 held").id.clone(),
+                    };
                     out.push(SuggestionCandidate {
                         action_template: action_template_for(&consequent),
-                        connector_id: state.id.clone(),
+                        connector_id,
                         confidence: score,
                         pattern_id: row.pattern_id,
                     });
@@ -359,10 +440,113 @@ impl PatternEngine {
             }
         }
 
+        // Temporal (time-of-day) candidates ride the same gate (decision #16).
+        self.temporal_candidates(ctx, &mut out);
+
         // Overflow rule (§6.5): keep the highest-score candidates first (the
         // downstream queue drops lowest on overflow).
         out.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
         out
+    }
+
+    /// The temporal trigger path (owner decision #16, 2026-08-16 — doc 08 §4
+    /// mined these but nothing ever fired them): when "now" falls in a formed
+    /// pattern's peak time-of-day bucket, the predicted resource becomes a
+    /// candidate through the SAME 7-rule gate as sequence patterns — score
+    /// (`peak/total` confidence × decay × freshness × novelty), support floor
+    /// (peak weighted mass), fresh connector state (rule 3 — temporal resources
+    /// always have a resource class), per-signature cooldown, the hourly cap,
+    /// novelty (the current event just stamped `last_focused`, so a return the
+    /// user is making RIGHT NOW self-suppresses), and capture.
+    ///
+    /// Each fired pattern is backed by a real [`PatternRow`] keyed by
+    /// [`temporal::signature_for`], so feedback (decay/mute ladder) and
+    /// flush/hydrate persistence work exactly like sequence rows. The histogram
+    /// itself is in-memory and re-mines after a restart; the row preserves what
+    /// must survive — the decay and the mute.
+    fn temporal_candidates(&mut self, ctx: &EngineContext<'_>, out: &mut Vec<SuggestionCandidate>) {
+        let peaks: Vec<(String, usize, f64, f64)> = self
+            .temporal
+            .iter()
+            .filter(|(_, h)| h.now_is_peak(ctx.now_ms))
+            .filter_map(|(res, h)| {
+                h.peak_bucket()
+                    .map(|(bucket, peak)| (res.clone(), bucket, peak, h.total_mass()))
+            })
+            .collect();
+
+        for (res, bucket, peak, total) in peaks {
+            let consequent = temporal::consequent_token(&res);
+            let sig = temporal::signature_for(bucket, &consequent);
+
+            if !self.patterns.contains_key(&sig) {
+                let id = self.next_local_id;
+                self.next_local_id -= 1;
+                self.patterns.insert(
+                    sig.clone(),
+                    PatternRow {
+                        pattern_id: id,
+                        stats: PatternStats::new(ctx.now_ms),
+                        mute: MuteState::default(),
+                        consequent: Some(consequent.clone()),
+                        dirty: true,
+                    },
+                );
+                self.id_index.insert(id, sig.clone());
+            }
+            let row = self.patterns.get_mut(&sig).expect("inserted above");
+            // The histogram is the statistical truth for temporal patterns —
+            // sync it into the row so the flush persists honest numbers and the
+            // decay prune sees live support.
+            row.stats.weighted_support = peak;
+            row.stats.antecedent_total = total.max(peak);
+            row.stats.last_updated_ms = ctx.now_ms;
+            row.dirty = true;
+            if row.mute.is_muted(ctx.now_ms) {
+                continue; // muted signatures stay silent (doc 08 §7)
+            }
+            let conf = row.stats.confidence();
+            let dismiss_decay = row.stats.dismiss_decay;
+            let dismissal_step = row.mute.dismissal_step(ctx.now_ms);
+            let pattern_id = row.pattern_id;
+
+            // Rule 3: temporal bubbles resume state like any other bubble.
+            let state = (ctx.connector_lookup)(&consequent);
+            let fresh = state
+                .as_ref()
+                .map(|s| scorer::freshness(s, ctx.now_ms))
+                .unwrap_or(0.0);
+            let nov = scorer::novelty(
+                Some(&res),
+                self.foreground_resource.as_deref(),
+                self.last_focused.get(&res).copied(),
+                ctx.now_ms,
+            );
+            let score = scorer::score(conf, dismiss_decay, fresh, nov);
+
+            let input = TriggerInput {
+                score,
+                weighted_support: peak,
+                connector_state: state.as_ref(),
+                requires_fresh_state: true,
+                signature: &sig,
+                dismissal_step,
+                consequent_is_foreground: self.foreground_resource.as_deref()
+                    == Some(res.as_str()),
+                consequent_last_focused_ms: self.last_focused.get(&res).copied(),
+                now_ms: ctx.now_ms,
+            };
+            if self.gate.admit(&input, self.capture_on).is_ok() {
+                let state = state.expect("rule 3 held");
+                out.push(SuggestionCandidate {
+                    action_template: action_template_for(&consequent),
+                    connector_id: state.id.clone(),
+                    confidence: score,
+                    pattern_id,
+                });
+                self.gate.note_emitted(&sig, ctx.now_ms);
+            }
+        }
     }
 
     /// Route a user reaction for `pattern_id` back into the feedback loop
@@ -385,18 +569,29 @@ impl PatternEngine {
         }
     }
 
-    /// Weekly maintenance hook (doc 08 §9): prune signatures with weighted
+    /// Maintenance hook (doc 08 §9): prune signatures with decayed weighted
     /// support below [`config::PRUNE_SUPPORT_FLOOR`]. Returns the pruned
     /// SIGNATURES so the caller can mirror the deletions to the `patterns`
     /// table — without the mirror they re-hydrate at the next restart
     /// (2026-08-15 review: this hook previously had no caller at all).
+    ///
+    /// **Sole `patterns` deleter** (owner decision #18, 2026-08-16): this decay
+    /// prune — checked daily by the shell's pattern task, which mirrors the
+    /// result to the DB — is the ONE owner of pattern-row deletion. The DB
+    /// retention job's independent 180-day age prune was removed: decay strictly
+    /// dominates it (a row untouched that long decayed under the floor weeks
+    /// earlier), and a single owner means two timers can never disagree.
     pub fn prune(&mut self, now_ms: i64) -> Vec<String> {
         let mut flat: HashMap<String, (PatternStats, MuteState)> = self
             .patterns
             .iter()
             .map(|(k, v)| (k.clone(), (v.stats.clone(), v.mute.clone())))
             .collect();
-        let doomed = feedback::prune_stale_patterns(&mut flat, now_ms);
+        let doomed = feedback::prune_stale_patterns(
+            &mut flat,
+            now_ms,
+            self.config.half_life_sequence_days,
+        );
         for sig in &doomed {
             if let Some(row) = self.patterns.remove(sig) {
                 self.id_index.remove(&row.pattern_id);
@@ -451,10 +646,17 @@ impl PatternEngine {
     /// observation and what must be exact (decay + mute) is stored verbatim. A
     /// signature that fails to parse is skipped with a warning, never aborting the
     /// load. Intended to run once, before the event loop, on a fresh engine.
-    pub fn hydrate(&mut self, rows: impl IntoIterator<Item = PersistedPattern>) {
+    ///
+    /// Returns the SKIPPED (unparseable) signatures so the caller can delete
+    /// those rows: they can never fire, take feedback, or decay — and since the
+    /// engine's decay prune is now the sole `patterns` deleter (decision #18),
+    /// a row the engine cannot cache would otherwise linger forever.
+    pub fn hydrate(&mut self, rows: impl IntoIterator<Item = PersistedPattern>) -> Vec<String> {
+        let mut skipped = Vec::new();
         for p in rows {
             let Some((ant_key, consequent)) = ngram::parse_signature(&p.signature) else {
                 tracing::warn!(signature = %p.signature, "skipping unparseable persisted pattern");
+                skipped.push(p.signature);
                 continue;
             };
             let weighted_support = p.support as f64;
@@ -491,6 +693,7 @@ impl PatternEngine {
                 siblings.push(p.signature);
             }
         }
+        skipped
     }
 }
 
@@ -500,16 +703,33 @@ impl Default for PatternEngine {
     }
 }
 
+/// Sentinel prefix on [`SuggestionCandidate::connector_id`] marking a
+/// "switch to X" app-focus candidate (owner decision #15, 2026-08-16). The rest
+/// of the id is the target's raw process name (e.g. `slack.exe`). The shell
+/// resolves it into a synthetic `app_focus` connector-state row so the bubble
+/// rides the normal suggestion pipeline and Path B click-resolve; real
+/// connector ids are UUIDs, so the prefix cannot collide.
+pub const APP_FOCUS_REF_PREFIX: &str = "app-focus:";
+
+/// The launch-target process of an app-focus candidate's `connector_id`, if it
+/// is one ([`APP_FOCUS_REF_PREFIX`]).
+pub fn app_focus_target(connector_id: &str) -> Option<&str> {
+    connector_id.strip_prefix(APP_FOCUS_REF_PREFIX)
+}
+
 /// Render the default action template for a consequent token (doc 08 §6 →
 /// suggestion-generator). The generator expands `{title}`/`{position}` from the
-/// connector's `reconstruct_payload` (doc 08 §6, doc 11 §3).
+/// connector's `reconstruct_payload` (doc 08 §6, doc 11 §3). A resource-less
+/// consequent is an app-focus ("switch to X") candidate — `{app}` expands from
+/// the synthetic `app_focus` state's payload (decision #15).
 fn action_template_for(consequent: &Token) -> String {
     match consequent.resource_class.as_deref() {
         Some("youtube") => "Continue {title} — {position}".to_string(),
         Some(r) if r.starts_with("doc:") => "Reopen {title}".to_string(),
         Some(r) if r.starts_with("ide:") => "Back to {title}:{line}".to_string(),
         Some(r) if r.starts_with("url:") => "Return to {title}".to_string(),
-        _ => "Resume {title}".to_string(),
+        Some(_) => "Resume {title}".to_string(),
+        None => "Switch to {app}".to_string(),
     }
 }
 
@@ -613,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn no_fresh_connector_state_means_no_bubble() {
+    fn no_fresh_connector_state_means_no_resume_bubble() {
         let mut engine = PatternEngine::new();
         engine.set_capture(true);
         let lookup = |_: &Token| -> Option<ConnectorState> { None };
@@ -633,7 +853,155 @@ mod tests {
             let ctx = EngineContext { connector_lookup: &lookup, now_ms: ts };
             all.extend(engine.on_event(&focus_event(ts, "slack.exe"), &ctx));
         }
-        assert!(all.is_empty(), "rule 3: no fresh resumable state ⇒ silence");
+        // Rule 3 still bars every RESUME candidate (resource-ful consequent, no
+        // fresh state). Since decision #15, app-focus consequents may produce
+        // "switch to X" candidates instead — those are the only kind allowed here.
+        assert!(
+            all.iter().all(|c| app_focus_target(&c.connector_id).is_some()),
+            "no fresh resumable state ⇒ no resume bubble (rule 3); got {all:?}"
+        );
+    }
+
+    /// Decision #15: a pure window-focus habit (ide → slack, no connector state
+    /// anywhere) produces the lighter "switch to X" candidate through the same
+    /// gate — including the not-recently-focused rule.
+    #[test]
+    fn pure_focus_pattern_yields_a_switch_to_candidate() {
+        let mut engine = PatternEngine::new();
+        engine.set_capture(true);
+        let lookup = |_: &Token| -> Option<ConnectorState> { None };
+
+        // 3 reps of (code focus → slack focus), spaced so slack's last focus is
+        // stale (> 10 min) by each rep's code event.
+        let mut ts = 0;
+        for _ in 0..3 {
+            ts += 12 * MIN;
+            let ctx = EngineContext { connector_lookup: &lookup, now_ms: ts };
+            engine.on_event(&focus_event(ts, "code.exe"), &ctx);
+            ts += 2 * MIN;
+            let ctx = EngineContext { connector_lookup: &lookup, now_ms: ts };
+            engine.on_event(&focus_event(ts, "slack.exe"), &ctx);
+        }
+
+        // 4th antecedent: support 3, slack last focused 12 min ago ⇒ novel.
+        ts += 12 * MIN;
+        let ctx = EngineContext { connector_lookup: &lookup, now_ms: ts };
+        let got = engine.on_event(&focus_event(ts, "code.exe"), &ctx);
+        let c = got
+            .iter()
+            .find(|c| app_focus_target(&c.connector_id).is_some())
+            .expect("switch-to candidate for the pure focus habit (#15)");
+        assert_eq!(app_focus_target(&c.connector_id), Some("slack.exe"));
+        assert_eq!(c.action_template, "Switch to {app}");
+        assert!(c.confidence >= config::TAU_CONF, "same rule-1 threshold applies");
+
+        // Not-recently-focused (rule 6) still gates it: past the 30 min
+        // cooldown but with slack focused 5 min ago, recency must suppress.
+        ts += 26 * MIN;
+        let ctx = EngineContext { connector_lookup: &lookup, now_ms: ts };
+        engine.on_event(&focus_event(ts, "slack.exe"), &ctx);
+        ts += 5 * MIN; // cooldown (31 min since shown) expired; focus is recent
+        let ctx = EngineContext { connector_lookup: &lookup, now_ms: ts };
+        let got = engine.on_event(&focus_event(ts, "code.exe"), &ctx);
+        assert!(
+            got.iter().all(|c| app_focus_target(&c.connector_id) != Some("slack.exe")),
+            "focused 5 min ago ⇒ not novel ⇒ no switch bubble (rule 6)"
+        );
+    }
+
+    /// Decision #16: a formed time-of-day habit fires a bubble in its peak
+    /// bucket via the normal trigger path, and its mute ladder works because
+    /// the candidate is backed by a real pattern row.
+    #[test]
+    fn temporal_pattern_fires_in_its_peak_bucket() {
+        std::env::set_var("APERTURE_TZ_OFFSET_MIN", "0");
+        const DAY: i64 = 86_400_000;
+        let mut engine = PatternEngine::new();
+        engine.set_capture(true);
+        let lookup = |tok: &Token| -> Option<ConnectorState> {
+            (tok.resource_class.as_deref() == Some("youtube")).then(youtube_state)
+        };
+        let nine_am = 9 * 3_600_000;
+
+        // One youtube return ~9am on 4 consecutive days — a single event per
+        // day, so no n-gram can form: any candidate is temporal-only.
+        for day in 0..4 {
+            let ts = day * DAY + nine_am;
+            let ctx = EngineContext { connector_lookup: &lookup, now_ms: ts };
+            let got = engine.on_event(
+                &nav_event(ts, "chrome.exe", "https://youtube.com/watch?v=abc"),
+                &ctx,
+            );
+            assert!(
+                got.is_empty(),
+                "the return being made right now must self-suppress (rule 6)"
+            );
+        }
+
+        // Day 5, 9:05am, focused elsewhere: the predicted return window is now.
+        let ts = 4 * DAY + nine_am + 5 * MIN;
+        let ctx = EngineContext { connector_lookup: &lookup, now_ms: ts };
+        let got = engine.on_event(&focus_event(ts, "code.exe"), &ctx);
+        let c = got.first().expect("temporal pattern fires in its peak bucket (#16)");
+        assert_eq!(c.connector_id, "conn-yt", "rule 3: resumes fresh connector state");
+        assert!(c.action_template.contains("{title}"));
+        assert!(c.confidence >= config::TAU_CONF);
+        let temporal_id = c.pattern_id;
+
+        // Outside the peak bucket (9am + 6h) nothing temporal fires.
+        let ts_off = 4 * DAY + nine_am + 6 * 3_600_000;
+        let ctx = EngineContext { connector_lookup: &lookup, now_ms: ts_off };
+        let got = engine.on_event(&focus_event(ts_off, "code.exe"), &ctx);
+        assert!(
+            got.iter().all(|c| c.pattern_id != temporal_id),
+            "no temporal bubble outside the predicted window"
+        );
+
+        // The feedback ladder reaches temporal rows: 3 dismissals mute it.
+        engine.apply_feedback(temporal_id, FeedbackEvent::Dismissed, ts_off);
+        engine.apply_feedback(temporal_id, FeedbackEvent::Dismissed, ts_off + MIN);
+        engine.apply_feedback(temporal_id, FeedbackEvent::Dismissed, ts_off + 2 * MIN);
+        let ts_next = 5 * DAY + nine_am + 5 * MIN; // next day's peak window
+        let ctx = EngineContext { connector_lookup: &lookup, now_ms: ts_next };
+        let got = engine.on_event(&focus_event(ts_next, "code.exe"), &ctx);
+        assert!(
+            got.iter().all(|c| c.pattern_id != temporal_id),
+            "a muted temporal pattern stays silent in its window (doc 08 §7)"
+        );
+    }
+
+    /// Decision #17: the settings-loaded config actually moves the gate.
+    #[test]
+    fn set_config_changes_trigger_behavior() {
+        let mut engine = PatternEngine::new();
+        engine.set_capture(true);
+        engine.set_config(config::EngineConfig {
+            cold_start_support_floor: 10.0, // far above the default 3
+            ..config::EngineConfig::default()
+        });
+        let lookup = |tok: &Token| -> Option<ConnectorState> {
+            (tok.resource_class.as_deref() == Some("youtube")).then(youtube_state)
+        };
+        let mut ts = 0;
+        let mut all = Vec::new();
+        for _ in 0..4 {
+            ts += 12 * MIN;
+            let ctx = EngineContext { connector_lookup: &lookup, now_ms: ts };
+            all.extend(engine.on_event(&focus_event(ts, "code.exe"), &ctx));
+            ts += 2 * MIN;
+            let ctx = EngineContext { connector_lookup: &lookup, now_ms: ts };
+            all.extend(engine.on_event(
+                &nav_event(ts, "chrome.exe", "https://youtube.com/watch?v=a"),
+                &ctx,
+            ));
+            ts += 2 * MIN;
+            let ctx = EngineContext { connector_lookup: &lookup, now_ms: ts };
+            all.extend(engine.on_event(&focus_event(ts, "slack.exe"), &ctx));
+        }
+        assert!(
+            all.is_empty(),
+            "a configured support floor of 10 suppresses what fires at the default (#17)"
+        );
     }
 
     #[test]

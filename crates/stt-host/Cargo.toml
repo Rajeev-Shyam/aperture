@@ -25,7 +25,9 @@ anyhow = { workspace = true }
 # --- third-party (pinned; [VERIFY] at build time, doc 00 conventions) ---
 # HTTP surface for /transcribe + /health, and the reverse-proxy client to the
 # whisper server child. [VERIFY] axum vs hyper choice + exact versions at M6.
-axum = "0.7"                                                                   # [VERIFY]
+# "multipart": the WAV arrives as one raw multipart part (decision #33), not a
+# JSON number array.
+axum = { version = "0.7", features = ["multipart"] }                           # [VERIFY]
 # CLI arg parsing: --port, --model, --backend, --whisper-bin, --device (doc 07 §3).
 clap = { version = "4", features = ["derive"] }                                # [VERIFY]
 # Client used to forward decoded WAV jobs to the whisper server child over loopback.

@@ -2,7 +2,11 @@
 //!
 //! 1. `score ≥ τ_conf = 0.7` ([`config::TAU_CONF`], ADR-033) `[VERIFY — SC7 at M3]`
 //! 2. Weighted support ≥ 3 ([`config::COLD_START_SUPPORT_FLOOR`]) `[ASSUMPTION]`
-//! 3. A **fresh, resumable** `connector_state` exists for the consequent (doc 10 TTLs)
+//! 3. A **fresh, resumable** `connector_state` exists for the consequent (doc 10
+//!    TTLs). Amended by owner decision #15 (2026-08-16): pure app-focus
+//!    consequents ("switch to X") are exempt — they carry no resumable state by
+//!    design ([`TriggerInput::requires_fresh_state`]); every other rule still
+//!    applies to them.
 //! 4. Cooldown: same signature not shown within its current cooldown — base 30 min
 //!    ([`config::COOLDOWN_MIN`]), multiplied by the dismissal ladder (×2 / ×4, ADR-033)
 //! 5. Global cap: **adaptive 2→8/hr, click-through-driven** (ADR-032; cold-start
@@ -50,6 +54,11 @@ pub struct TriggerInput<'a> {
     pub weighted_support: f64,
     /// Fresh, resumable state for the consequent, if any (rule 3).
     pub connector_state: Option<&'a ConnectorState>,
+    /// Whether rule 3 applies to this candidate. `true` for every resume-style
+    /// candidate; `false` only for the "switch to X" app-focus candidates
+    /// (owner decision #15, 2026-08-16), whose consequent has no resumable
+    /// state by design. Rules 1-2 and 4-7 apply regardless.
+    pub requires_fresh_state: bool,
     /// Stable n-gram signature, for cooldown bookkeeping (rule 4).
     pub signature: &'a str,
     /// The signature's current dismissal-ladder step (0 = none, 1 = one recent
@@ -72,10 +81,24 @@ pub struct TriggerGate {
     /// `ts` of suggestions emitted in the trailing hour, for the adaptive
     /// 2→8/hr cap (ADR-032).
     recent_emissions: Vec<i64>,
-    /// The current adaptive cap, bounded to
-    /// `[CAP_PER_HOUR_FLOOR, CAP_PER_HOUR_CEILING]` (ADR-032); starts at the
-    /// cold-start default and moves on click-through evidence.
+    /// The current adaptive cap, bounded to `[cap_floor, cap_ceiling]`
+    /// (ADR-032); starts at the cold-start default and moves on click-through
+    /// evidence.
     cap_per_hour: u32,
+    /// Whether [`adapt_cap`](Self::adapt_cap) has ever moved the cap — a
+    /// settings reload ([`configure`](Self::configure)) re-baselines an
+    /// unadapted cap to the new default but never discards earned adaptation.
+    cap_adapted: bool,
+    /// Rule 1 threshold (decision #17; default [`config::TAU_CONF`]).
+    tau_conf: f64,
+    /// Rule 2 floor (default [`config::COLD_START_SUPPORT_FLOOR`]).
+    support_floor: f64,
+    /// Rule 4 base cooldown, minutes (default [`config::COOLDOWN_MIN`]).
+    cooldown_min: i64,
+    /// Rule 5 hard band (defaults [`config::CAP_PER_HOUR_FLOOR`] /
+    /// [`config::CAP_PER_HOUR_CEILING`]).
+    cap_floor: u32,
+    cap_ceiling: u32,
 }
 
 impl Default for TriggerGate {
@@ -84,6 +107,12 @@ impl Default for TriggerGate {
             last_shown: Default::default(),
             recent_emissions: Vec::new(),
             cap_per_hour: config::CAP_PER_HOUR_DEFAULT,
+            cap_adapted: false,
+            tau_conf: config::TAU_CONF,
+            support_floor: config::COLD_START_SUPPORT_FLOOR,
+            cooldown_min: config::COOLDOWN_MIN,
+            cap_floor: config::CAP_PER_HOUR_FLOOR,
+            cap_ceiling: config::CAP_PER_HOUR_CEILING,
         }
     }
 }
@@ -92,6 +121,22 @@ impl TriggerGate {
     /// Fresh gate at the cold-start cap.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Apply the runtime tunables (decision #17): threshold, support floor,
+    /// cooldown, and the cap band. An unadapted cap re-baselines to the new
+    /// default; an adapted cap keeps its earned value, re-clamped into the new
+    /// band — a daily settings re-read must not trash learned presence.
+    pub fn configure(&mut self, cfg: &config::EngineConfig) {
+        self.tau_conf = cfg.tau_conf;
+        self.support_floor = cfg.cold_start_support_floor;
+        self.cooldown_min = cfg.cooldown_min;
+        self.cap_floor = cfg.cap_per_hour_floor;
+        self.cap_ceiling = cfg.cap_per_hour_ceiling;
+        if !self.cap_adapted {
+            self.cap_per_hour = cfg.cap_per_hour_default;
+        }
+        self.cap_per_hour = self.cap_per_hour.clamp(self.cap_floor, self.cap_ceiling);
     }
 
     /// The current adaptive hourly cap (ADR-032).
@@ -108,7 +153,8 @@ impl TriggerGate {
         } else {
             self.cap_per_hour.saturating_sub(1)
         };
-        self.cap_per_hour = next.clamp(config::CAP_PER_HOUR_FLOOR, config::CAP_PER_HOUR_CEILING);
+        self.cap_per_hour = next.clamp(self.cap_floor, self.cap_ceiling);
+        self.cap_adapted = true;
     }
 
     /// Apply rules 1-7 (rule 7 supplied by `capture_on` from the orchestrator).
@@ -123,19 +169,22 @@ impl TriggerGate {
         }
         // Rule 1: score threshold (novelty already folded into score upstream,
         // but rule 6 is also asserted independently below for defense in depth).
-        if input.score < config::TAU_CONF {
+        if input.score < self.tau_conf {
             return Err(TriggerReject::BelowScore);
         }
         // Rule 2: cold-start support floor. The small epsilon absorbs read-time
         // decay: "3 observed returns" minutes ago weigh 2.999…, which must count
         // as 3 (US1 acceptance (a)); 2 returns (≈2.0) never pass.
-        if input.weighted_support + 0.01 < config::COLD_START_SUPPORT_FLOOR {
+        if input.weighted_support + 0.01 < self.support_floor {
             return Err(TriggerReject::BelowSupport);
         }
-        // Rule 3: fresh, resumable connector state.
-        match input.connector_state {
-            Some(st) if scorer::freshness(st, input.now_ms) > 0.0 => {}
-            _ => return Err(TriggerReject::NoFreshState),
+        // Rule 3: fresh, resumable connector state — except for app-focus
+        // ("switch to X") candidates, which have none by design (decision #15).
+        if input.requires_fresh_state {
+            match input.connector_state {
+                Some(st) if scorer::freshness(st, input.now_ms) > 0.0 => {}
+                _ => return Err(TriggerReject::NoFreshState),
+            }
         }
         // Rule 4: per-signature cooldown, ladder-multiplied (ADR-033).
         let ladder_mult = match input.dismissal_step {
@@ -144,7 +193,7 @@ impl TriggerGate {
             _ => config::DISMISS_COOLDOWN_MULT_2ND,
         };
         if let Some(&shown) = self.last_shown.get(input.signature) {
-            if input.now_ms - shown < config::COOLDOWN_MIN * ladder_mult * 60_000 {
+            if input.now_ms - shown < self.cooldown_min * ladder_mult * 60_000 {
                 return Err(TriggerReject::Cooldown);
             }
         }
@@ -202,6 +251,7 @@ mod tests {
             score: 0.9,
             weighted_support: 5.0,
             connector_state: Some(state),
+            requires_fresh_state: true,
             signature: "sig",
             dismissal_step: 0,
             consequent_is_foreground: false,
@@ -274,6 +324,57 @@ mod tests {
             gate.adapt_cap(false);
         }
         assert_eq!(gate.cap_per_hour(), config::CAP_PER_HOUR_FLOOR);
+    }
+
+    #[test]
+    fn app_focus_candidates_skip_rule_3_but_nothing_else() {
+        // Decision #15: no connector state + requires_fresh_state=false admits…
+        let gate = TriggerGate::new();
+        let st = fresh_state();
+        let mut input = ok_input(&st, 0);
+        input.connector_state = None;
+        input.requires_fresh_state = false;
+        assert!(gate.admit(&input, true).is_ok(), "rule 3 exempt for app-focus (#15)");
+
+        // …but every other rule still applies: score, support, novelty, capture.
+        input.score = 0.5;
+        assert_eq!(gate.admit(&input, true), Err(TriggerReject::BelowScore));
+        input.score = 0.9;
+        input.weighted_support = 2.0;
+        assert_eq!(gate.admit(&input, true), Err(TriggerReject::BelowSupport));
+        input.weighted_support = 5.0;
+        input.consequent_is_foreground = true;
+        assert_eq!(gate.admit(&input, true), Err(TriggerReject::NotNovel));
+        input.consequent_is_foreground = false;
+        assert_eq!(gate.admit(&input, false), Err(TriggerReject::CaptureOff));
+    }
+
+    #[test]
+    fn configure_applies_runtime_tunables_and_keeps_earned_cap() {
+        // Decision #17: the settings block moves the gate's thresholds.
+        let mut gate = TriggerGate::new();
+        let st = fresh_state();
+        let mut cfg = config::EngineConfig {
+            tau_conf: 0.95,
+            ..config::EngineConfig::default()
+        };
+        gate.configure(&cfg);
+        let input = ok_input(&st, 0); // score 0.9 passes the default 0.7…
+        assert_eq!(
+            gate.admit(&input, true),
+            Err(TriggerReject::BelowScore),
+            "…but not a configured 0.95 (#17)"
+        );
+
+        // An unadapted cap re-baselines to the configured default…
+        cfg.tau_conf = 0.7;
+        cfg.cap_per_hour_default = 6;
+        gate.configure(&cfg);
+        assert_eq!(gate.cap_per_hour(), 6);
+        // …while an adapted cap survives a reload (re-clamped only).
+        gate.adapt_cap(false); // 6 → 5, adapted
+        gate.configure(&cfg);
+        assert_eq!(gate.cap_per_hour(), 5, "earned adaptation is not reset by a re-read");
     }
 
     #[test]

@@ -24,11 +24,26 @@ use crate::overlay::{self, BubbleRect};
 
 /// Hover padding around each published rect, physical px — absorbs measurement
 /// jitter at bubble edges so the interactive flag doesn't flap mid-click.
+/// Kept at 8 (decision #11): nothing in the history argues for a change, and
+/// the real-mouse feel pass below is what would.
 const RECT_PAD: i32 = 8;
 
-/// Poll cadence. 30 Hz is far below any perceptible hover latency and the tick
-/// is two Win32 calls + a few rect compares when rects exist, nothing when idle.
-pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
+/// Poll cadence — 60 Hz (decision #11, was 30). The tick is two Win32 calls +
+/// a few rect compares when rects exist and a map walk when idle, so doubling
+/// the rate halves worst-case hover latency (33 → 16 ms) for negligible cost.
+/// Rect and modal changes never wait for a tick: `set_rects`/`set_modal`
+/// reconcile immediately on arrival.
+///
+/// PROFILING (decision #11 — owner feel pass on real hardware, post-install):
+/// with a physical mouse, evaluate (a) fast flicks across a bubble edge — does
+/// the window turn interactive before the press lands, or does the click fall
+/// through; (b) whether the 8 px pad leaves perceptible dead-click halos on
+/// the apps beneath a bubble; (c) whether whole-window `WS_EX_TRANSPARENT`
+/// flipping is too coarse when rects from several surfaces coexist. The
+/// escalation path if window-level proves too coarse is per-pixel hit-testing
+/// (a `WM_NCHITTEST` subclass returning HTTRANSPARENT outside the rects)
+/// rather than more poll rate.
+pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
 /// What was last applied to the window, so the poller only touches styles on
 /// transitions. Tracks the MECHANISM, not just the boolean: hover-interactive
@@ -112,13 +127,7 @@ impl HitTestState {
                     (Some((cx, cy)), false) => {
                         // Window-relative physical px, same space the UI published.
                         window.outer_position().is_ok_and(|pos| {
-                            let (rx, ry) = (cx - pos.x, cy - pos.y);
-                            hit.rects.iter().any(|r| {
-                                rx >= r.x - RECT_PAD
-                                    && rx <= r.x + r.width + RECT_PAD
-                                    && ry >= r.y - RECT_PAD
-                                    && ry <= r.y + r.height + RECT_PAD
-                            })
+                            cursor_in_rects(&hit.rects, cx - pos.x, cy - pos.y)
                         })
                     }
                     _ => false,
@@ -157,8 +166,22 @@ pub fn spawn_poller(app: tauri::AppHandle) {
     });
 }
 
+/// Is the window-relative cursor inside any published rect, padded by
+/// [`RECT_PAD`]? Pure — the poller's containment decision, kept extractable so
+/// the pad boundary is testable off-hardware.
+fn cursor_in_rects(rects: &[BubbleRect], rx: i32, ry: i32) -> bool {
+    rects.iter().any(|r| {
+        rx >= r.x - RECT_PAD
+            && rx <= r.x + r.width + RECT_PAD
+            && ry >= r.y - RECT_PAD
+            && ry <= r.y + r.height + RECT_PAD
+    })
+}
+
 /// Global cursor position in screen physical px, or `None` off-Windows/on error.
-fn cursor_pos() -> Option<(i32, i32)> {
+/// Crate-visible: control-surface routing (`overlay::cursor_overlay_label`,
+/// decision #13) reuses the same source of truth as the poller.
+pub(crate) fn cursor_pos() -> Option<(i32, i32)> {
     #[cfg(windows)]
     unsafe {
         use windows::Win32::Foundation::POINT;
@@ -176,4 +199,49 @@ fn cursor_pos() -> Option<(i32, i32)> {
 /// writer leaves nothing inconsistent worth refusing over.
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> BubbleRect {
+        BubbleRect { x, y, width: w, height: h }
+    }
+
+    #[test]
+    fn no_rects_never_hits() {
+        assert!(!cursor_in_rects(&[], 0, 0));
+    }
+
+    #[test]
+    fn inside_and_outside_are_distinguished() {
+        let rects = [rect(100, 100, 50, 20)];
+        assert!(cursor_in_rects(&rects, 125, 110), "center hits");
+        assert!(!cursor_in_rects(&rects, 200, 110), "well right of the pad misses");
+        assert!(!cursor_in_rects(&rects, 125, 200), "well below the pad misses");
+    }
+
+    #[test]
+    fn the_8px_pad_is_inclusive_at_its_boundary() {
+        let rects = [rect(100, 100, 50, 20)];
+        // Exactly RECT_PAD outside every edge still hits (jitter absorption)…
+        assert!(cursor_in_rects(&rects, 100 - RECT_PAD, 110));
+        assert!(cursor_in_rects(&rects, 150 + RECT_PAD, 110));
+        assert!(cursor_in_rects(&rects, 125, 100 - RECT_PAD));
+        assert!(cursor_in_rects(&rects, 125, 120 + RECT_PAD));
+        // …and one more pixel out does not.
+        assert!(!cursor_in_rects(&rects, 100 - RECT_PAD - 1, 110));
+        assert!(!cursor_in_rects(&rects, 150 + RECT_PAD + 1, 110));
+        assert!(!cursor_in_rects(&rects, 125, 100 - RECT_PAD - 1));
+        assert!(!cursor_in_rects(&rects, 125, 120 + RECT_PAD + 1));
+    }
+
+    #[test]
+    fn any_rect_in_the_set_can_hit() {
+        let rects = [rect(0, 0, 10, 10), rect(500, 500, 10, 10)];
+        assert!(cursor_in_rects(&rects, 505, 505));
+        assert!(cursor_in_rects(&rects, 5, 5));
+        assert!(!cursor_in_rects(&rects, 250, 250));
+    }
 }

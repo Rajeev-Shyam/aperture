@@ -12,6 +12,7 @@
 //! shift habits with the user rather than fracturing them (doc 08 §9).
 
 use crate::config;
+use crate::normalizer::Token;
 
 /// Number of [`config::TEMPORAL_BUCKET_HOURS`]-hour buckets spanning a day.
 pub const BUCKETS_PER_DAY: usize = (24 / config::TEMPORAL_BUCKET_HOURS) as usize;
@@ -56,8 +57,11 @@ fn env_offset_override() -> Option<i64> {
 pub struct TemporalHistogram {
     /// The resource this histogram tracks (coarse `resource_class`, doc 08 §2).
     pub resource_class: String,
-    /// Weighted return mass per time-of-day bucket.
+    /// Weighted return mass per time-of-day bucket, valid as of `last_update_ms`.
     pub buckets: [f64; BUCKETS_PER_DAY],
+    /// The instant the bucket masses were last re-based (epoch ms); `None`
+    /// until the first return is recorded.
+    last_update_ms: Option<i64>,
 }
 
 impl TemporalHistogram {
@@ -66,14 +70,33 @@ impl TemporalHistogram {
         Self {
             resource_class,
             buckets: [0.0; BUCKETS_PER_DAY],
+            last_update_ms: None,
         }
     }
 
-    /// Record a return visit at `ts_ms` weighted by `recency_weight`
-    /// (`w = 0.5^(age_days/5)` for temporal patterns — ADR-033;
-    /// [`crate::scorer::recency_weight`] with [`config::HALF_LIFE_TEMPORAL_DAYS`]).
-    pub fn record_return(&mut self, ts_ms: i64, recency_weight: f64) {
-        self.buckets[bucket_of(ts_ms)] += recency_weight;
+    /// Record a return visit at `ts_ms`: existing mass ages to `ts_ms` by the
+    /// factorized decay (`0.5^(Δdays/H)` — the same math as
+    /// [`crate::scorer::PatternStats::decayed_to`]), then the visit adds weight
+    /// 1 to its bucket. `half_life_days` is the temporal half-life
+    /// (ADR-033 ≈ 5 d — [`config::HALF_LIFE_TEMPORAL_DAYS`], runtime-tunable
+    /// via `pattern_engine.half_life_temporal_days`, decision #17). Before
+    /// this aging existed the buckets only ever grew, so a long-dead habit
+    /// stayed "formed" forever.
+    pub fn record_return(&mut self, ts_ms: i64, half_life_days: f64) {
+        if let Some(last) = self.last_update_ms {
+            let f = crate::scorer::recency_weight(ts_ms, last, half_life_days);
+            for b in &mut self.buckets {
+                *b *= f;
+            }
+        }
+        self.last_update_ms = Some(ts_ms);
+        self.buckets[bucket_of(ts_ms)] += 1.0;
+    }
+
+    /// Total weighted return mass across all buckets — the denominator for the
+    /// temporal candidate's confidence (`peak / total`, decision #16).
+    pub fn total_mass(&self) -> f64 {
+        self.buckets.iter().sum()
     }
 
     /// `true` if any bucket has ≥ [`config::TEMPORAL_RETURN_FLOOR`] weighted
@@ -106,6 +129,29 @@ impl TemporalHistogram {
     }
 }
 
+/// The synthetic consequent [`Token`] a temporal pattern predicts (owner
+/// decision #16, 2026-08-16). Only the `resource_class` carries meaning — the
+/// connector lookup (trigger rule 3) and the action template read nothing
+/// else; the fixed `app_class`/`action` just keep the encoding well-formed so
+/// [`signature_for`] round-trips through `ngram::parse_signature` at hydrate.
+pub fn consequent_token(resource_class: &str) -> Token {
+    Token {
+        app_class: "temporal".to_string(),
+        action: "return".to_string(),
+        resource_class: Some(resource_class.to_string()),
+    }
+}
+
+/// The `patterns`-row signature keying one temporal pattern: resource × peak
+/// time-of-day bucket (decision #16). Rides the normal signature grammar
+/// (`antecedent ⇒ consequent`) so flush/hydrate/feedback all work unchanged;
+/// the `temporal:<bucket>` antecedent can never collide with a real n-gram
+/// tail key (encoded tokens always carry two `:`s, this carries one), so a
+/// hydrated temporal row never leaks into sequence candidate generation.
+pub fn signature_for(bucket: usize, consequent: &Token) -> String {
+    format!("temporal:{bucket} ⇒ {}", consequent.encode())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,17 +175,54 @@ mod tests {
     #[test]
     fn temporal_pattern_forms_at_the_floor() {
         std::env::set_var("APERTURE_TZ_OFFSET_MIN", "0");
+        let h_days = config::HALF_LIFE_TEMPORAL_DAYS;
         let mut h = TemporalHistogram::new("doc:xlsx".into());
         let nine_am = 9 * 3_600_000;
         assert!(!h.is_temporal());
-        h.record_return(nine_am, 1.0);
-        h.record_return(nine_am + 86_400_000, 1.0);
-        h.record_return(nine_am + 2 * 86_400_000, 1.0);
-        assert!(h.is_temporal(), "3 weighted returns in one bucket (doc 08 §4)");
+        // A daily 9am habit: mass is recency-weighted (H = 5 d), so 3 calendar
+        // returns weigh < 3.0 and the pattern forms on the 4th day — matching
+        // the sequence engine's "once-a-day habit fires ~day 4" posture.
+        for day in 0..3 {
+            h.record_return(nine_am + day * 86_400_000, h_days);
+        }
+        assert!(!h.is_temporal(), "3 aged returns stay under the floor");
+        h.record_return(nine_am + 3 * 86_400_000, h_days);
+        assert!(h.is_temporal(), "4th daily return crosses the weighted floor (doc 08 §4)");
         let (idx, mass) = h.peak_bucket().expect("peak");
         assert_eq!(idx, 4, "9am → bucket 4");
-        assert!((mass - 3.0).abs() < 1e-9);
+        // 0.5^(3/5) + 0.5^(2/5) + 0.5^(1/5) + 1 ≈ 3.29.
+        assert!(mass > 3.0 && mass < 3.5, "recency-weighted mass, got {mass}");
+        assert!((h.total_mass() - mass).abs() < 1e-9, "all mass in one bucket");
         assert!(h.now_is_peak(nine_am + 3 * 86_400_000));
         assert!(!h.now_is_peak(nine_am + 3 * 86_400_000 + 6 * 3_600_000));
+    }
+
+    #[test]
+    fn mass_decays_so_a_dead_habit_unforms() {
+        std::env::set_var("APERTURE_TZ_OFFSET_MIN", "0");
+        let h_days = config::HALF_LIFE_TEMPORAL_DAYS;
+        let mut h = TemporalHistogram::new("youtube".into());
+        let nine_am = 9 * 3_600_000;
+        for day in 0..5 {
+            h.record_return(nine_am + day * 86_400_000, h_days);
+        }
+        assert!(h.is_temporal());
+        // One stray return 30 days later: the old 9am mass has halved 6 times.
+        h.record_return(nine_am + 35 * 86_400_000 + 6 * 3_600_000, h_days);
+        assert!(!h.is_temporal(), "a month-dead habit no longer predicts returns");
+    }
+
+    #[test]
+    fn temporal_signature_round_trips_through_parse_signature() {
+        // Decision #16: temporal rows persist via the normal flush/hydrate path.
+        for res in ["youtube", "url:docs.rs", "doc:xlsx"] {
+            let tok = consequent_token(res);
+            let sig = signature_for(4, &tok);
+            let (ant_key, decoded) =
+                crate::ngram::parse_signature(&sig).expect("temporal signature parses");
+            assert_eq!(ant_key, "temporal:4 ⇒ *");
+            assert_eq!(decoded, tok, "consequent survives hydrate");
+            assert_eq!(decoded.resource_class.as_deref(), Some(res));
+        }
     }
 }

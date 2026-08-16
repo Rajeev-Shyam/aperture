@@ -17,6 +17,17 @@
     "active": "L1",
     "$comment": "L1 = Qwen2.5-VL-3B + faster-whisper small, co-residency CONDITIONAL on the 7.0 GB projection (ADR-030 — STT is the swap victim when it doesn't fit). L2 = Qwen2.5-VL-7B exclusive (opt-in, doc 04 §3).",
     "vlm_model": "qwen2.5-vl-3b",
+    "$comment_vlm_download": "Decision #30: the VLM weights are too big for the installer (NSIS 2 GB cap), so the Dashboard offers an explicit, user-click-only download (never automatic — no surprise network activity). URLs + byte sizes are settings, never code (NG8); the destination file names come from SidecarConfig. Verified byte-exact against the ggml-org HF repo on 2026-08-16 (matches the dev machine's files).",
+    "vlm_download": {
+      "model": {
+        "url": "https://huggingface.co/ggml-org/Qwen2.5-VL-3B-Instruct-GGUF/resolve/main/Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf",
+        "bytes": 1929901056
+      },
+      "mmproj": {
+        "url": "https://huggingface.co/ggml-org/Qwen2.5-VL-3B-Instruct-GGUF/resolve/main/mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf",
+        "bytes": 1338428128
+      }
+    },
     "stt_model": "whisper-base.en",
     "$comment_stt": "What actually ships: whisper.cpp CPU+BLAS base.en (verified live 2026-08-14). The GPU path (faster-whisper/CTranslate2 or CUDA whisper.cpp) is still [VERIFY] with the SC4 gate — this key must name the model the app can really spawn, not an aspiration (2026-08-15 review).",
     "vram_ceiling_gb": 7.0,
@@ -31,10 +42,12 @@
     "ptt_hotkey": "Ctrl+Alt+Space",
     "vad_speech_floor_ms": 300,
     "max_utterance_sec": 30,
+    "$comment_confidence": "Decision #27: STT confidence below this floor shows the 'Did you say…?' confirm chip instead of acting. Clamped to [0,1] at read; 1.0 = always confirm. Read by the voice pipeline per utterance (no restart needed); edited live from the Dashboard Voice tab.",
     "intent_confidence_floor": 0.6
   },
 
   "pattern_engine": {
+    "$comment": "Read by the pattern task at startup and re-read on its daily maintenance tick (decision #17, 2026-08-16). Missing/invalid keys fall back to the crate constants in pattern-engine/src/config.rs — a typo can never weaken the engine.",
     "tau_conf": 0.7,
     "cold_start_support_floor": 3,
     "semantic_similarity_threshold": 0.75,
@@ -74,11 +87,11 @@
   },
 
   "connectors": {
-    "$comment": "Per-connector staleness TTLs (doc 10, [ASSUMPTION] values). Code carries these as constants until the M9 settings-load pass wires overrides; kept here so the tunables are visible in one place.",
+    "$comment": "Per-connector staleness TTLs (decision #37, 2026-08-16: video goes stale fast, documents/IDE files stay resumable long). Code carries these as constants in crates/connectors — these keys are informational until a settings-load pass wires overrides; kept here so the tunables are visible in one place.",
     "browser_ttl_hours": 24,
-    "youtube_ttl_days": 7,
-    "document_ttl_days": 7,
-    "ide_ttl_days": 7,
+    "youtube_ttl_days": 3,
+    "document_ttl_days": 30,
+    "ide_ttl_days": 30,
     "$comment_extension": "Browser extension feed (ADR-027/028): native messaging (stdio + named pipe), no sockets. Toggle OFF halts forwarding (FIX 2.1); extension URLs run the same exclusion pipeline (FIX 2.2).",
     "extension_bridge_enabled": true,
     "$comment_media": "media_state coalescing [ASSUMPTION]: publish on video/state change, >=15 s position delta, or 30 s silence; pause/hidden always report exactly.",
@@ -88,7 +101,7 @@
 
   "privacy": {
     "exclusion_defaults": [],
-    "$comment_exclusions": "Defaults ship EMPTY (ADR-029/Q15): onboarding detects password managers/banking and SUGGESTS exclusions — the user confirms; nothing is ever auto-excluded.",
+    "$comment_exclusions": "Decision #20 (amends ADR-029/Q15): curated defaults (password managers, banking patterns — SHIPPED_DEFAULT_RULES in crates/capture/src/exclusion.rs) seed ONCE into the durable exclusion_list table at startup, where they are user-disableable/deletable and never resurrect. This key stays empty — the seed is code-defined, not settings-defined. Onboarding detect-and-suggest still runs on top.",
     "redaction_user_terms": [],
     "retention_days": {
       "events": 90,

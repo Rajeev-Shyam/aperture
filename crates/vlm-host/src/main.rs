@@ -45,7 +45,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{Multipart, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -87,10 +87,13 @@ pub struct Args {
     pub child_port: u16,
 }
 
-/// `POST /infer` request body. One image only (doc 06 §3, doc 04 R2 — image
-/// prefill is the silent killer). The bytes are already downscaled ≤ 1024 px long
-/// edge, JPEG q85, by the caller (the GPU job contract, [`aperture_contracts::GpuJobKind::Vlm`]).
-#[derive(Debug, Deserialize)]
+/// `POST /infer` request, decoded from `multipart/form-data` (decision #33: the
+/// JPEG rides as ONE raw binary part named `image_jpeg` — the JSON number-array
+/// encoding inflated it ~3.6× — plus text parts `prompt` and optional `schema`).
+/// One image only (doc 06 §3, doc 04 R2 — image prefill is the silent killer).
+/// The bytes are already downscaled ≤ 1024 px long edge, JPEG q85, by the caller
+/// (the GPU job contract, [`aperture_contracts::GpuJobKind::Vlm`]).
+#[derive(Debug)]
 pub struct InferRequest {
     /// Single downscaled JPEG frame (≤ 1024 px long edge, q85).
     pub image_jpeg: Vec<u8>,
@@ -356,6 +359,12 @@ fn parse_scene(content: &str) -> Result<InferResponse, HostError> {
         serde_json::from_str(json).map_err(|_| HostError::MalformedJson)?;
     if let Some(c) = value.get_mut("confidence") {
         if let Some(label) = c.as_str() {
+            // #32: loose hint only (owner decision 2026-08-16). These fixed
+            // label→number mappings — and the confidence value itself — are
+            // advisory context; no downstream consumer may gate an automated
+            // decision purely on this number (audited 2026-08-16: none do —
+            // it is clamped in vision-ocr's parse_scene, persisted opaquely in
+            // screen_context.vlm_summary, and surfaced only for display).
             let coerced = label.trim().parse::<f32>().unwrap_or_else(|_| {
                 match label.trim().to_ascii_lowercase().as_str() {
                     "high" | "very high" => 0.9,
@@ -401,10 +410,55 @@ fn extract_json_object(s: &str) -> Option<&str> {
 /// Shared axum state: the supervised child.
 type AppState = Arc<LlamaChild>;
 
+/// Decode the multipart `POST /infer` body (decision #33): one binary part
+/// `image_jpeg` (raw JPEG bytes), a text part `prompt`, and an optional text
+/// part `schema` (JSON; defaults to `null`). The orchestration `SidecarRunner`
+/// is the only client and both sides ship together, so this replaced the JSON
+/// number-array encoding outright — no compatibility shim.
+async fn read_infer_multipart(mut multipart: Multipart) -> Result<InferRequest, StatusCode> {
+    let mut image_jpeg: Option<Vec<u8>> = None;
+    let mut prompt: Option<String> = None;
+    let mut schema = serde_json::Value::Null;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+    {
+        match field.name() {
+            Some("image_jpeg") => {
+                image_jpeg = Some(
+                    field
+                        .bytes()
+                        .await
+                        .map_err(|_| StatusCode::BAD_REQUEST)?
+                        .to_vec(),
+                );
+            }
+            Some("prompt") => {
+                prompt = Some(field.text().await.map_err(|_| StatusCode::BAD_REQUEST)?);
+            }
+            Some("schema") => {
+                let text = field.text().await.map_err(|_| StatusCode::BAD_REQUEST)?;
+                schema = serde_json::from_str(&text).map_err(|_| StatusCode::BAD_REQUEST)?;
+            }
+            _ => {}
+        }
+    }
+    match (image_jpeg, prompt) {
+        (Some(image_jpeg), Some(prompt)) => Ok(InferRequest {
+            image_jpeg,
+            prompt,
+            schema,
+        }),
+        _ => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
 async fn infer_handler(
     State(child): State<AppState>,
-    Json(req): Json<InferRequest>,
+    multipart: Multipart,
 ) -> Result<Json<InferResponse>, StatusCode> {
+    let req = read_infer_multipart(multipart).await?;
     match child.infer(&req).await {
         Ok(resp) => Ok(Json(resp)),
         Err(HostError::MalformedJson) => Err(StatusCode::UNPROCESSABLE_ENTITY),
@@ -435,9 +489,10 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/infer", post(infer_handler))
         .route("/health", get(health_handler))
-        // The JPEG rides as a JSON number array (~3.6 chars/byte): axum's 2 MB
-        // default body limit 413'd large desktop frames into a silent OCR-only
-        // degrade (2026-08-15 review). 64 MB, loopback-only.
+        // Decision #33: the JPEG now arrives as one raw multipart part (no JSON
+        // number-array inflation, which is what 413'd large desktop frames into
+        // a silent OCR-only degrade — 2026-08-15 review). The 64 MB ceiling is
+        // kept deliberately; loopback-only.
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(Arc::clone(&child));
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, args.port)).await?;
@@ -481,5 +536,101 @@ mod tests {
         let scene = parse_scene(good).expect("valid scene");
         assert_eq!(scene.app_guess, "code");
         assert!(parse_scene("not json").is_err());
+    }
+
+    /// #32: non-conforming string confidences coerce to the fixed hint values
+    /// (never discard an otherwise-good scene over the label) — and the result
+    /// is only ever a loose hint downstream.
+    #[test]
+    fn string_confidence_labels_coerce_to_loose_hint_numbers() {
+        let scene = |conf: &str| {
+            parse_scene(&format!(
+                r#"{{"scene":"s","app_guess":"a","key_entities":[],
+                    "resumable_hint":{{"connector_type":"none","payload_guess":{{}}}},
+                    "confidence":{conf}}}"#
+            ))
+            .expect("scene survives a string confidence")
+        };
+        assert_eq!(scene(r#""High""#).confidence, 0.9);
+        assert_eq!(scene(r#""medium""#).confidence, 0.6);
+        assert_eq!(scene(r#""LOW""#).confidence, 0.3);
+        assert_eq!(scene(r#""0.8""#).confidence, 0.8);
+        assert_eq!(scene(r#""cromulent""#).confidence, 0.5, "unknown label = neutral");
+    }
+
+    /// Decision #33 round trip: a JPEG posted as multipart — built exactly the
+    /// way orchestration's `SidecarRunner` builds it — must decode
+    /// byte-identically through the real `read_infer_multipart` path. (The echo
+    /// route stands in for the llama.cpp child, which tests can't spawn; the
+    /// decode fn IS the production one.)
+    #[tokio::test]
+    async fn infer_multipart_round_trips_image_bytes_byte_identically() {
+        use std::sync::Mutex as StdMutex;
+
+        // Capture the decoded request so the test can assert prompt + schema too.
+        let seen: Arc<StdMutex<Option<InferRequest>>> = Arc::new(StdMutex::new(None));
+        let seen_srv = Arc::clone(&seen);
+        let app = Router::new()
+            .route(
+                "/infer",
+                post(move |mp: Multipart| {
+                    let seen = Arc::clone(&seen_srv);
+                    async move {
+                        let req = read_infer_multipart(mp).await?;
+                        let echo = req.image_jpeg.clone();
+                        *seen.lock().unwrap() = Some(req);
+                        Ok::<_, StatusCode>(echo)
+                    }
+                }),
+            )
+            .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024));
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // A JPEG SOI marker plus every byte value, so nothing survives by accident.
+        let mut jpeg: Vec<u8> = vec![0xFF, 0xD8];
+        jpeg.extend((0u8..=255).cycle().take(4096));
+
+        // The client leg mirrors SidecarRunner's VLM arm exactly
+        // (parts `image_jpeg` + `prompt` + `schema`).
+        let part = reqwest::multipart::Part::bytes(jpeg.clone())
+            .file_name("frame.jpg")
+            .mime_str("image/jpeg")
+            .unwrap();
+        let form = reqwest::multipart::Form::new()
+            .part("image_jpeg", part)
+            .text("prompt", "describe the screen")
+            .text("schema", "null");
+        let client = reqwest::Client::new();
+        let echoed = client
+            .post(format!("http://127.0.0.1:{port}/infer"))
+            .multipart(form)
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(
+            echoed.as_ref(),
+            jpeg.as_slice(),
+            "byte-identical after the multipart round trip"
+        );
+        let req = seen.lock().unwrap().take().expect("request decoded");
+        assert_eq!(req.prompt, "describe the screen");
+        assert!(req.schema.is_null());
+
+        // A body with no image part is a 400, not a hang or a 500.
+        let bad = reqwest::multipart::Form::new().text("prompt", "no image");
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/infer"))
+            .multipart(bad)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400);
     }
 }
