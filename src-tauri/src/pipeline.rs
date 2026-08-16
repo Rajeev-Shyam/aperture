@@ -335,8 +335,40 @@ pub fn spawn_pattern_task(
             Err(e) => tracing::error!(%e, "pattern hydrate read failed; engine starts cold"),
         }
 
+        // Weekly pattern-table maintenance (doc 08 §9) — checked daily; the
+        // engine's own support-decay math decides what is actually stale.
+        // This hook had NO caller before 2026-08-15: stale signatures
+        // accumulated forever and re-hydrated at every restart.
+        let mut prune_tick = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
+        prune_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        prune_tick.tick().await; // consume the immediate first tick
+
         loop {
             tokio::select! {
+                _ = prune_tick.tick() => {
+                    let doomed = engine.prune(epoch_ms());
+                    if !doomed.is_empty() {
+                        // Mirror to the patterns table or they re-hydrate.
+                        let n = doomed.len();
+                        let res = db.with_conn(|c| {
+                            for sig in &doomed {
+                                // Suggestion history outlives its pattern: detach
+                                // the FK, then drop the pattern row.
+                                c.execute(
+                                    "UPDATE suggestions SET pattern_id = NULL WHERE pattern_id IN \
+                                     (SELECT id FROM patterns WHERE signature = ?1)",
+                                    [sig],
+                                )?;
+                                c.execute("DELETE FROM patterns WHERE signature = ?1", [sig])?;
+                            }
+                            Ok(())
+                        });
+                        match res {
+                            Ok(()) => tracing::info!(pruned = n, "stale patterns pruned (doc 08 §9)"),
+                            Err(e) => tracing::error!(%e, "pattern prune DB mirror failed"),
+                        }
+                    }
+                }
                 state = capture_rx.recv() => {
                     match state {
                         Ok(s) => engine.set_capture(matches!(
@@ -767,4 +799,113 @@ pub(crate) fn epoch_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Surface cloud-returned suggestions as real bubbles — US3's last leg
+/// (doc 09 §4; doc 20's amended acceptance criterion). Shared by the MCP
+/// `aperture_submit_suggestions` tool and the push-transport `preview_send`
+/// result path, so BOTH transports end in the same on-screen rendering.
+///
+/// Per suggestion: connector re-validation produces a fresh `ConnectorState`
+/// (only connectors act, ADR-035) which is persisted so a click resolves
+/// through the same Path B as a local bubble; the durable `suggestions` row is
+/// written (`source = 'claude'`); the bubble emits unless snoozed (ADR-040:
+/// queued rows surface when the snooze lifts). `connector_type == "none"` is
+/// informational — no action, empty `action_ref`. A trailing `answer_text`
+/// surfaces on the voice answer card. Returns how many suggestions surfaced.
+pub fn surface_cloud_suggestions(
+    app: &tauri::AppHandle,
+    state: &crate::app_state::AppState,
+    parsed: &aperture_contracts::StructuredSuggestions,
+) -> usize {
+    use aperture_contracts::suggestions::{BubbleSpec, SuggestionSource};
+    let now_ms = epoch_ms();
+    let snoozed = state.snooze_until.load(std::sync::atomic::Ordering::SeqCst) > now_ms;
+    let mut surfaced = 0usize;
+
+    for s in &parsed.suggestions {
+        let conn_state = if s.connector_type == "none" {
+            None
+        } else {
+            match state
+                .connectors
+                .by_type(&s.connector_type)
+                .and_then(|c| c.validate(&s.reconstruct_payload))
+            {
+                Some(st) => Some(st),
+                None => {
+                    tracing::warn!(
+                        connector_type = %s.connector_type,
+                        "cloud suggestion rejected by connector re-validation (doc 09 §4)"
+                    );
+                    continue;
+                }
+            }
+        };
+        let action_ref = conn_state.as_ref().map(|st| st.id.clone()).unwrap_or_default();
+        if let Some(st) = &conn_state {
+            if let Err(e) = state.db.insert_connector_state(st) {
+                tracing::error!(%e, "cloud suggestion connector_state persist failed");
+                continue;
+            }
+        }
+        // Rationale as the sublabel, clipped to bubble scale.
+        let sublabel = {
+            let r = s.rationale.trim();
+            if r.is_empty() {
+                None
+            } else if r.chars().count() > 90 {
+                Some(format!("{}…", r.chars().take(89).collect::<String>()))
+            } else {
+                Some(r.to_string())
+            }
+        };
+        let spec = BubbleSpec {
+            title: s.title.clone(),
+            glyph: aperture_suggestion_generator::glyph_for(&s.connector_type).to_string(),
+            sublabel,
+            action_ref: action_ref.clone(),
+            source: SuggestionSource::Claude,
+            // User-requested content, not a mined guess — full confidence tag.
+            confidence: 1.0,
+        };
+        let insert = state.db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO suggestions (pattern_id, connector_id, source, title, glyph, confidence, state, shown_ts) \
+                 VALUES (NULL, ?1, 'claude', ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    (!action_ref.is_empty()).then_some(action_ref.as_str()),
+                    spec.title,
+                    spec.glyph,
+                    spec.confidence,
+                    if snoozed { "queued" } else { "shown" },
+                    (!snoozed).then_some(now_ms),
+                ],
+            )?;
+            Ok(c.last_insert_rowid())
+        });
+        match insert {
+            Ok(id) => {
+                surfaced += 1;
+                if !snoozed {
+                    let _ = crate::events::emit_bubble_spec(app, &id.to_string(), &spec);
+                }
+            }
+            Err(e) => tracing::error!(%e, "cloud suggestion persist failed"),
+        }
+    }
+
+    if let Some(text) = parsed.answer_text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        let _ = crate::events::emit_voice_surface(
+            app,
+            &serde_json::json!({
+                "surface": "answer",
+                "title": text,
+                "source": "Claude",
+                "action_ref": null,
+                "can_ask_claude": false,
+            }),
+        );
+    }
+    surfaced
 }

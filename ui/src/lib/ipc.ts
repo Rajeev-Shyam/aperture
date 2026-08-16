@@ -244,25 +244,61 @@ export function bubbleClick(id: string, actionRef: string): Promise<OpenOutcome>
 
 /** Bubble feedback into the durable suggestions row + the engine's decay/mute
  *  ladder (doc 08 §7, Q81). Without this, dismissed bubbles resurrect on a
- *  WebView respawn and dismissal decay never learns. */
+ *  WebView respawn and dismissal decay never learns. `"muted"` is the explicit
+ *  "Mute this pattern" — straight to the 7-day mute, no ladder counting. */
 export function recordFeedback(
   id: string,
-  kind: "clicked" | "dismissed" | "expired" | "up" | "down",
+  kind: "clicked" | "dismissed" | "muted" | "expired" | "up" | "down",
 ): Promise<void> {
   return invoke<void>("record_feedback", { id, kind });
 }
 
 /** Global bubble snooze (ADR-040/Q95): silences bubbles while capture +
- *  learning continue. TODO(M3-followup): render the snooze control
- *  (15 min / 1 h / until re-enabled) in the overlay's overflow menu. */
+ *  learning continue. Rendered as the HUD's 🔕 control. */
 export function setSnooze(mode: "off" | "15m" | "1h" | "forever"): Promise<void> {
   return invoke<void>("set_snooze", { mode });
+}
+
+/** The snooze deadline (epoch ms; 0 = off, i64::MAX ≈ forever) — the HUD's 🔕
+ *  control renders the truth, not its last click. */
+export function getSnooze(): Promise<number> {
+  return invoke<number>("get_snooze");
+}
+
+/** Dismiss the current voice surface on EVERY overlay window (multi-monitor
+ *  convergence — a local-state dismiss left clones on the other monitors). */
+export function voiceDismiss(): Promise<void> {
+  return invoke("voice_dismiss");
+}
+
+/** Give this overlay window OS keyboard focus (non-exclusive panels opened
+ *  without a click otherwise can't receive Escape/Tab/typing). */
+export function focusOverlay(): Promise<void> {
+  return invoke("focus_overlay");
+}
+
+/** Open the Activity & Privacy panel on the primary overlay (exclusions
+ *  manager) — reachable from any monitor's bubble overflow. */
+export function openPrivacy(): Promise<void> {
+  return invoke("open_privacy");
 }
 
 /** Ask the core to BUILD a Context Payload for preview (doc 03 §4). The returned
  *  object IS the thing that will ship — the panel renders/edits it in place. */
 export function requestPreview(intent: Intent, seedActionRef?: string): Promise<ContextPayload> {
   return invoke<ContextPayload>("request_preview", { intent, seedActionRef: seedActionRef ?? null });
+}
+
+/** The event-trail slice for the "Add more history" slider (doc 11 §4,
+ *  ADR-040/Q71): metadata rows from the last N minutes, oldest-first, capped
+ *  at EVENT_TRAIL_MAX. The panel swaps its `event_trail` item for this. */
+export function listTrailEvents(minutes: number): Promise<unknown[]> {
+  return invoke<unknown[]>("list_trail_events", { minutes });
+}
+
+/** Health of one transport for the preview footer's dot (doc 11 §4). */
+export function transportHealth(target: TransportTarget): Promise<Health> {
+  return invoke<Health>("transport_health", { target });
 }
 
 /** The approval gate's answer: the core-owned payload after the edits were
@@ -566,6 +602,10 @@ export const onSuggestionLifecycle = (h: (e: SuggestionLifecycleEvent) => void) 
 /** `"dashboard_open"` — the tray (left-click / menu) or a second app launch
  *  asks this window to open the Dashboard. Targeted at the primary overlay. */
 export const onDashboardOpen = (h: () => void) => on<null>("dashboard_open", () => h());
+
+/** `"privacy_open"` — a bubble's "Exclusions…" (any monitor) asks the primary
+ *  overlay to open the Activity & Privacy panel. */
+export const onPrivacyOpen = (h: () => void) => on<null>("privacy_open", () => h());
 
 /** `"preview_request"` — the core staged a payload (MCP gated search, ADR-037)
  *  and asks this window to open the preview panel on it. The user's explicit

@@ -65,6 +65,8 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",   # WS_EX_LAYERED | WS_EX_TRANSPARENT, GetWindowLongPtr/SetWindowLongPtr
     "Win32_Graphics_Gdi",             # monitor enumeration for per-monitor overlays
     "Win32_UI_HiDpi",                 # WM_DPICHANGED re-anchoring (doc 11 §7)
+    "Win32_Security",                 # SECURITY_ATTRIBUTES for the MCP pipe DACL
+    "Win32_Security_Authorization",   # SDDL -> security descriptor (owner-only pipe)
 ] }  # [VERIFY] at build time
 
 # Required by the shell's DB reads (list_suggestions / settings / pipeline).

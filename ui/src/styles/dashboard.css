@@ -49,6 +49,42 @@
   gap: 6px;
 }
 
+/* Global snooze control (doc 11 §6, ADR-040) — button + popover menu. */
+.hud__snooze {
+  position: relative;
+  display: inline-flex;
+}
+.hud__snooze-btn--on {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.hud__snooze-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 220px;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  padding: 4px;
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-12);
+  box-shadow: var(--shadow-elev), var(--lens-lip);
+}
+.hud__snooze-menu button {
+  text-align: left;
+  background: transparent;
+  border: 0;
+  color: var(--ink-primary);
+  padding: 8px 10px;
+  border-radius: 8px;
+  font: inherit;
+  cursor: pointer;
+}
+.hud__snooze-menu button:hover {
+  background: var(--lift-2);
+}
+
 .hud__grip {
   align-self: center;
   width: 34px;
@@ -66,7 +102,9 @@
 
 .hud__grip:hover {
   color: var(--ink-secondary);
-  background: var(--fallback-opaque);
+  /* Light tint — --fallback-opaque on an opaque panel was a zero-delta hover
+   * (2026-08-15 review). */
+  background: var(--lift-2);
 }
 
 .hud--dragging .hud__grip {
@@ -147,7 +185,9 @@
 
 .dash__navitem:hover {
   color: var(--ink-primary);
-  background: var(--fallback-opaque);
+  /* Light tint — --fallback-opaque on the opaque dashboard was a zero-delta
+   * hover (2026-08-15 review). */
+  background: var(--lift-1);
 }
 
 .dash__navitem--active {
@@ -340,6 +380,31 @@
 .dash__row-excluded {
   color: var(--health-setup);
   font-size: 0.72rem;
+}
+
+/* The "useful?" thumbs on suggestion rows (SC7, Q81): quiet until set. */
+.dash__row-thumbs {
+  display: inline-flex;
+  gap: 2px;
+  margin-left: 8px;
+}
+.dash__thumb {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 0 4px;
+  font-size: 0.78rem;
+  cursor: pointer;
+  filter: grayscale(1) opacity(0.55);
+}
+.dash__thumb:hover {
+  filter: none;
+  background: var(--lift-1);
+}
+.dash__thumb--set {
+  filter: none;
+  background: var(--lift-2);
+  border-color: var(--border-hairline);
 }
 
 /* Voice notice surface: opaque + readable + always closable (user feedback:

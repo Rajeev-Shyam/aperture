@@ -75,7 +75,7 @@ pub fn run_nightly_prune(db: &Db, now_ms: i64, policy: &RetentionPolicy) -> Resu
         //    DELETE CASCADE). Audit rows (capture_toggle / cloud_send) have their
         //    own TTL and are excluded here; they expire below.
         report.events_deleted = conn.execute(
-            "DELETE FROM events WHERE ts < ?1 AND type NOT IN ('capture_toggle','cloud_send')",
+            "DELETE FROM events WHERE ts < ?1 AND type NOT IN ('capture_toggle','cloud_send','mcp_search')",
             [events_floor],
         )?;
 
@@ -84,7 +84,7 @@ pub fn run_nightly_prune(db: &Db, now_ms: i64, policy: &RetentionPolicy) -> Resu
         //     never shorter than audit_days).
         let audit_floor = now_ms - policy.events_days.max(policy.audit_days) as i64 * DAY_MS;
         conn.execute(
-            "DELETE FROM events WHERE ts < ?1 AND type IN ('capture_toggle','cloud_send')",
+            "DELETE FROM events WHERE ts < ?1 AND type IN ('capture_toggle','cloud_send','mcp_search')",
             [audit_floor],
         )?;
 
@@ -122,6 +122,12 @@ pub fn run_nightly_prune(db: &Db, now_ms: i64, policy: &RetentionPolicy) -> Resu
              WHERE stale_after_ts IS NOT NULL AND stale_after_ts < ?1",
             [now_ms - DAY_MS],
         )?;
+
+        // 7. v2 agent tables (Doc 22 §3.4): steps expire on the shorter OCR
+        //    window (they carry action text), tasks on the events window;
+        //    a task's remaining steps cascade with it.
+        conn.execute("DELETE FROM task_steps WHERE timestamp < ?1", [ocr_floor])?;
+        conn.execute("DELETE FROM tasks WHERE created_at < ?1", [events_floor])?;
         Ok(())
         })();
 

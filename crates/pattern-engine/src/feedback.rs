@@ -32,6 +32,9 @@ pub enum Signal {
     ThumbsUp,
     /// Explicit "useful?" 👎 (Q81) — strong penalty; advances the dismissal ladder.
     ThumbsDown,
+    /// Explicit "Mute this pattern" (doc 11 §3 overflow) — jump the ladder
+    /// straight to muted, no dismissal counting.
+    Muted,
 }
 
 /// Mute bookkeeping per signature for the ladder (doc 08 §7, ADR-033: mute only
@@ -105,6 +108,10 @@ pub fn apply(stats: &mut PatternStats, mute: &mut MuteState, signal: Signal, now
             stats.dismiss_decay *= config::THUMBS_DOWN_DECAY_MULT;
             // A 👎 also advances the ladder — it is a dismissal *with signal* (Q81).
             mute.register_dismissal(now_ms);
+        }
+        Signal::Muted => {
+            // The user asked by name — no ladder, straight to the 7-day mute.
+            mute.muted_until = Some(now_ms + config::MUTE_DURATION_DAYS * 86_400_000);
         }
     }
 }

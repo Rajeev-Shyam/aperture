@@ -698,11 +698,13 @@ fn spawn_idle_sweep(
     });
 }
 
-/// Retention on startup + a daily timer (doc 03 §6, doc 16 M2).
+/// Retention on startup + a daily timer (doc 03 §6, doc 16 M2). The policy is
+/// re-read from `privacy.retention_days` each pass (2026-08-15 review — the
+/// settings block existed but the runtime silently used the defaults).
 fn spawn_retention(db: Arc<aperture_db::Db>) {
     tokio::spawn(async move {
-        let policy = aperture_db::retention::RetentionPolicy::default();
         loop {
+            let policy = retention_policy_from_settings(&db);
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
@@ -714,6 +716,29 @@ fn spawn_retention(db: Arc<aperture_db::Db>) {
             tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
         }
     });
+}
+
+/// `privacy.retention_days` from the settings store, defaults where absent or
+/// invalid. A zero/negative value is rejected (a typo must never mean "delete
+/// everything today").
+fn retention_policy_from_settings(db: &aperture_db::Db) -> aperture_db::retention::RetentionPolicy {
+    let mut policy = aperture_db::retention::RetentionPolicy::default();
+    let Ok(Some(raw)) = db.get_setting("privacy") else { return policy };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else { return policy };
+    let Some(days) = v.get("retention_days") else { return policy };
+    let mut read = |key: &str, dst: &mut u32| {
+        if let Some(n) = days.get(key).and_then(serde_json::Value::as_u64) {
+            if n >= 1 {
+                *dst = n.min(u32::MAX as u64) as u32;
+            }
+        }
+    };
+    read("events", &mut policy.events_days);
+    read("ocr_text", &mut policy.ocr_text_days);
+    read("voice", &mut policy.voice_days);
+    read("suggestions", &mut policy.suggestions_days);
+    read("audit", &mut policy.audit_days);
+    policy
 }
 
 /// Build and run the Tauri app: manage [`AppState`], register the IPC command
@@ -750,13 +775,19 @@ fn run_tauri(
             commands::bubble_click,
             commands::record_feedback,
             commands::set_snooze,
+            commands::get_snooze,
             commands::request_preview,
+            commands::list_trail_events,
+            commands::transport_health,
             commands::preview_set_approved,
             commands::preview_cancel,
             commands::preview_send,
             commands::voice_ptt_down,
             commands::voice_ptt_up,
             commands::voice_run_transcript,
+            commands::voice_dismiss,
+            commands::focus_overlay,
+            commands::open_privacy,
             commands::get_settings,
             commands::set_settings,
             commands::get_autostart,

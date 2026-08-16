@@ -141,9 +141,21 @@ export function BubbleContainer({ onAskClaude }: Props) {
           onResume={() => onResume(b)}
           onDismiss={() => {
             // User-driven: persist + teach the ladder (doc 08 §7) so the
-            // bubble cannot resurrect on a WebView respawn.
+            // bubble cannot resurrect on a WebView respawn. The core
+            // re-broadcasts the transition so every monitor converges.
             void recordFeedback(b.id, "dismissed");
             applyLifecycle(b.id, "dismissed");
+          }}
+          onMute={() => {
+            // "Mute this pattern": straight to the engine's 7-day mute
+            // (doc 08 §7); the bubble resolves as dismissed.
+            void recordFeedback(b.id, "muted");
+            applyLifecycle(b.id, "dismissed");
+          }}
+          onRate={(kind) => {
+            // The explicit "useful?" thumbs — SC7's signal (Q81). The bubble
+            // stays; only the rating is recorded.
+            void recordFeedback(b.id, kind);
           }}
           onExited={() => removeBubble(b.id)}
           onLifecycle={(state) => {

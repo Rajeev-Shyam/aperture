@@ -141,7 +141,9 @@ export function VoiceSurfaces({ event, onAskClaude, onDismiss, onRun }: Props) {
 }
 
 /** Minimal level-driven waveform. Animates `transform` only (doc 14 §2);
- *  the actual level comes from the listening event. */
+ *  the level streams in on the listening event at ~10 Hz (core-side meter,
+ *  2026-08-15 review — `level || 0.5` used to freeze the bars at half height
+ *  because the core never sent a level and 0 is falsy). */
 function Waveform({ level }: { level: number }) {
   const bars = [0.4, 0.7, 1, 0.7, 0.4];
   return (
@@ -150,7 +152,7 @@ function Waveform({ level }: { level: number }) {
         <span
           key={i}
           className="voice__wave-bar"
-          style={{ transform: `scaleY(${Math.max(0.15, base * Math.min(1, level || 0.5))})` }}
+          style={{ transform: `scaleY(${Math.max(0.15, base * Math.min(1, level))})` }}
         />
       ))}
     </span>

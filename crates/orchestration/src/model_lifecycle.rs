@@ -424,12 +424,71 @@ mod os_spawn {
     /// a terminal window (user report 2026-08-14).
     pub(super) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-    /// A running sidecar child + its loopback endpoint. Killing it reaps the
-    /// transitive llama.cpp child (kill_on_drop), returning VRAM to the driver.
+    /// A running sidecar child + its loopback endpoint + the Job Object that
+    /// guarantees the WHOLE tree dies with it (see [`JobHandle`]).
     pub(super) struct OsSidecar {
         child: tokio::process::Child,
         base_url: String,
         client: reqwest::Client,
+        /// `None` only if job assignment failed (logged); tree-kill then
+        /// degrades to host-only and relies on the hosts' own kill_on_drop.
+        job: Option<JobHandle>,
+    }
+
+    /// Owns the Windows Job Object the host — and, transitively, its
+    /// llama/whisper grandchild — runs inside. `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+    /// means the LAST handle close terminates the whole tree: an explicit kill,
+    /// a drop, or this process dying by ANY path (tray Quit's process::exit
+    /// runs no drops; a crash runs nothing at all — the OS closes the handle
+    /// either way). This is the guaranteed VRAM-release path (invariant 3):
+    /// TerminateProcess on the host alone orphaned the GPU-holding grandchild
+    /// (2026-08-15 review, HIGH).
+    pub(super) struct JobHandle(windows::Win32::Foundation::HANDLE);
+    // SAFETY: a job-object handle is process-global and freely usable across
+    // threads; the only operation after creation is CloseHandle on drop.
+    unsafe impl Send for JobHandle {}
+    unsafe impl Sync for JobHandle {}
+    impl Drop for JobHandle {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(self.0);
+            }
+        }
+    }
+
+    /// Create a kill-on-close Job Object and put `child` in it. Grandchildren
+    /// the host spawns AFTER assignment join the job automatically; assignment
+    /// happens within milliseconds of CreateProcess, long before a host can
+    /// exec its llama/whisper child.
+    fn assign_to_kill_on_close_job(child: &tokio::process::Child) -> Option<JobHandle> {
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        let raw = child.raw_handle()?;
+        unsafe {
+            let job = CreateJobObjectW(None, None).ok()?;
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION as *const core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+            .is_err()
+            {
+                let _ = CloseHandle(job);
+                return None;
+            }
+            if AssignProcessToJobObject(job, HANDLE(raw)).is_err() {
+                let _ = CloseHandle(job);
+                return None;
+            }
+            Some(JobHandle(job))
+        }
     }
 
     #[async_trait::async_trait]
@@ -452,7 +511,12 @@ mod os_spawn {
         }
 
         async fn kill(&mut self) -> Result<(), LifecycleError> {
-            // Graceful child.kill() first; kill_on_drop is the belt-and-braces.
+            // Close the Job Object FIRST: that terminates host + grandchild in
+            // one stroke — child.kill() alone left llama/whisper holding VRAM.
+            if let Some(job) = self.job.take() {
+                drop(job); // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE fires here
+            }
+            // Reap the host handle; a no-op if the job close already took it.
             if self.child.kill().await.is_ok() {
                 return Ok(());
             }
@@ -514,6 +578,14 @@ mod os_spawn {
             .kill_on_drop(true) // invariant 3: kill => VRAM release
             .spawn()
             .map_err(|e| LifecycleError::Spawn(e.to_string()))?;
+        // Tree-kill guarantee (2026-08-15 review, HIGH): the job handle dying
+        // — with this struct, or with this PROCESS — reaps host + grandchild.
+        let job = assign_to_kill_on_close_job(&child);
+        if job.is_none() {
+            tracing::warn!(
+                "sidecar Job Object assignment failed — tree-kill degraded to host-only"
+            );
+        }
 
         let base_url = format!("http://127.0.0.1:{port}");
         let client = reqwest::Client::builder()
@@ -524,11 +596,21 @@ mod os_spawn {
             child,
             base_url,
             client,
+            job,
         };
 
         // Poll /health until ready within the cold-load SLA (doc 04 §5).
         let deadline = tokio::time::Instant::now() + config.cold_load_timeout;
         while tokio::time::Instant::now() < deadline {
+            // A host that already exited (port collision, missing binary or
+            // model) can never become healthy — fail fast instead of burning
+            // the full cold-load window while the lifecycle mutex blocks the
+            // voice thread and every VLM job (2026-08-15 review).
+            if let Ok(Some(status)) = sidecar.child.try_wait() {
+                return Err(LifecycleError::Spawn(format!(
+                    "sidecar exited during cold load: {status}"
+                )));
+            }
             if sidecar.is_ready().await {
                 return Ok(Box::new(sidecar));
             }

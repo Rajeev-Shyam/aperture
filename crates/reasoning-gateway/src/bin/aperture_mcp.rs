@@ -100,15 +100,45 @@ async fn handle_call(msg: &serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// `ERROR_PIPE_BUSY` — every instance is mid-handoff; retry, per the tokio
+/// named-pipe docs. The app's accept loop has an unavoidable window between
+/// taking a connection and standing up the next listener instance.
+const ERROR_PIPE_BUSY: i32 = 231;
+/// How long to retry a busy pipe before reporting failure.
+const BUSY_RETRY_DEADLINE: Duration = Duration::from_secs(2);
+
 /// One round-trip over the named pipe: a JSON line out, a JSON line back.
 /// The app returns the finished MCP tool result (`{content, isError?}`).
 async fn call_app(name: &str, arguments: &serde_json::Value) -> Result<serde_json::Value, String> {
-    let client = tokio::net::windows::named_pipe::ClientOptions::new()
-        .open(MCP_PIPE_NAME)
-        .map_err(|_| {
-            "Aperture is not running on this machine — start Aperture, then try again."
-                .to_string()
-        })?;
+    let deadline = tokio::time::Instant::now() + BUSY_RETRY_DEADLINE;
+    let client = loop {
+        match tokio::net::windows::named_pipe::ClientOptions::new().open(MCP_PIPE_NAME) {
+            Ok(c) => break c,
+            // Busy ≠ not running (2026-08-15 review): the server exists but its
+            // one instance is between connect() and the next create(). Wait out
+            // the handoff window instead of lying "not running".
+            Err(e)
+                if e.raw_os_error() == Some(ERROR_PIPE_BUSY)
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                return Err("Aperture is busy with another request — try again.".to_string());
+            }
+            Err(_) => {
+                return Err(
+                    "Aperture is not running on this machine — start Aperture, then try again."
+                        .to_string(),
+                );
+            }
+        }
+    };
+    // Anti-squat (2026-08-15 review): the \\.\pipe namespace is machine-global,
+    // so with Aperture closed ANY local process could claim this name, harvest
+    // tool arguments, and feed Claude spoofed "tool results". Verify the server
+    // process is the real aperture.exe before a single byte of arguments flows.
+    verify_server(&client)?;
     let mut reader = BufReader::new(client);
     let mut request =
         serde_json::json!({ "op": "call", "name": name, "arguments": arguments }).to_string();
@@ -138,6 +168,50 @@ async fn call_app(name: &str, arguments: &serde_json::Value) -> Result<serde_jso
             .unwrap_or("Aperture reported an unknown bridge error")
             .to_string())
     }
+}
+
+/// Verify the pipe server is the aperture.exe that ships NEXT TO this binary
+/// (externalBin: both live in the install dir; in dev both sit in target\*).
+/// Any other image gets refused — no arguments forwarded, no reply trusted.
+fn verify_server(
+    client: &tokio::net::windows::named_pipe::NamedPipeClient,
+) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::Pipes::GetNamedPipeServerProcessId;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    let expected = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("aperture.exe")))
+        .ok_or_else(|| "could not resolve the expected Aperture path".to_string())?;
+    unsafe {
+        let mut pid = 0u32;
+        GetNamedPipeServerProcessId(HANDLE(client.as_raw_handle()), &mut pid)
+            .map_err(|e| format!("pipe server verification failed: {e}"))?;
+        let proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+            .map_err(|e| format!("pipe server verification failed: {e}"))?;
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let res = QueryFullProcessImageNameW(
+            proc,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        );
+        let _ = CloseHandle(proc);
+        res.map_err(|e| format!("pipe server verification failed: {e}"))?;
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        if !path.eq_ignore_ascii_case(&expected.to_string_lossy()) {
+            return Err(format!(
+                "refusing an unverified pipe server at {path} — expected {}",
+                expected.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A JSON-RPC 2.0 success envelope.

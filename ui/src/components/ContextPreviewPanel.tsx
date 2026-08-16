@@ -21,13 +21,16 @@
 //  Contract law (doc 15 §2): only THIS panel sets `user_approved` (via
 //  `preview_set_approved`); only the gateway consumes an approved payload.
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
+  listTrailEvents,
   previewSend,
   previewSetApproved,
+  transportHealth,
   PAYLOAD_SIZE_WARN_BYTES,
   type ContextPayload,
+  type Health,
   type Intent,
   type PayloadItem,
   type StructuredSuggestions,
@@ -71,6 +74,22 @@ export function ContextPreviewPanel({ payload, onChange, onClose }: Props) {
   const [freeText, setFreeText] = useState("");
   const [historyMinutes, setHistoryMinutes] = useState(0);
   const panelRef = useRef<HTMLDivElement>(null);
+
+  // Real transport health for the footer dot (was hardcoded "setup" yellow,
+  // 2026-08-15 review). Queried once per open per transport.
+  const [health, setHealth] = useState<Health | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    setHealth(null);
+    void transportHealth(payload.transport_target)
+      .then((h) => {
+        if (!cancelled) setHealth(h);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [payload.transport_target]);
 
   // `aria-modal` must be backed by the real modal contract (this is the ONE gate
   // where the user reviews exactly what egresses): make the click-through
@@ -118,34 +137,30 @@ export function ContextPreviewPanel({ payload, onChange, onClose }: Props) {
     setFreeText("");
   }
 
-  function addSelection() {
-    // TODO(M7:) invoke a core command to capture the current selection text,
-    //           then append it as a `user_addition` item. Placeholder marks it
-    //           explicitly so it can't masquerade as real content.
-    onChange({
-      ...payload,
-      items: [...payload.items, { kind: "user_addition", text: "[selection pending]" }],
-    });
-  }
+  // "Add selection" / "Add screen summary" / "Add screenshot" are DISABLED with
+  // honest copy: their capture paths land with v2's screen-serializer (Doc 22
+  // §3.2). They used to render enabled — one injected a literal
+  // "[selection pending]" placeholder that could ship inside an approved
+  // payload; the others were silent no-ops (2026-08-15 review). The trust
+  // surface must never fake content or claim affordances it doesn't have.
 
-  function addScreenSummary() {
-    // TODO(M5:) invoke a local-VLM scene-summary job (doc 06); on completion
-    //           append the structured summary as a `connector`/`user_addition`.
-    //           This may queue a GPU job behind the single-permit mutex (doc 12)
-    //           and trigger the gpu_busy degrade while it runs.
-  }
-
-  function addScreenshot() {
-    // TODO(M5:) opt-in only. Core captures, downscales to <=1568px / ~1.15MP
-    //           (doc 09 §5), returns { width, height, data_b64 } -> append a
-    //           `screenshot` item. The footer token estimate then reflects it.
-  }
-
+  /** Extend/shrink the event_trail over the selected range (ADR-040/Q71):
+   *  fetch the metadata rows and swap the payload's `event_trail` item —
+   *  WYSIWYS, and approval re-runs redaction over the result. */
   function applyHistoryRange(minutes: number) {
     setHistoryMinutes(minutes);
-    // TODO(M7:) invoke a core command to extend the `event_trail` item over the
-    //           selected range (capped at 50 events, EVENT_TRAIL_MAX, doc 03 §4),
-    //           replacing the existing event_trail item in `items`.
+    if (minutes === 0) return; // 0 = keep the trail the builder assembled
+    void listTrailEvents(minutes)
+      .then((events) => {
+        onChange({
+          ...payload,
+          items: [
+            ...payload.items.filter((i) => i.kind !== "event_trail"),
+            ...(events.length ? [{ kind: "event_trail", events } as PayloadItem] : []),
+          ],
+        });
+      })
+      .catch((e) => setSendError(`history range failed: ${e}`));
   }
 
   // ---- Send / Approve (over the EXACT object the panel holds) --------------
@@ -266,18 +281,19 @@ export function ContextPreviewPanel({ payload, onChange, onClose }: Props) {
         </section>
       )}
 
-      {/* 4. Enrichment affordances ("make context richer"). */}
+      {/* 4. Enrichment affordances ("make context richer"). The three capture
+          paths ship with v2's screen-serializer — disabled, never fake. */}
       <section className="preview__enrich" aria-label="Add context">
         <h4>Make context richer</h4>
         <div className="preview__enrich-row">
-          <button className="btn" onClick={addSelection}>
-            Add selection
+          <button className="btn" disabled title="Coming with v2 — selection capture isn't built yet">
+            Add selection (v2)
           </button>
-          <button className="btn" onClick={addScreenSummary}>
-            Add screen summary
+          <button className="btn" disabled title="Coming with v2 — local VLM scene summary isn't wired yet">
+            Add screen summary (v2)
           </button>
-          <button className="btn" onClick={addScreenshot}>
-            Add screenshot (opt-in)
+          <button className="btn" disabled title="Coming with v2 — screenshot capture isn't wired yet">
+            Add screenshot (v2)
           </button>
         </div>
 
@@ -308,12 +324,18 @@ export function ContextPreviewPanel({ payload, onChange, onClose }: Props) {
       {/* 5. Footer: transport target + health dot · size/token · Cancel/Send. */}
       <footer className="preview__foot">
         <div className="preview__transport">
-          {/* TODO(M7:) the health dot color comes from a transport health query
-              (reasoning::Health). Default to "setup" until wired. */}
           <span
             className="preview__health-dot"
-            style={{ background: "var(--health-setup)" }}
-            aria-label="transport health"
+            style={{
+              background:
+                health?.kind === "ready"
+                  ? "var(--health-ready)"
+                  : health?.kind === "unavailable"
+                    ? "var(--health-down)"
+                    : "var(--health-setup)",
+            }}
+            aria-label={`transport health: ${health?.kind ?? "checking"}`}
+            title={health && health.kind !== "ready" ? health.detail : undefined}
           />
           <span>{TRANSPORT_LABELS[payload.transport_target]}</span>
         </div>

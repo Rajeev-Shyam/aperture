@@ -539,6 +539,7 @@ pub async fn list_suggestion_history(
 pub async fn record_feedback(
     id: String,
     kind: String,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let row_id: i64 = id.parse().map_err(|_| format!("bad suggestion id: {id}"))?;
@@ -551,6 +552,13 @@ pub async fn record_feedback(
         ),
         "dismissed" => (
             aperture_pattern_engine::FeedbackEvent::Dismissed,
+            "UPDATE suggestions SET state='dismissed', resolved_ts=?2 WHERE id=?1",
+            true,
+        ),
+        // Explicit "Mute this pattern" (doc 11 §3): the row resolves as
+        // dismissed; the engine jumps the ladder straight to the 7-day mute.
+        "muted" => (
+            aperture_pattern_engine::FeedbackEvent::Muted,
             "UPDATE suggestions SET state='dismissed', resolved_ts=?2 WHERE id=?1",
             true,
         ),
@@ -589,6 +597,17 @@ pub async fn record_feedback(
     if let Some(pid) = pattern_id {
         let _ = state.feedback_tx.send((pid, fb)); // task gone = shutdown; fine
     }
+    // Terminal transitions broadcast so EVERY overlay window converges — a
+    // dismissal on one monitor removed the bubble there only, leaving live
+    // clones on the others (2026-08-15 review). The originating window applies
+    // the same state locally first; re-applying is idempotent.
+    if matches!(kind.as_str(), "clicked" | "dismissed" | "muted" | "expired") {
+        let lifecycle_state = if kind == "muted" { "dismissed" } else { kind.as_str() };
+        let _ = crate::events::emit_suggestion_lifecycle(
+            &app,
+            &serde_json::json!({ "id": id, "state": lifecycle_state }),
+        );
+    }
     Ok(())
 }
 
@@ -609,6 +628,13 @@ pub async fn set_snooze(mode: String, state: State<'_, AppState>) -> Result<(), 
         .snooze_until
         .store(until, std::sync::atomic::Ordering::SeqCst);
     Ok(())
+}
+
+/// Read the global snooze deadline (epoch ms; `0` = off, `i64::MAX` = until
+/// re-enabled) — backs the HUD's 🔕 control so it can render the truth.
+#[tauri::command]
+pub async fn get_snooze(state: State<'_, AppState>) -> Result<i64, String> {
+    Ok(state.snooze_until.load(std::sync::atomic::Ordering::SeqCst))
 }
 
 /// Return the currently-renderable bubbles for the overlay (doc 11 §3).
@@ -633,12 +659,16 @@ pub async fn list_suggestions(
         .db
         .with_conn(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, title, glyph, confidence, connector_id \
+                "SELECT id, title, glyph, confidence, connector_id, source \
                  FROM suggestions WHERE state IN ('queued','shown') \
                  ORDER BY shown_ts DESC LIMIT 16",
             )?;
             let rows = stmt.query_map([], |row| {
                 let id: i64 = row.get(0)?;
+                let source = match row.get::<_, Option<String>>(5)?.as_deref() {
+                    Some("claude") => SuggestionSource::Claude,
+                    _ => SuggestionSource::Local,
+                };
                 Ok(BubbleSpecEnvelope {
                     id: id.to_string(),
                     spec: BubbleSpec {
@@ -646,7 +676,7 @@ pub async fn list_suggestions(
                         glyph: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
                         sublabel: None,
                         action_ref: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                        source: SuggestionSource::Local,
+                        source,
                         confidence: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
                     },
                 })
@@ -817,7 +847,8 @@ pub async fn request_preview(
         .with_conn(|c| {
             let mut stmt = c.prepare(
                 "SELECT ts, type, app, window_title FROM events \
-                 WHERE redaction_flags = 0 AND type NOT IN ('capture_toggle','cloud_send') \
+                 WHERE redaction_flags = 0 \
+                   AND type NOT IN ('capture_toggle','cloud_send','mcp_search') \
                  ORDER BY ts DESC LIMIT 50",
             )?;
             let rows = stmt.query_map([], |r| {
@@ -868,6 +899,74 @@ pub async fn request_preview(
         aperture_reasoning_gateway::preview::PreviewSession::new(payload.clone()),
     );
     Ok(payload)
+}
+
+/// The event-trail slice for the preview panel's "Add more history" slider
+/// (doc 11 §4, ADR-040/Q71): metadata-only rows from the last `minutes`,
+/// oldest-first, same filters + shape as the trail `request_preview` builds,
+/// capped at EVENT_TRAIL_MAX (50). The panel swaps its `event_trail` item for
+/// this — WYSIWYS: the object on screen is the object that ships, and approval
+/// re-runs redaction over it (doc 13 §5).
+#[tauri::command]
+pub async fn list_trail_events(
+    minutes: u32,
+    state: State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let floor = crate::pipeline::epoch_ms() - minutes as i64 * 60_000;
+    let trail = state
+        .db
+        .with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT ts, type, app, window_title FROM events \
+                 WHERE redaction_flags = 0 AND ts >= ?1 \
+                   AND type NOT IN ('capture_toggle','cloud_send','mcp_search') \
+                 ORDER BY ts DESC LIMIT 50",
+            )?;
+            let rows = stmt.query_map([floor], |r| {
+                Ok(serde_json::json!({
+                    "ts": r.get::<_, i64>(0)?,
+                    "type": r.get::<_, String>(1)?,
+                    "app": r.get::<_, Option<String>>(2)?,
+                    "title": r.get::<_, Option<String>>(3)?,
+                }))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(trail.into_iter().rev().collect())
+}
+
+/// Health of one transport for the preview footer's dot (doc 11 §4) — was a
+/// hardcoded "setup" yellow since M7 (2026-08-15 review). `target` is the
+/// kebab-case wire name the payload carries.
+#[tauri::command]
+pub async fn transport_health(
+    target: String,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    use aperture_contracts::reasoning::Health;
+    use aperture_contracts::TransportId;
+    fn id_matches(id: TransportId, target: &str) -> bool {
+        matches!(
+            (id, target),
+            (TransportId::ClaudeCli, "claude-cli")
+                | (TransportId::ClaudeDesktopMcp, "claude-desktop-mcp")
+                | (TransportId::MessagesApi, "messages-api")
+        )
+    }
+    let health = state
+        .gateway
+        .health_report()
+        .await
+        .into_iter()
+        .find(|(id, _)| id_matches(*id, &target))
+        .map(|(_, h)| h);
+    Ok(match health {
+        Some(Health::Ready) => serde_json::json!({ "kind": "ready" }),
+        Some(Health::NeedsSetup(d)) => serde_json::json!({ "kind": "needs_setup", "detail": d }),
+        Some(Health::Unavailable(d)) => serde_json::json!({ "kind": "unavailable", "detail": d }),
+        None => serde_json::json!({ "kind": "needs_setup", "detail": "transport not configured" }),
+    })
 }
 
 /// The user's configured redaction terms (doc 13 §5 rule 6), from settings.
@@ -979,6 +1078,7 @@ pub async fn preview_cancel(payload_id: Uuid, state: State<'_, AppState>) -> Res
 #[tauri::command]
 pub async fn preview_send(
     payload_id: Uuid,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<StructuredSuggestions, String> {
     let (session, approved_hash) = {
@@ -1008,7 +1108,13 @@ pub async fn preview_send(
         .ok_or_else(|| "preview_send: session cancelled".to_string())?;
 
     match state.gateway.send_with_preview(&approved, true).await {
-        Ok(result) => Ok(result),
+        Ok(result) => {
+            // US3's last leg (doc 09 §4): render the validated response as
+            // bubbles/answer core-side — the panel closes right after Send, so
+            // the returned value alone reached no surface (2026-08-15 review).
+            crate::pipeline::surface_cloud_suggestions(&app, state.inner(), &result);
+            Ok(result)
+        }
         Err(e) => {
             let mut previews = state.previews.lock().await;
             previews.sessions.insert(
@@ -1057,6 +1163,32 @@ pub async fn voice_run_transcript(
         .tx
         .send(crate::voice::VoiceCmd::RunTranscript(transcript))
         .map_err(|_| "voice thread not running".to_string())
+}
+
+/// Dismiss the current voice surface EVERYWHERE (2026-08-15 review): the
+/// surfaces broadcast to every overlay window, so a local-state dismiss left
+/// live clones on the other monitors. Re-broadcasting `hidden` converges them.
+#[tauri::command]
+pub async fn voice_dismiss(app: tauri::AppHandle) -> Result<(), String> {
+    crate::events::emit_voice_surface(&app, &serde_json::json!({ "surface": "hidden" }))
+        .map_err(|e| e.to_string())
+}
+
+/// Give THIS overlay window OS keyboard focus without touching its
+/// click-through styles (2026-08-15 review): non-exclusive panels (preview /
+/// dashboard / privacy) opened without a click — tray, MCP preview_request —
+/// had DOM focus in an unfocused window, so Escape/Tab/typing went to the
+/// user's foreground app until they clicked inside.
+#[tauri::command]
+pub async fn focus_overlay(window: tauri::Window) -> Result<(), String> {
+    window.set_focus().map_err(|e| e.to_string())
+}
+
+/// Open the Activity & Privacy panel on the primary overlay (bubble overflow
+/// "Exclusions…" — works from any monitor's bubble).
+#[tauri::command]
+pub async fn open_privacy(app: tauri::AppHandle) -> Result<(), String> {
+    crate::events::emit_privacy_open(&app).map_err(|e| e.to_string())
 }
 
 /// Voice consent gate (doc 13 §8): PTT requires the explicit mic opt-in AND

@@ -74,18 +74,26 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
                 tauri::async_runtime::spawn(async move {
                     let state = app.state::<AppState>();
                     // First-run must be answered in the overlay's consent flow,
-                    // never bypassed from the tray.
+                    // never bypassed from the tray. Don't just snap the box
+                    // back (that read as "broken", 2026-08-15 review) — raise
+                    // the overlay so the consent dialog is actually seen.
                     if !state.consent.lock().await.state().first_run_completed {
                         let _ = item.set_checked(false);
+                        if let Some(w) = app.get_webview_window(crate::overlay::OVERLAY_LABEL) {
+                            let _ = w.set_focus();
+                        }
                         return;
                     }
                     if let Err(e) =
                         commands::toggle_capture(want, app.clone(), app.state()).await
                     {
                         tracing::error!(%e, "tray capture toggle failed");
-                        // The indicator event reports the real state; also
-                        // revert eagerly so the menu never lies while closed.
-                        let _ = item.set_checked(!want);
+                        // Every error path leaves capture OFF (an ON that
+                        // failed never started; an OFF that failed to persist
+                        // still stopped) — so `false`, not `!want`, is the
+                        // truthful eager state; the indicator listener stays
+                        // authoritative when the next event lands.
+                        let _ = item.set_checked(false);
                     }
                 });
             }
@@ -104,7 +112,32 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
             "quit" => {
                 // Quit ≠ capture off: consent persists, so the next login's
                 // autostart restores capture exactly as the user left it.
-                app.exit(0);
+                //
+                // Reap the GPU sidecars BEFORE exiting: Tauri's exit ends in
+                // process::exit, which runs no Drop impls — kill_on_drop never
+                // fired and llama/whisper survived holding VRAM (2026-08-15
+                // review). The spawn-side Job Object is the hard backstop
+                // (handle close on process death kills the tree); this makes
+                // the normal path orderly and logged. Bounded so a wedged
+                // lifecycle can never hold Quit hostage.
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let cleanup = async {
+                        let state = app.state::<AppState>();
+                        let lifecycle = state.orchestration.lock().await.lifecycle();
+                        let mut lifecycle = lifecycle.lock().await;
+                        if let Err(e) = lifecycle.kill_all_sidecars().await {
+                            tracing::warn!(%e, "sidecar reap on quit failed (Job Object will finish it)");
+                        }
+                    };
+                    if tokio::time::timeout(std::time::Duration::from_secs(3), cleanup)
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!("sidecar reap on quit timed out (Job Object will finish it)");
+                    }
+                    app.exit(0);
+                });
             }
             other => tracing::warn!(id = other, "unknown tray menu id"),
         })

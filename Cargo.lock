@@ -185,6 +185,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "aperture-action-executor"
+version = "0.1.0"
+dependencies = [
+ "aperture-contracts",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+ "uuid",
+ "windows 0.58.0",
+]
+
+[[package]]
+name = "aperture-agent-loop"
+version = "0.1.0"
+dependencies = [
+ "aperture-action-executor",
+ "aperture-contracts",
+ "aperture-screen-serializer",
+ "aperture-task-manager",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "aperture-capture"
 version = "0.1.0"
 dependencies = [
@@ -273,6 +301,7 @@ dependencies = [
  "aperture-suggestion-generator",
  "rusqlite",
  "serde_json",
+ "tokio",
  "uuid",
 ]
 
@@ -336,6 +365,20 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "windows 0.58.0",
+]
+
+[[package]]
+name = "aperture-screen-serializer"
+version = "0.1.0"
+dependencies = [
+ "aperture-contracts",
+ "aperture-privacy",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]
@@ -362,6 +405,20 @@ dependencies = [
  "aperture-contracts",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "aperture-task-manager"
+version = "0.1.0"
+dependencies = [
+ "aperture-contracts",
+ "aperture-db",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

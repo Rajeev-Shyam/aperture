@@ -1,0 +1,24 @@
+[package]
+name = "aperture-action-executor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "v2 agent 'hands' (Doc 22 §3.1, SKELETON): Win32/UIA click/type/launch behind the ActionExecutor seam. UI-only action surface — no filesystem, no registry, no network (locked decision 3; the executor is NOT an emitter). The UIA backend body is the V2-M0 spike (Q-V2-01)."
+
+[dependencies]
+aperture-contracts = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# UIA tree walk + SendInput land with the V2-M0 spike; features are [VERIFY]
+# at spike time (UIAutomationClient interfaces).
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_Accessibility",         # IUIAutomation tree walk (V2-M0)
+    "Win32_UI_Input_KeyboardAndMouse", # SendInput for type/key/click
+    "Win32_UI_WindowsAndMessaging",   # window enumeration / focus
+] }

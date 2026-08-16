@@ -31,7 +31,7 @@
   column-gap: 12px;
   align-items: center;
 
-  background: var(--glass-2); /* rgba(255,255,255,0.10) */
+  background: var(--glass-2); /* near-opaque dark — the fill carries contrast */
   -webkit-backdrop-filter: blur(var(--blur-12)) saturate(var(--saturate));
   backdrop-filter: blur(var(--blur-12)) saturate(var(--saturate));
   border: 1px solid var(--border-hairline);
@@ -77,7 +77,9 @@
   place-items: center;
   font-size: 18px;
   border-radius: var(--radius-12);
-  background: var(--glass-1);
+  /* Light chip ON the dark bubble — --glass-1 here was invisible dark-on-dark
+   * (2026-08-15 review). */
+  background: var(--lift-1);
 }
 .bubble__title {
   grid-area: title;
@@ -113,7 +115,9 @@
 .btn {
   appearance: none;
   border: 1px solid var(--border-hairline);
-  background: var(--glass-1);
+  /* Raised ON a dark surface: light lift tints, not glass fills — the
+   * glass-1→glass-3 delta was imperceptible dark-on-dark (2026-08-15 review). */
+  background: var(--lift-1);
   color: var(--ink-primary);
   border-radius: var(--radius-12);
   padding: 5px 10px;
@@ -127,7 +131,7 @@
     transform var(--dur-120) var(--ease-chrome);
 }
 .btn:hover {
-  background: var(--glass-3);
+  background: var(--lift-2);
   border-color: var(--border-hairline-hover);
 }
 .btn:active {
@@ -144,6 +148,19 @@
 .btn:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
+}
+/* The "useful?" thumbs (SC7 signal, doc 11 §3): quiet until set. */
+.bubble__thumb {
+  font-size: 11px;
+  filter: grayscale(1) opacity(0.7);
+}
+.bubble__thumb:hover {
+  filter: none;
+}
+.bubble__thumb--set {
+  filter: none;
+  background: var(--lift-2);
+  border-color: var(--border-hairline-hover);
 }
 
 /*
@@ -175,7 +192,9 @@
   cursor: pointer;
 }
 .bubble__overflow button:hover {
-  background: var(--glass-3);
+  /* The ⋯ menu is .surface-opaque (dark): only a light tint reads as hover
+   * (2026-08-15 review — glass-3 here was invisible). */
+  background: var(--lift-2);
 }
 
 /* ---- Lifecycle state treatments (doc 14 §4) — opacity/transform only ----- */
@@ -446,6 +465,9 @@ body.gpu-busy .bubble--exit {
   flex-direction: column;
   align-items: flex-start;
   width: 360px;
+  /* Clear the absolutely-positioned × (dashboard.css) — long titles rendered
+   * underneath it and clicks aimed at the title hit Dismiss (2026-08-15 review). */
+  padding-right: 40px;
 }
 .voice__answer-title {
   font-weight: 600;

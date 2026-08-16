@@ -207,6 +207,12 @@ impl VoiceSubsystem {
         self.recorder.as_ref().map(|r| r.elapsed())
     }
 
+    /// Live mic level in `0..=1` for the listening pill's meter, or `None`
+    /// when not recording (2026-08-15 review — the waveform never moved).
+    pub fn live_level(&self) -> Option<f32> {
+        self.recorder.as_ref().map(|r| r.live_level())
+    }
+
     /// Non-blocking drain of the registered chord's press/release queue —
     /// `None` when voice is disabled or no event is pending. The composition
     /// root's voice loop polls this alongside its Win32 message pump.

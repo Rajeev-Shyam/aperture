@@ -40,21 +40,38 @@ impl Token {
     }
 
     /// Inverse of [`encode`](Self::encode): parse one encoded token back into a
-    /// [`Token`]. Fields split on `:`; a `∅` resource decodes to `None`. Because
-    /// `encode` folds any `:`/`⇒` inside a class to `_`, the three coarse fields
-    /// never contain the separator, so the split is unambiguous — the round-trip
-    /// is stable for every class the miner produces. Returns `None` for a string
-    /// that isn't the expected `app:action:resource` shape (a corrupt persisted
-    /// signature, skipped by the hydrate rather than crashing it — CONN-M2).
+    /// [`Token`]. Fields split on `:`; a `∅` resource decodes to `None`. Returns
+    /// `None` for a string that isn't the expected `app:action:resource` shape
+    /// (a corrupt persisted signature, skipped by the hydrate rather than
+    /// crashing it — CONN-M2).
+    ///
+    /// `encode` folds the `:` inside prefixed resource classes (`url:<host>`,
+    /// `doc:<ext>`, `ide:<ext>`) to `_`, so the round-trip MUST restore it —
+    /// without this, every hydrated pattern's consequent came back as e.g.
+    /// `url_docs.rs`, which the connector lookup (`url:`-prefix match) rejected
+    /// forever: after the first app restart no learned browser/doc/IDE pattern
+    /// could ever bubble again (2026-08-15 review — the "zero recommendations"
+    /// root cause). Hosts and extensions never legitimately start with these
+    /// prefixes, so the restoration is unambiguous; DB-persisted signatures keep
+    /// the folded form, which stays byte-stable across this fix.
     pub fn decode(encoded: &str) -> Option<Token> {
         let parts: Vec<&str> = encoded.split(':').collect();
         if parts.len() != 3 {
             return None;
         }
+        let resource_class = (parts[2] != "∅").then(|| {
+            let r = parts[2];
+            for prefix in ["url_", "doc_", "ide_"] {
+                if let Some(rest) = r.strip_prefix(prefix) {
+                    return format!("{}:{rest}", &prefix[..prefix.len() - 1]);
+                }
+            }
+            r.to_string()
+        });
         Some(Token {
             app_class: parts[0].to_string(),
             action: parts[1].to_string(),
-            resource_class: (parts[2] != "∅").then(|| parts[2].to_string()),
+            resource_class,
         })
     }
 }
@@ -95,6 +112,7 @@ pub fn action_of(ty: EventType) -> &'static str {
         EventType::SuggestionDismissed => "suggestion_dismissed",
         EventType::CaptureToggle => "capture_toggle",
         EventType::CloudSend => "cloud_send",
+        EventType::McpSearch => "mcp_search",
     }
 }
 
@@ -108,6 +126,7 @@ fn is_behavioral(ty: EventType) -> bool {
             | EventType::SuggestionDismissed
             | EventType::CaptureToggle
             | EventType::CloudSend
+            | EventType::McpSearch // audit row (ADR-037), never behavior
             | EventType::VoiceUtterance // telemetry role; queried, not mined (doc 07)
     )
 }
@@ -233,6 +252,30 @@ mod tests {
             session_id: None,
             redaction_flags: 0,
         }
+    }
+
+    /// The hydration round-trip (2026-08-15 review, root cause of "zero
+    /// recommendations"): a prefixed resource class must survive
+    /// encode → persist → decode byte-identically as a TOKEN, colon restored.
+    #[test]
+    fn prefixed_resource_classes_survive_the_encode_decode_round_trip() {
+        for resource in ["url:docs.rs", "doc:xlsx", "ide:rs", "youtube", "url:my_host"] {
+            let t = Token {
+                app_class: "browser".into(),
+                action: "navigation".into(),
+                resource_class: Some(resource.into()),
+            };
+            let decoded = Token::decode(&t.encode()).expect("decodes");
+            assert_eq!(
+                decoded.resource_class.as_deref(),
+                Some(resource),
+                "resource class mangled through encode/decode"
+            );
+            // And the encoding itself is stable (persisted signatures keep matching).
+            assert_eq!(decoded.encode(), t.encode());
+        }
+        let none = Token { app_class: "a".into(), action: "focus".into(), resource_class: None };
+        assert_eq!(Token::decode(&none.encode()).expect("decodes").resource_class, None);
     }
 
     #[test]

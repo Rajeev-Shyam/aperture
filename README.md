@@ -31,8 +31,9 @@ Every crate honors these (see [`docs/00-README.md`](docs/00-README.md) §"The th
    pressure. Enforced by the [`orchestration`](crates/orchestration) crate (docs 04, 12).
 2. **The transparency gate.** **Raw user data** leaves only via the
    [`reasoning-gateway`](crates/reasoning-gateway) crate, only after the user
-   approves the **exact serialized payload** (an explicit Send **or** a scoped
-   allow with payload preview + cancel window + audit). That crate is the only
+   approves the **exact serialized payload** with an explicit per-send approval
+   (v1 ships per-send only; ADR-026's scoped allow arrives with v2's per-task
+   approvals — Doc 22 §4.1). That crate is the only
    code that opens application network sockets — including the opt-in,
    off-by-default, **aggregate-only diagnostics** path; the Tauri updater is a
    separate framework path carrying no user data (docs 09, 13; ADR-026/036). A CI

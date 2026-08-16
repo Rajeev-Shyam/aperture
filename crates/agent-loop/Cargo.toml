@@ -1,0 +1,17 @@
+[package]
+name = "aperture-agent-loop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "v2 observe->plan->act controller (Doc 22 §3.3, SKELETON): the task state machine, termination conditions (step cap, error threshold, hard stop), and the loop driver seam. The Claude call rides the EXISTING MCP gate (agent_step as a 5th tool on the live aperture-mcp plumbing — v2 kickoff §1); no new transport."
+
+[dependencies]
+aperture-contracts = { workspace = true }
+aperture-action-executor = { workspace = true }
+aperture-screen-serializer = { workspace = true }
+aperture-task-manager = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }

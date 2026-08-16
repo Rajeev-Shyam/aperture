@@ -52,6 +52,8 @@ pub enum FeedbackEvent {
     ThumbsUp,
     /// Explicit "useful?" 👎 (Q81) — strong penalty + ladder advance.
     ThumbsDown,
+    /// Explicit "Mute this pattern" (doc 11 §3) — straight to the 7-day mute.
+    Muted,
 }
 
 impl From<FeedbackEvent> for feedback::Signal {
@@ -62,6 +64,7 @@ impl From<FeedbackEvent> for feedback::Signal {
             FeedbackEvent::Expired => feedback::Signal::Expired,
             FeedbackEvent::ThumbsUp => feedback::Signal::ThumbsUp,
             FeedbackEvent::ThumbsDown => feedback::Signal::ThumbsDown,
+            FeedbackEvent::Muted => feedback::Signal::Muted,
         }
     }
 }
@@ -375,15 +378,19 @@ impl PatternEngine {
         }
         match fb {
             FeedbackEvent::Clicked | FeedbackEvent::ThumbsUp => self.gate.adapt_cap(true),
-            FeedbackEvent::Dismissed | FeedbackEvent::ThumbsDown => self.gate.adapt_cap(false),
+            FeedbackEvent::Dismissed | FeedbackEvent::ThumbsDown | FeedbackEvent::Muted => {
+                self.gate.adapt_cap(false)
+            }
             FeedbackEvent::Expired => {}
         }
     }
 
     /// Weekly maintenance hook (doc 08 §9): prune signatures with weighted
-    /// support below [`config::PRUNE_SUPPORT_FLOOR`]. Scheduled by the
-    /// orchestrator (doc 12). Returns rows pruned.
-    pub fn prune(&mut self, now_ms: i64) -> usize {
+    /// support below [`config::PRUNE_SUPPORT_FLOOR`]. Returns the pruned
+    /// SIGNATURES so the caller can mirror the deletions to the `patterns`
+    /// table — without the mirror they re-hydrate at the next restart
+    /// (2026-08-15 review: this hook previously had no caller at all).
+    pub fn prune(&mut self, now_ms: i64) -> Vec<String> {
         let mut flat: HashMap<String, (PatternStats, MuteState)> = self
             .patterns
             .iter()
@@ -398,7 +405,7 @@ impl PatternEngine {
                 sigs.retain(|s| s != sig);
             }
         }
-        doomed.len()
+        doomed
     }
 
     /// Rows needing persistence (doc 03 `patterns`); the shell flushes these via

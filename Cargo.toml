@@ -29,6 +29,12 @@ members = [
     "crates/vlm-host",
     "crates/stt-host",
     "crates/gates",
+    # --- v2 agent execution layer (Doc 22) — SKELETON crates, not wired into
+    #     the shell yet; V2-M0 starts with the action-executor spike.
+    "crates/action-executor",
+    "crates/screen-serializer",
+    "crates/agent-loop",
+    "crates/task-manager",
     "src-tauri",
     "xtask",
 ]
@@ -37,7 +43,10 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "Proprietary"
-rust-version = "1.80"
+# 1.89 minimum: crates/db uses std::fs::File::lock (stable 1.89) to guard the
+# one-time SQLCipher migration against a double-launch race. Toolchain is
+# pinned newer in rust-toolchain.toml.
+rust-version = "1.89"
 
 [workspace.dependencies]
 # --- shared internal crates ---
@@ -54,6 +63,11 @@ aperture-orchestration = { path = "crates/orchestration" }
 aperture-reasoning-gateway = { path = "crates/reasoning-gateway" }
 aperture-privacy = { path = "crates/privacy" }
 aperture-voice = { path = "crates/voice" }
+# v2 agent execution layer (Doc 22, skeleton)
+aperture-action-executor = { path = "crates/action-executor" }
+aperture-screen-serializer = { path = "crates/screen-serializer" }
+aperture-agent-loop = { path = "crates/agent-loop" }
+aperture-task-manager = { path = "crates/task-manager" }
 
 # --- third-party (versions are [VERIFY] at build time, doc 00 conventions) ---
 serde = { version = "1", features = ["derive"] }

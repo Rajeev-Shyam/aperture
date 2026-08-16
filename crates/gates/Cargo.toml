@@ -38,6 +38,11 @@ aperture-capture = { workspace = true }
 aperture-event-bus = { workspace = true }
 uuid = { workspace = true }
 
+# SC6 on-target harness (2026-08-15): drives the REAL ModelLifecycle/OsSpawner
+# (async API) and shells out to nvidia-smi/tasklist for measurement. A runtime,
+# not a network crate — the two-emitter rule is untouched.
+tokio = { workspace = true }
+
 [features]
 default = []
 # Forwards to aperture-db's SQLCipher build so `m9_db_is_unreadable_without_the_key`

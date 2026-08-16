@@ -17,6 +17,7 @@ import {
   listEvents,
   listPatterns,
   listSuggestionHistory,
+  recordFeedback,
   setAutostart,
   type DashboardStats,
   type HistoryEvent,
@@ -372,6 +373,16 @@ function SuggestionsTab() {
     void listSuggestionHistory(200).then(setRows).catch((e) => setError(String(e)));
   }, []);
 
+  /** Record a "useful?" rating (SC7's signal) and echo it locally. */
+  async function rate(id: number, kind: "up" | "down") {
+    try {
+      await recordFeedback(String(id), kind);
+      setRows((cur) => cur.map((r) => (r.id === id ? { ...r, useful_rating: kind } : r)));
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
   return (
     <div>
       <h2>Suggestions</h2>
@@ -390,7 +401,26 @@ function SuggestionsTab() {
               <span className="dash__row-type">
                 {s.state ?? "?"}
                 {s.outcome ? ` · ${s.outcome}` : ""}
-                {s.useful_rating ? ` · ${s.useful_rating === "up" ? "👍" : "👎"}` : ""}
+              </span>
+              {/* The "useful?" thumbs (SC7, Q81) — ratable here after the
+                  bubble is gone, so late judgments still count. */}
+              <span className="dash__row-thumbs">
+                <button
+                  className={`dash__thumb ${s.useful_rating === "up" ? "dash__thumb--set" : ""}`}
+                  aria-label="Rate useful"
+                  aria-pressed={s.useful_rating === "up"}
+                  onClick={() => void rate(s.id, "up")}
+                >
+                  👍
+                </button>
+                <button
+                  className={`dash__thumb ${s.useful_rating === "down" ? "dash__thumb--set" : ""}`}
+                  aria-label="Rate not useful"
+                  aria-pressed={s.useful_rating === "down"}
+                  onClick={() => void rate(s.id, "down")}
+                >
+                  👎
+                </button>
               </span>
               {s.shown_ts && <time>{fmtTime(s.shown_ts)}</time>}
             </div>

@@ -29,4 +29,5 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 windows = { version = "0.58", features = [
     "Win32_System_Threading",        # OpenProcess / TerminateProcess
     "Win32_Foundation",              # HANDLE / CloseHandle
+    "Win32_System_JobObjects",       # sidecar tree-kill (KILL_ON_JOB_CLOSE)
 ] }  # [VERIFY] at build time
