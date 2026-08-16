@@ -10,9 +10,10 @@
 //    2. **Declining is a real outcome.** "Not now" completes first-run with
 //       capture OFF — it never re-nags, and it never silently enables anything.
 //
-//  Rendered as OPAQUE chrome, not glass: it is a full-surface takeover, so a
-//  backdrop-filter here would both blow the ≤2 glass budget (doc 14 §5) and cost
-//  the most on the largest area.
+//  Rendered as OPAQUE chrome, not glass: it is the largest surface in the app,
+//  so a backdrop-filter here would both blow the ≤2 glass budget (doc 14 §5)
+//  and cost the most. Non-exclusive since decision #12 — the card owns focus,
+//  not the whole monitor.
 
 import { useEffect, useRef, useState } from "react";
 
@@ -47,7 +48,14 @@ export function FirstRunConsent({ dbEncrypted, onDone }: Props) {
   // `aria-modal` below is a real contract: focus enters here and stays here.
   // No Escape handler — first-run has no safe "dismiss"; the way out is an
   // explicit decision ("Not now" also completes it).
-  const onKeyDown = useModalSurface(rootRef);
+  //
+  // Non-exclusive (decision #12): the card is clickable via its own published
+  // rect and takes OS keyboard focus on mount, but the rest of the monitor
+  // stays click-through — first-run must be prominent, not hold the user's
+  // whole screen hostage. It cannot be missed or half-completed regardless:
+  // it is the ONLY surface the overlay renders until consent completes
+  // (App.tsx), and capture stays OFF until `complete_first_run` (doc 13 §8).
+  const onKeyDown = useModalSurface(rootRef, { exclusive: false });
 
   // Each step swaps the whole <section>, unmounting the button that was just
   // clicked — focus would fall to <body> and a screen reader would announce

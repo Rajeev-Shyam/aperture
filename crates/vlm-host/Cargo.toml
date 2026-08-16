@@ -25,11 +25,15 @@ anyhow = { workspace = true }
 # --- third-party (pinned; [VERIFY] at build time, doc 00 conventions) ---
 # HTTP surface for /infer + /health, and the reverse-proxy client to the
 # llama.cpp server child. [VERIFY] axum vs hyper choice + exact versions at M5.
-axum = "0.7"                                                                   # [VERIFY]
+# "multipart": the frame arrives as one raw multipart part (decision #33), not a
+# JSON number array.
+axum = { version = "0.7", features = ["multipart"] }                           # [VERIFY]
 # CLI arg parsing: --port, --model, --loadout, --llama-bin, --model-dir (doc 04 §3).
 clap = { version = "4", features = ["derive"] }                                # [VERIFY]
 # Client used to forward decoded jobs to the llama.cpp server child over loopback.
 # rustls (not native-tls) avoids an OpenSSL build dep on Windows MSVC.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }  # [VERIFY]
+# "multipart" is test-only: the decision-#33 round-trip test mirrors the
+# orchestration SidecarRunner's multipart client leg.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart"] }  # [VERIFY]
 # Inline the single screenshot as a base64 data URL for the multimodal endpoint.
 base64 = "0.22"                                                                # [VERIFY]

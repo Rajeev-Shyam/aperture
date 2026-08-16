@@ -65,6 +65,21 @@ pub enum GatewayError {
     Validation(#[from] suggestion_validator::ValidationError),
 }
 
+/// The result of a successful Send (decision #41): the validated suggestions plus
+/// whether the `cloud_send` audit row actually persisted. An audit failure never
+/// fails the Send (the bytes already left — reporting the egress as failed would
+/// be a worse lie than a missing row), but it must not be silent either: the
+/// shell surfaces `audit_failure` as a visible UI warning.
+#[derive(Debug)]
+pub struct SendOutcome {
+    /// The re-validated cloud response (doc 09 §4).
+    pub suggestions: StructuredSuggestions,
+    /// `Some(reason)` when the `cloud_send` audit row failed to persist AFTER a
+    /// successful egress — the sole "what left this machine?" trail is missing
+    /// this send (doc 13 §3).
+    pub audit_failure: Option<String>,
+}
+
 /// The reasoning gateway (doc 09 §2). Owns the ordered, swappable transport list
 /// and the single egress chokepoint.
 pub struct Gateway {
@@ -156,7 +171,7 @@ impl Gateway {
         &self,
         payload: &ContextPayload,
         user_approved: bool,
-    ) -> Result<StructuredSuggestions, GatewayError> {
+    ) -> Result<SendOutcome, GatewayError> {
         // INVARIANT (doc 13 §2): the gateway is the ONLY emitter, and it emits ONLY
         // on explicit approval. Both conditions are checked here, before egress.
         if !user_approved || !payload.user_approved {
@@ -170,14 +185,20 @@ impl Gateway {
             .ok_or(GatewayError::NoHealthyTransport)?;
         let used_target = target_of(transport.id());
 
-        // 2. Egress. The approved payload is transmitted here — this is the ONLY
+        // 2. Per-transport HARD cap (decision #42), checked on the transport's
+        //    REAL wire bytes BEFORE any byte moves. Distinct from the 50 KB soft
+        //    preview warning (doc 09 §5); a violation is a hard stop naming the
+        //    transport and the size — never an auto-shrink (decision #40).
+        let wire = transport.wire_bytes(payload);
+        transports::check_hard_cap(transport.id(), wire.len())?;
+
+        // 3. Egress. The approved payload is transmitted here — this is the ONLY
         //    byte-moving call (doc 13 §2).
         let raw = transport.send(payload).await?;
 
-        // 3. Audit AFTER a successful send (bytes actually left — never a phantom
+        // 4. Audit AFTER a successful send (bytes actually left — never a phantom
         //    egress row on a failed send), over the transport's REAL wire bytes so
         //    the recorded SHA-256 matches what egressed (doc 13 §3, preview == wire).
-        let wire = transport.wire_bytes(payload);
         let record = payload_builder::record_cloud_send(payload, &wire, used_target);
         tracing::info!(
             payload_id = %record.payload_id,
@@ -188,16 +209,21 @@ impl Gateway {
         );
         // A failed audit write does NOT fail the Send: the bytes have already
         // left, so erroring here would report a send that happened as one that
-        // did not — a worse lie than a missing row. Surface it loudly instead;
-        // the accountability gap is real and belongs in the log.
-        if let Err(e) = self.audit.record_cloud_send(record) {
-            tracing::error!(%e, "cloud_send audit row FAILED to persist (doc 13 §3) — egress happened, the trail is incomplete");
-        }
+        // did not — a worse lie than a missing row. It propagates on the Ok path
+        // instead (decision #41) so the shell shows a visible warning; the
+        // accountability gap is real and must reach the user, not just the log.
+        let audit_failure = match self.audit.record_cloud_send(record) {
+            Ok(()) => None,
+            Err(e) => {
+                tracing::error!(%e, "cloud_send audit row FAILED to persist (doc 13 §3) — egress happened, the trail is incomplete");
+                Some(e.to_string())
+            }
+        };
 
-        // 4. Re-validate every suggestion against its target connector — the cloud
+        // 5. Re-validate every suggestion against its target connector — the cloud
         //    suggests, only connectors act (doc 09 §4).
         let validated = suggestion_validator::validate(raw, self.connectors.as_ref())?;
-        Ok(validated)
+        Ok(SendOutcome { suggestions: validated, audit_failure })
     }
 }
 
@@ -276,7 +302,8 @@ mod tests {
         );
         let g = gateway(vec![down, ready]);
         let out = g.send_with_preview(&approved_payload(), true).await.unwrap();
-        assert_eq!(out.answer_text.as_deref(), Some("from the ready transport"));
+        assert_eq!(out.suggestions.answer_text.as_deref(), Some("from the ready transport"));
+        assert!(out.audit_failure.is_none(), "the NullAuditSink never fails");
     }
 
     #[tokio::test]
@@ -306,8 +333,8 @@ mod tests {
         };
         let g = gateway(vec![transport(Health::Ready, canned)]);
         let out = g.send_with_preview(&approved_payload(), true).await.unwrap();
-        assert!(out.suggestions.is_empty(), "no connector accepted it");
-        assert!(out.answer_text.unwrap().contains("Open the deploy dashboard"));
+        assert!(out.suggestions.suggestions.is_empty(), "no connector accepted it");
+        assert!(out.suggestions.answer_text.unwrap().contains("Open the deploy dashboard"));
     }
 
     #[tokio::test]
@@ -408,8 +435,9 @@ mod tests {
 
     /// An audit-write failure must not turn a completed Send into a reported
     /// failure — the bytes already left; lying about that is worse than a gap.
+    /// Decision #41: the failure rides the Ok path so the shell can SHOW it.
     #[tokio::test]
-    async fn m9_a_failing_audit_sink_does_not_fail_the_send() {
+    async fn m9_a_failing_audit_sink_does_not_fail_the_send_but_surfaces() {
         use aperture_privacy::audit_log::{AuditSink, CloudSendRecord};
         struct Broken;
         impl AuditSink for Broken {
@@ -423,10 +451,38 @@ mod tests {
         let canned = StructuredSuggestions { suggestions: vec![], answer_text: None };
         let g = gateway(vec![transport(Health::Ready, canned)])
             .with_audit(std::sync::Arc::new(Broken) as std::sync::Arc<dyn AuditSink>);
-        assert!(
-            g.send_with_preview(&approved_payload(), true).await.is_ok(),
-            "egress succeeded; the Send result must reflect that"
+        let out = g
+            .send_with_preview(&approved_payload(), true)
+            .await
+            .expect("egress succeeded; the Send result must reflect that");
+        let reason = out.audit_failure.expect("#41: the audit failure must propagate, not vanish");
+        assert!(reason.contains("disk full"), "carries the sink's reason: {reason}");
+    }
+
+    /// Decision #42: an oversized payload is refused BEFORE any byte moves, with
+    /// an error naming the transport and the size — and never auto-shrunk (#40).
+    #[tokio::test]
+    async fn c42_hard_cap_refuses_oversized_payloads_before_any_egress() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let sent = std::sync::Arc::new(AtomicBool::new(false));
+        let g = Gateway::new(
+            vec![Box::new(Tripwire { sent: std::sync::Arc::clone(&sent) })],
+            Box::new(NoConnectors),
         );
+        // Tripwire reports TransportId::MessagesApi; its default wire_bytes is
+        // the payload serialization — pad one item past the 20 MB API cap.
+        let cap = transports::hard_cap_bytes(aperture_contracts::TransportId::MessagesApi);
+        let mut p = approved_payload();
+        p.items = vec![PayloadItem::UserAddition { text: "x".repeat(cap) }];
+        let err = g.send_with_preview(&p, true).await.unwrap_err();
+        assert!(
+            matches!(err, GatewayError::Transport(TransportError::PayloadTooLarge(_))),
+            "hard-stop error, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("Messages API"), "names the transport: {msg}");
+        assert!(msg.contains(&cap.to_string()), "names the cap: {msg}");
+        assert!(!sent.load(Ordering::SeqCst), "#42: no byte may move on a cap violation");
     }
 
     #[tokio::test]
@@ -529,6 +585,10 @@ mod tests {
             ),
         ]);
         let out = g.send_with_preview(&approved_payload(), true).await.unwrap();
-        assert_eq!(out.answer_text.as_deref(), Some("via push"), "reached the push transport");
+        assert_eq!(
+            out.suggestions.answer_text.as_deref(),
+            Some("via push"),
+            "reached the push transport"
+        );
     }
 }

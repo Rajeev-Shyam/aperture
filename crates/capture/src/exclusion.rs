@@ -5,11 +5,16 @@
 //! **url_pattern** (ADR-040) yields a metadata-only
 //! [`aperture_contracts::Event`] flagged [`redaction_flags::EXCLUDED`]
 //! (doc 13 §4); such events **can never appear in any payload** (doc 13 §2/§4).
-//! **Defaults ship EMPTY** (ADR-029/Q15 — the user chose max control): safety is
-//! restored by the onboarding **detect-and-suggest** flow (scan installed
-//! password managers / banking apps locally, *suggest* exclusions the user
-//! confirms — never auto-excluded) and the one-click "exclude this domain/app"
-//! affordances (ADR-040).
+//! **Defaults are a curated durable seed** (owner decision #20, Doc 24,
+//! 2026-08-16 — supersedes ADR-029/Q15's empty-default posture): on first
+//! launch [`SHIPPED_DEFAULT_RULES`] (password managers + generic banking-style
+//! patterns) is seeded ONCE into the durable `exclusion_list` table, guarded by
+//! the [`EXCLUSION_DEFAULTS_SEEDED_KEY`] settings flag. Seeded rows are
+//! ordinary rows: user-visible, disableable, and permanently deletable in the
+//! exclusion manager — a deleted default never resurrects on a later launch
+//! ([`defaults_needing_seed`]). The onboarding **detect-and-suggest** flow
+//! (suggest-only, never auto-excluded) and the one-click "exclude this
+//! domain/app" affordances (ADR-040) still run ON TOP of the seed.
 //!
 //! Private/incognito browser windows are detected via title-suffix heuristics and
 //! treated as excluded, additionally flagged [`redaction_flags::PRIVATE_WINDOW`]
@@ -131,9 +136,13 @@ impl ExclusionList {
         *self.rules.write().unwrap_or_else(|p| p.into_inner()) = compiled;
     }
 
-    /// The shipped defaults: **EMPTY** (ADR-029/Q15). Sensitive-app protection
-    /// comes from onboarding's detect-and-suggest (user-confirmed, M9/ADR-040),
-    /// never from silent auto-exclusion.
+    /// An **EMPTY** compiled list — the pre-DB bootstrap used by unit tests
+    /// and hardware-less harnesses. Out-of-box protection does NOT live here:
+    /// it ships as the durable [`SHIPPED_DEFAULT_RULES`] seed (decision #20),
+    /// which lands in the `exclusion_list` table and arrives through
+    /// [`rules_from_rows`] like any user rule. This stays empty on purpose: a
+    /// compiled-in list could never be deleted by the user, and would
+    /// resurrect rules they removed.
     pub fn shipped_defaults() -> Self {
         Self::default()
     }
@@ -239,6 +248,91 @@ pub fn rules_from_rows(rows: Vec<(i64, String, String, bool)>) -> Vec<ExclusionR
         .collect()
 }
 
+/// The curated out-of-box seed (owner decision #20, Doc 24, 2026-08-16 —
+/// supersedes ADR-029/Q15's "defaults ship EMPTY" posture): common password
+/// managers plus generic banking-style URL/title patterns. Expressed as the
+/// same `(match_kind, pattern)` pairs the durable `exclusion_list` table
+/// stores, so seeded rows ride the existing add/disable/delete machinery and
+/// appear in the Activity & Privacy manager exactly like user-entered rules —
+/// visible, disableable, and permanently deletable.
+///
+/// Process names are lowercase (process matching is case-insensitive, and
+/// detect-and-suggest's catalogue normalizes the same way); regex kinds
+/// compile case-insensitively. The banking patterns over-match by design
+/// (e.g. any https host containing "bank"): a false hit costs one capture,
+/// never privacy — exclusion may only ever fail closed.
+pub const SHIPPED_DEFAULT_RULES: &[(&str, &str)] = &[
+    // Password managers — desktop apps, by process image name.
+    ("process", "1password.exe"),
+    ("process", "bitwarden.exe"),
+    ("process", "keepass.exe"),
+    ("process", "keepassxc.exe"),
+    ("process", "lastpass.exe"),
+    ("process", "dashlane.exe"),
+    // Proton Pass has shipped under both image names.
+    ("process", "protonpass.exe"),
+    ("process", "proton pass.exe"),
+    // Password managers — web vaults (extension/UIA-sourced URLs traverse the
+    // same gate, FIX 2.2).
+    ("url_pattern", r"^https://([a-z0-9-]+\.)?1password\.(com|ca|eu)/"),
+    ("url_pattern", r"^https://vault\.bitwarden\.(com|eu)/"),
+    ("url_pattern", r"^https://([a-z0-9-]+\.)?lastpass\.com/"),
+    ("url_pattern", r"^https://app\.dashlane\.com/"),
+    ("url_pattern", r"^https://pass\.proton\.me/"),
+    // Generic banking-style patterns: any https host containing "bank", plus
+    // the common online-banking host/path markers, plus the title fallback for
+    // when no URL reaches the gate.
+    ("url_pattern", r"^https://[^/]*bank[^/]*(/|$)"),
+    ("url_pattern", r"^https://[^?#]*(online.?banking|internet.?banking|net.?banking|ebanking)"),
+    ("title_regex", r"\bonline banking\b"),
+];
+
+/// Settings-table key for the one-shot defaults seed (decision #20). Present ⇒
+/// the seed already ran on this install and must never run again — that is
+/// what keeps a default the user deleted from resurrecting. The startup wiring
+/// writes it (`Db::set_setting`) only AFTER every needed row inserted
+/// successfully; an interrupted seed therefore retries next launch, and
+/// [`defaults_needing_seed`] makes that retry idempotent.
+pub const EXCLUSION_DEFAULTS_SEEDED_KEY: &str = "exclusion_defaults_seeded";
+
+/// Which shipped defaults still need inserting — the seeding brain (decision
+/// #20), kept beside the matcher so its semantics are testable without a DB.
+/// `rows` are the raw `exclusion_list` rows — `(id, match_kind, pattern,
+/// enabled)`, the same shape [`rules_from_rows`] takes — INCLUDING disabled
+/// ones.
+///
+/// - **Seed once, never resurrect:** with `already_seeded` (the
+///   [`EXCLUSION_DEFAULTS_SEEDED_KEY`] flag is present) this returns nothing,
+///   so a default the user deleted can never reappear on a later launch.
+/// - **Idempotent retry:** if the seed was interrupted before the flag write,
+///   the next launch retries, but any `(match_kind, pattern)` already present
+///   — enabled OR disabled, compared case-insensitively — is skipped. The
+///   disabled-row skip matters because `Db::add_exclusion_rule` re-enables on
+///   re-add: without it, a retry could silently flip a rule the user had
+///   switched off back on.
+/// - **Never fail open:** seeding is purely additive and runs before the
+///   startup compile; when the caller's own DB read fails it must skip seeding
+///   (keeping every existing row intact), never clear or replace anything.
+pub fn defaults_needing_seed(
+    already_seeded: bool,
+    rows: &[(i64, String, String, bool)],
+) -> Vec<(&'static str, &'static str)> {
+    if already_seeded {
+        return Vec::new();
+    }
+    let existing: std::collections::HashSet<(String, String)> = rows
+        .iter()
+        .map(|(_, kind, pattern, _)| (kind.to_ascii_lowercase(), pattern.to_ascii_lowercase()))
+        .collect();
+    SHIPPED_DEFAULT_RULES
+        .iter()
+        .filter(|(kind, pattern)| {
+            !existing.contains(&(kind.to_ascii_lowercase(), pattern.to_ascii_lowercase()))
+        })
+        .copied()
+        .collect()
+}
+
 /// Validate one `(match_kind, pattern)` pair BEFORE it is persisted (doc 13 §4).
 ///
 /// [`ExclusionList::compile`] fails **open** on a bad regex — it drops that
@@ -294,14 +388,107 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_are_empty_adr_029() {
+    fn compiled_shipped_defaults_stay_empty_seed_is_durable() {
+        // The compiled bootstrap stays EMPTY on purpose: out-of-box protection
+        // ships as the durable seed (decision #20), so the user can disable or
+        // permanently delete every rule. A compiled-in list could do neither —
+        // it would shadow the manager and resurrect deleted rules.
         let list = ExclusionList::shipped_defaults();
-        assert!(list.is_empty(), "ADR-029/Q15: defaults ship EMPTY");
+        assert!(list.is_empty(), "compiled form is empty; protection is the durable seed");
         assert_eq!(
             list.is_excluded(Some("1password.exe"), None, None, None),
             ExclusionVerdict::Allowed,
-            "nothing auto-excluded by default"
+            "nothing is compiled in — seeded rows arrive via rules_from_rows"
         );
+    }
+
+    #[test]
+    fn shipped_default_rules_all_validate_compile_and_match() {
+        // Every seed row must survive the same entry validation user rules get
+        // — `compile` fails open on a bad matcher, so a non-validating default
+        // would ship as a rule the UI lists but which protects nothing.
+        for (kind, pattern) in SHIPPED_DEFAULT_RULES {
+            validate_pattern(kind, pattern)
+                .unwrap_or_else(|e| panic!("shipped default {kind}:{pattern}: {e}"));
+        }
+
+        // Compile through the SAME row pipeline the DB path uses; none may drop.
+        let rows: Vec<(i64, String, String, bool)> = SHIPPED_DEFAULT_RULES
+            .iter()
+            .enumerate()
+            .map(|(i, (k, p))| (i as i64, k.to_string(), p.to_string(), true))
+            .collect();
+        let list = ExclusionList::compile(rules_from_rows(rows));
+        assert_eq!(list.len(), SHIPPED_DEFAULT_RULES.len(), "no default dropped at compile");
+
+        // Spot-check each family's intent.
+        assert!(list.is_excluded(Some("KeePassXC.exe"), None, None, None).is_excluded());
+        assert!(list
+            .is_excluded(Some("chrome.exe"), None, Some("Vault"), Some("https://vault.bitwarden.com/#/login"))
+            .is_excluded());
+        assert!(list
+            .is_excluded(Some("chrome.exe"), None, Some("tab"), Some("https://www.bankofamerica.com/"))
+            .is_excluded());
+        assert!(list
+            .is_excluded(
+                Some("chrome.exe"),
+                None,
+                Some("tab"),
+                Some("https://www.chase.com/personal/online-banking")
+            )
+            .is_excluded());
+        assert!(list
+            .is_excluded(Some("firefox.exe"), None, Some("Online Banking — Acme CU"), None)
+            .is_excluded());
+        // Ordinary work stays untouched.
+        assert_eq!(
+            list.is_excluded(Some("code.exe"), None, Some("main.rs — aperture"), Some("https://docs.rs/regex")),
+            ExclusionVerdict::Allowed
+        );
+    }
+
+    #[test]
+    fn defaults_seed_once_and_never_resurrect() {
+        // Fresh install: no flag, empty table → the full curated set.
+        assert_eq!(defaults_needing_seed(false, &[]).len(), SHIPPED_DEFAULT_RULES.len());
+
+        // The user deletes a default (its row is GONE). With the flag set,
+        // later launches must not bring it back — decision #20's critical
+        // no-resurrection semantic.
+        let after_delete: Vec<(i64, String, String, bool)> = SHIPPED_DEFAULT_RULES
+            .iter()
+            .enumerate()
+            .skip(1)
+            .map(|(i, (k, p))| (i as i64, k.to_string(), p.to_string(), true))
+            .collect();
+        assert!(
+            defaults_needing_seed(true, &after_delete).is_empty(),
+            "a deleted default must stay deleted"
+        );
+        // Even deleting EVERY rule must not re-seed once the flag is set.
+        assert!(
+            defaults_needing_seed(true, &[]).is_empty(),
+            "an emptied rule list must not resurrect the defaults"
+        );
+    }
+
+    #[test]
+    fn interrupted_seed_retry_is_idempotent_and_never_reenables() {
+        // A crash before the flag write retries the seed next launch. Rows
+        // already present are skipped — INCLUDING disabled ones and case
+        // variants — because `Db::add_exclusion_rule` re-enables on re-add,
+        // and a retry must never flip a user-disabled rule back on.
+        let rows = vec![
+            (1_i64, "process".to_string(), "1Password.exe".to_string(), false), // disabled + case-variant
+            (2_i64, "process".to_string(), "bitwarden.exe".to_string(), true),
+        ];
+        let need = defaults_needing_seed(false, &rows);
+        assert_eq!(need.len(), SHIPPED_DEFAULT_RULES.len() - 2);
+        assert!(
+            !need.iter().any(|(k, p)| *k == "process" && p.eq_ignore_ascii_case("1password.exe")),
+            "a disabled default must not be re-added (re-add would re-enable it)"
+        );
+        assert!(!need.iter().any(|(k, p)| *k == "process" && *p == "bitwarden.exe"));
     }
 
     #[test]

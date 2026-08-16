@@ -455,6 +455,17 @@ body.gpu-busy .bubble--exit {
 .voice--pill {
   border-radius: 999px;
 }
+/* Decision #28: the last 5 s before the 30 s PTT force-finalize — the pill
+ * turns urgent and counts down instead of cutting off silently. */
+.voice--urgent {
+  border-color: var(--health-down);
+  box-shadow: var(--shadow-elev), var(--lens-lip), 0 0 0 1px var(--health-down);
+}
+.voice__countdown {
+  color: var(--health-down);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
 .voice--chip {
   border-radius: var(--radius-16);
   flex-wrap: wrap;
@@ -514,6 +525,38 @@ body.gpu-busy .bubble--exit {
   to {
     transform: rotate(360deg);
   }
+}
+
+/* ==========================================================================
+ * Audit-trail failure banners (decision #41) — top-center on the primary
+ * overlay. Opaque, not glass: they carry an error the user must READ, and they
+ * never auto-hide (a gap in the "what left this machine?" trail must not fade
+ * away on its own). Dismiss is the only exit.
+ * ======================================================================== */
+.audit-alerts {
+  position: fixed;
+  top: var(--edge-inset);
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: min(520px, calc(100vw - 2 * var(--edge-inset)));
+}
+.audit-alert {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--health-down);
+  border-radius: var(--radius-12);
+  color: var(--ink-primary);
+  box-shadow: var(--shadow-elev);
+  font-size: 0.85rem;
+  line-height: 1.4;
+}
+.audit-alert__msg {
+  flex: 1;
 }
 
 /* ==========================================================================

@@ -62,9 +62,12 @@ impl PatternStats {
     }
 
     /// Re-base the weighted sums to `now_ms` (decay applied **at read time**,
-    /// build prompt / doc 08 §4) with the sequence half-life.
-    pub fn decayed_to(&self, now_ms: i64) -> PatternStats {
-        let f = recency_weight(now_ms, self.last_updated_ms, config::HALF_LIFE_SEQUENCE_DAYS);
+    /// build prompt / doc 08 §4). `half_life_days` is explicit since decision
+    /// #17 made it a runtime tunable ([`crate::config::EngineConfig`]) — callers
+    /// pass the engine's configured sequence half-life
+    /// (default [`config::HALF_LIFE_SEQUENCE_DAYS`]).
+    pub fn decayed_to(&self, now_ms: i64, half_life_days: f64) -> PatternStats {
+        let f = recency_weight(now_ms, self.last_updated_ms, half_life_days);
         PatternStats {
             weighted_support: self.weighted_support * f,
             antecedent_total: self.antecedent_total * f,
@@ -75,16 +78,16 @@ impl PatternStats {
 
     /// Credit one observed occurrence of this exact n-gram at `now_ms`
     /// (decays the running sums to now, then adds weight 1).
-    pub fn credit_occurrence(&mut self, now_ms: i64) {
-        *self = self.decayed_to(now_ms);
+    pub fn credit_occurrence(&mut self, now_ms: i64, half_life_days: f64) {
+        *self = self.decayed_to(now_ms, half_life_days);
         self.weighted_support += 1.0;
         self.antecedent_total += 1.0;
     }
 
     /// Credit an occurrence of the antecedent that led to a *different*
     /// consequent (the `⇒ *` denominator grows, this row's support doesn't).
-    pub fn credit_antecedent_only(&mut self, now_ms: i64) {
-        *self = self.decayed_to(now_ms);
+    pub fn credit_antecedent_only(&mut self, now_ms: i64, half_life_days: f64) {
+        *self = self.decayed_to(now_ms, half_life_days);
         self.antecedent_total += 1.0;
     }
 
@@ -162,10 +165,11 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
 
 /// Optional semantic assist (doc 08 §5, Q30 unchanged): cosine similarity of the
 /// current context embedding to a pattern's stored centroid may substitute for
-/// one token when it is ≥ [`config::SEMANTIC_SIMILARITY_THRESHOLD`].
-/// `[ASSUMPTION — evaluate at M3]`.
-pub fn semantic_substitutes(query: &[f32], centroid: &[f32]) -> bool {
-    cosine(query, centroid) >= config::SEMANTIC_SIMILARITY_THRESHOLD
+/// one token when it is ≥ `threshold` (the configured
+/// `semantic_similarity_threshold`, default
+/// [`config::SEMANTIC_SIMILARITY_THRESHOLD`]). `[ASSUMPTION — evaluate at M3]`.
+pub fn semantic_substitutes(query: &[f32], centroid: &[f32], threshold: f64) -> bool {
+    cosine(query, centroid) >= threshold
 }
 
 #[cfg(test)]
@@ -186,10 +190,11 @@ mod tests {
     #[test]
     fn incremental_decay_matches_per_occurrence_math() {
         // Two occurrences at t=0 and t=14d, read at t=28d.
+        let h = config::HALF_LIFE_SEQUENCE_DAYS;
         let mut stats = PatternStats::new(0);
-        stats.credit_occurrence(0);
-        stats.credit_occurrence(14 * DAY);
-        let read = stats.decayed_to(28 * DAY);
+        stats.credit_occurrence(0, h);
+        stats.credit_occurrence(14 * DAY, h);
+        let read = stats.decayed_to(28 * DAY, h);
         // Direct sum: 0.5^(28/14) + 0.5^(14/14) = 0.25 + 0.5 = 0.75.
         assert!(
             (read.weighted_support - 0.75).abs() < 1e-9,
@@ -200,9 +205,10 @@ mod tests {
 
     #[test]
     fn confidence_is_conditional_probability() {
+        let h = config::HALF_LIFE_SEQUENCE_DAYS;
         let mut s = PatternStats::new(0);
-        s.credit_occurrence(0); // ant ⇒ cons
-        s.credit_antecedent_only(0); // ant ⇒ other
+        s.credit_occurrence(0, h); // ant ⇒ cons
+        s.credit_antecedent_only(0, h); // ant ⇒ other
         assert!((s.confidence() - 0.5).abs() < 1e-9);
         assert_eq!(PatternStats::new(0).confidence(), 0.0, "cold start = 0");
     }
@@ -244,7 +250,7 @@ mod tests {
         let c = [0.0f32, 1.0, 0.0];
         assert!((cosine(&a, &b) - 1.0).abs() < 1e-9);
         assert!(cosine(&a, &c).abs() < 1e-9);
-        assert!(semantic_substitutes(&a, &b));
-        assert!(!semantic_substitutes(&a, &c));
+        assert!(semantic_substitutes(&a, &b, config::SEMANTIC_SIMILARITY_THRESHOLD));
+        assert!(!semantic_substitutes(&a, &c, config::SEMANTIC_SIMILARITY_THRESHOLD));
     }
 }

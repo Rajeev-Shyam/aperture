@@ -529,6 +529,146 @@ pub async fn list_suggestion_history(
         .map_err(|e| e.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Decision #30 — VLM weight install. The weights (~3.3 GB) cannot ship in the
+// installer; without them the app runs OCR-only. `vlm_status` makes that state
+// visible; `vlm_download` is the ONLY trigger for the fetch — an explicit user
+// click, never automatic (the app's promise: no surprise network activity).
+// ---------------------------------------------------------------------------
+
+/// VLM install status for the Dashboard notice (decision #30): which weight
+/// files are present at the spawner's resolved paths (present = exists at the
+/// settings-declared byte size), and whether a download is running right now.
+#[tauri::command]
+pub async fn vlm_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    use aperture_orchestration::model_fetch::is_present;
+    let loadout = crate::vlm_fetch::loadout_section(&state.db);
+    let items = crate::vlm_fetch::spec_from_settings(&loadout, &state.vlm_fetch);
+    let files: Vec<serde_json::Value> = items
+        .iter()
+        .map(|i| {
+            serde_json::json!({
+                "file": i.dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+                "expected_bytes": i.expected_bytes,
+                "present": is_present(i),
+            })
+        })
+        .collect();
+    let missing_bytes: u64 = items
+        .iter()
+        .filter(|i| !is_present(i))
+        .map(|i| i.expected_bytes)
+        .sum();
+    Ok(serde_json::json!({
+        "installed": missing_bytes == 0,
+        "downloading": state.vlm_fetch.in_flight.load(std::sync::atomic::Ordering::SeqCst),
+        "missing_bytes": missing_bytes,
+        "files": files,
+    }))
+}
+
+/// Start the user-initiated VLM weight download (decision #30). Streams
+/// progress on the `vlm_fetch` event and returns immediately.
+///
+/// Two-emitter rule note (doc 13 §2): the fetch itself runs in
+/// `aperture_orchestration::model_fetch` — a sanctioned crate. It is model
+/// INGRESS from the settings-declared URL, initiated by this explicit click;
+/// the request carries no user data, so the zero-DATA-egress promise holds.
+/// The shell opens no socket here.
+///
+/// Terminal states are honest: `phase: "done"` means every file verified at
+/// its expected size and the NEXT VLM spawn uses it (the spawner re-reads the
+/// same resolved path — no restart); `phase: "error"` keeps any resumable
+/// `.part` so a retry click continues where it stopped.
+#[tauri::command]
+pub async fn vlm_download(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    let fetch = Arc::clone(&state.vlm_fetch);
+    // Double-start guard: one download at a time; cleared on any terminal state.
+    if fetch
+        .in_flight
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("a VLM download is already running".into());
+    }
+    let loadout = crate::vlm_fetch::loadout_section(&state.db);
+    let items = crate::vlm_fetch::spec_from_settings(&loadout, &fetch);
+    let total: u64 = items.iter().map(|i| i.expected_bytes).sum();
+    if aperture_orchestration::model_fetch::missing(&items).is_empty() {
+        // Already installed (e.g. a stale Dashboard) — terminal, no network.
+        fetch.in_flight.store(false, Ordering::SeqCst);
+        let _ = events::emit_vlm_fetch(
+            &app,
+            &events::VlmFetchPayload {
+                phase: "done".into(),
+                file: None,
+                received_bytes: total,
+                total_bytes: total,
+                error: None,
+            },
+        );
+        return Ok(());
+    }
+    tauri::async_runtime::spawn(async move {
+        // Throttle the WebView stream: first snapshot + every ~8 MB + terminal
+        // — per-chunk emits would flood the IPC channel over a 3.3 GB fetch.
+        const EMIT_STEP_BYTES: u64 = 8 * 1024 * 1024;
+        let mut last_emit: Option<u64> = None;
+        let progress_app = app.clone();
+        let mut on_progress = move |p: aperture_orchestration::model_fetch::FetchProgress| {
+            let due = match last_emit {
+                None => true,
+                Some(last) => p.received_bytes >= last + EMIT_STEP_BYTES,
+            } || p.received_bytes == p.total_bytes;
+            if !due {
+                return;
+            }
+            last_emit = Some(p.received_bytes);
+            let _ = events::emit_vlm_fetch(
+                &progress_app,
+                &events::VlmFetchPayload {
+                    phase: "downloading".into(),
+                    file: Some(p.file),
+                    received_bytes: p.received_bytes,
+                    total_bytes: p.total_bytes,
+                    error: None,
+                },
+            );
+        };
+        let result =
+            aperture_orchestration::model_fetch::fetch_all(&items, &mut on_progress).await;
+        fetch.in_flight.store(false, Ordering::SeqCst);
+        let payload = match result {
+            Ok(()) => {
+                tracing::info!("VLM weights installed — live on the next VLM spawn (decision #30)");
+                events::VlmFetchPayload {
+                    phase: "done".into(),
+                    file: None,
+                    received_bytes: total,
+                    total_bytes: total,
+                    error: None,
+                }
+            }
+            Err(e) => {
+                tracing::error!(%e, "VLM weight download failed (decision #30)");
+                events::VlmFetchPayload {
+                    phase: "error".into(),
+                    file: None,
+                    received_bytes: 0,
+                    total_bytes: total,
+                    error: Some(e.to_string()),
+                }
+            }
+        };
+        let _ = events::emit_vlm_fetch(&app, &payload);
+    });
+    Ok(())
+}
+
 /// Record bubble feedback (doc 08 §7, ADR-040/Q81): update the durable
 /// suggestions row (state/resolved_ts/useful_rating — dismissed bubbles must
 /// not resurrect on a WebView respawn) and forward the signal to the pattern
@@ -717,9 +857,6 @@ pub async fn bubble_click(
     // Reconstruct + dispatch on a blocking thread (ShellExecuteW + fs checks).
     let registry = Arc::clone(&state.connectors);
     let outcome = tokio::task::spawn_blocking(move || -> Result<OpenOutcome, String> {
-        let Some(connector) = registry.by_type(&st.connector_type) else {
-            return Err(format!("unknown connector type: {}", st.connector_type));
-        };
         let now = crate::pipeline::epoch_ms();
         if st.stale_after_ts.is_some_and(|t| t <= now) {
             // The freshness factor should have zeroed this candidate long ago
@@ -728,6 +865,15 @@ pub async fn bubble_click(
                 reason: "captured state is stale (past TTL)".into(),
             });
         }
+        // Path B analog for "switch to X" bubbles (owner decision #15,
+        // 2026-08-16): `app_focus` rows are synthesized by the pattern task
+        // (pipeline.rs), not captured by a connector, so they resolve here.
+        if st.connector_type == "app_focus" {
+            return Ok(open_app_focus(&st));
+        }
+        let Some(connector) = registry.by_type(&st.connector_type) else {
+            return Err(format!("unknown connector type: {}", st.connector_type));
+        };
         match connector.reconstruct(&st) {
             Ok(artifact) => match connector.open(&artifact) {
                 Ok(outcome) => Ok(outcome),
@@ -785,6 +931,36 @@ pub async fn bubble_click(
     Ok(outcome)
 }
 
+/// Dispatch a "switch to X" click (decision #15): hand the stored process name
+/// to `ShellExecuteW("open", …)` through the connectors crate's one dispatch
+/// primitive — the same trust boundary every other bubble click crosses, so the
+/// shell gains no process-spawn API (invariant 2 discipline). The name resolves
+/// via App Paths / PATH; single-instance apps (Slack, Discord, browsers)
+/// self-activate their existing window, others launch fresh. Honest degrade: an
+/// unresolvable name returns `Failed` and the bubble swaps to fallback copy.
+fn open_app_focus(st: &aperture_contracts::ConnectorState) -> OpenOutcome {
+    let Some(process) = st
+        .reconstruct_payload
+        .get("process")
+        .and_then(|v| v.as_str())
+        .filter(|p| !p.trim().is_empty())
+    else {
+        return OpenOutcome::Failed {
+            reason: "app_focus state has no process name".into(),
+        };
+    };
+    // `Url` is the bare ShellExecuteW("open", …) rung — no pre-checks, exactly
+    // what an exe-name dispatch needs.
+    match aperture_connectors::deeplinker::open(&aperture_contracts::ResumeArtifact::Url(
+        process.to_string(),
+    )) {
+        Ok(outcome) => outcome,
+        Err(e) => OpenOutcome::Failed {
+            reason: format!("could not switch to {process}: {e}"),
+        },
+    }
+}
+
 /// How long an abandoned preview session may linger before the next
 /// `request_preview` prunes it (the UI's Cancel path calls `preview_cancel`;
 /// this is the backstop for a crashed WebView).
@@ -836,6 +1012,21 @@ pub async fn request_preview(
             }),
             Ok(None) => tracing::warn!(%action_ref, "preview seed: connector_state row gone"),
             Err(e) => tracing::error!(%e, "preview seed read failed"),
+        }
+    }
+
+    // Voice escalation rides with the recent on-screen text (decision #29):
+    // "ask claude" was transcript-only, which gave Claude the question but not
+    // the screen it was asked about. Same exclusion filter as the trail
+    // (`redaction_flags = 0`, doc 13 §4); the builder's redactor masks the text
+    // BEFORE preview and approval re-runs redaction (doc 13 §5) — the enriched
+    // items ride the identical preview→Send gate, no new egress path. A read
+    // failure soft-degrades (log + transcript/trail only): richer context is an
+    // enrichment, not a precondition.
+    if intent == Intent::AnswerQuery {
+        match recent_ocr_items(&state.db) {
+            Ok(ocr_items) => items.extend(ocr_items),
+            Err(e) => tracing::error!(%e, "escalation OCR context read failed (decision #29)"),
         }
     }
 
@@ -934,6 +1125,44 @@ pub async fn list_trail_events(
         })
         .map_err(|e| e.to_string())?;
     Ok(trail.into_iter().rev().collect())
+}
+
+/// How many recent OCR snapshots ride with a voice escalation, and how much of
+/// each (decision #29). 3 × 2000 chars ≈ 6 KB worst case — far under the 50 KB
+/// preview warning while still carrying the screen(s) the question was about.
+const ESCALATION_OCR_ROWS: u32 = 3;
+const ESCALATION_OCR_CHARS: u32 = 2000;
+
+/// The newest on-screen text for a voice escalation (decision #29):
+/// `screen_context` OCR joined to non-excluded events (`redaction_flags = 0` —
+/// excluded rows can never enter any payload, doc 13 §4), newest first so the
+/// screen the user is looking at leads. The text here is UNredacted by design:
+/// `payload_builder::build` redacts every text item before the preview renders,
+/// and `preview_set_approved` re-runs redaction over the panel's edits
+/// (doc 13 §5) — the same machinery every other payload item goes through.
+fn recent_ocr_items(
+    db: &aperture_db::Db,
+) -> Result<Vec<aperture_contracts::PayloadItem>, aperture_db::DbError> {
+    db.with_conn(|c| {
+        let mut stmt = c.prepare(
+            "SELECT e.id, substr(sc.ocr_text, 1, ?1) \
+             FROM screen_context sc JOIN events e ON e.id = sc.event_id \
+             WHERE e.redaction_flags = 0 AND sc.ocr_text IS NOT NULL \
+               AND length(trim(sc.ocr_text)) > 0 \
+             ORDER BY e.ts DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![ESCALATION_OCR_CHARS, ESCALATION_OCR_ROWS],
+            |r| {
+                Ok(aperture_contracts::PayloadItem::OcrText {
+                    source_event_id: r.get(0)?,
+                    text: r.get(1)?,
+                    redacted: false,
+                })
+            },
+        )?;
+        rows.collect()
+    })
 }
 
 /// Health of one transport for the preview footer's dot (doc 11 §4) — was a
@@ -1108,7 +1337,21 @@ pub async fn preview_send(
         .ok_or_else(|| "preview_send: session cancelled".to_string())?;
 
     match state.gateway.send_with_preview(&approved, true).await {
-        Ok(result) => {
+        Ok(outcome) => {
+            // Decision #41: an audit-write failure after a successful egress
+            // must be VISIBLE — the audit log is the sole record of what left
+            // this machine, and this send is now missing from it. The send
+            // itself stays non-blocking (the bytes already left).
+            if let Some(reason) = &outcome.audit_failure {
+                let _ = crate::events::emit_audit_alert(
+                    &app,
+                    &format!(
+                        "This send reached Claude but was NOT recorded in the audit log \
+                         ({reason}). The \"what left this machine?\" trail is missing this send."
+                    ),
+                );
+            }
+            let result = outcome.suggestions;
             // US3's last leg (doc 09 §4): render the validated response as
             // bubbles/answer core-side — the panel closes right after Send, so
             // the returned value alone reached no surface (2026-08-15 review).
@@ -1184,11 +1427,50 @@ pub async fn focus_overlay(window: tauri::Window) -> Result<(), String> {
     window.set_focus().map_err(|e| e.to_string())
 }
 
-/// Open the Activity & Privacy panel on the primary overlay (bubble overflow
-/// "Exclusions…" — works from any monitor's bubble).
+/// Open the Activity & Privacy panel on the CALLING window's monitor (bubble
+/// overflow "Exclusions…", HUD 🛡, dashboard link — decision #13: the click
+/// happened under the cursor, so the calling window is where the user is).
+/// The broadcast closes any copy open on another monitor.
 #[tauri::command]
-pub async fn open_privacy(app: tauri::AppHandle) -> Result<(), String> {
-    crate::events::emit_privacy_open(&app).map_err(|e| e.to_string())
+pub async fn open_privacy(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    crate::events::emit_privacy_open_on(&app, window.label()).map_err(|e| e.to_string())
+}
+
+/// Open the Dashboard on the CALLING window's monitor (HUD ◎ — decision #13).
+/// Same routing rationale + convergence contract as [`open_privacy`]. The tray
+/// and single-instance paths have no calling window and route by cursor
+/// instead (`events::emit_dashboard_open`).
+#[tauri::command]
+pub async fn open_dashboard(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    crate::events::emit_dashboard_open_on(&app, window.label()).map_err(|e| e.to_string())
+}
+
+/// The calling window's Context-Preview panel opened (`open: true`) or closed
+/// (`open: false`) — decision #13. Open registers the window as THE preview
+/// host (core-staged MCP requests route there and queue, never clobbering a
+/// mid-edit review) and broadcasts `preview_claimed` so every other window
+/// folds its copy. Close releases the slot only if this window still holds it,
+/// so a displaced window's teardown can't un-claim its successor.
+#[tauri::command]
+pub async fn set_preview_host(
+    open: bool,
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    host: State<'_, crate::overlay::PreviewHost>,
+) -> Result<(), String> {
+    if open {
+        host.claim(window.label());
+        crate::events::emit_preview_claimed(&app, window.label()).map_err(|e| e.to_string())
+    } else {
+        host.release(window.label());
+        Ok(())
+    }
 }
 
 /// Voice consent gate (doc 13 §8): PTT requires the explicit mic opt-in AND
@@ -1318,4 +1600,79 @@ pub fn persist_autostart(db: &aperture_db::Db, on: bool) -> Result<(), String> {
         .map(|_| ())
     })
     .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aperture_contracts::{Event, EventType, PayloadItem};
+    use aperture_db::{Db, ScreenContextInsert};
+
+    fn insert_screen(db: &Db, ts: i64, text: &str, redaction_flags: u32) -> i64 {
+        let ev = Event {
+            id: 0,
+            ts,
+            r#type: EventType::WindowFocus,
+            app: Some("app".into()),
+            process: None,
+            window_title: None,
+            payload: serde_json::json!({}),
+            connector_id: None,
+            session_id: None,
+            redaction_flags,
+        };
+        let row = ScreenContextInsert {
+            ocr_text: Some(text.to_string()),
+            ocr_confidence: Some(0.9),
+            vlm_summary: None,
+            thumb_phash: None,
+        };
+        db.insert_event_with_context(&ev, Some(&row), None).unwrap()
+    }
+
+    fn texts(items: &[PayloadItem]) -> Vec<&str> {
+        items
+            .iter()
+            .map(|i| match i {
+                PayloadItem::OcrText { text, .. } => text.as_str(),
+                other => panic!("expected only OCR items, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Decision #29: newest first, capped rows, and — non-negotiable — excluded
+    /// rows (`redaction_flags != 0`) can never enter a payload (doc 13 §4).
+    #[test]
+    fn recent_ocr_items_are_newest_first_and_never_excluded_rows() {
+        let db = Db::open_in_memory().unwrap();
+        for (ts, text) in [(1, "one"), (2, "two"), (3, "three"), (4, "four")] {
+            insert_screen(&db, ts, text, 0);
+        }
+        insert_screen(&db, 5, "EXCLUDED", 1); // newest, but excluded
+
+        let items = recent_ocr_items(&db).unwrap();
+        assert_eq!(
+            texts(&items),
+            vec!["four", "three", "two"],
+            "3 newest non-excluded snapshots, newest first"
+        );
+    }
+
+    /// Decision #29: each snapshot is char-capped and blank OCR rows are skipped
+    /// (an empty item would waste one of the 3 slots on nothing).
+    #[test]
+    fn recent_ocr_items_cap_chars_and_skip_blank_rows() {
+        let db = Db::open_in_memory().unwrap();
+        insert_screen(&db, 1, &"y".repeat(3000), 0);
+        insert_screen(&db, 2, "   ", 0); // whitespace-only: skipped
+
+        let items = recent_ocr_items(&db).unwrap();
+        let texts = texts(&items);
+        assert_eq!(texts.len(), 1, "the blank row is skipped");
+        assert_eq!(
+            texts[0].len(),
+            ESCALATION_OCR_CHARS as usize,
+            "snapshot capped at {ESCALATION_OCR_CHARS} chars"
+        );
+    }
 }

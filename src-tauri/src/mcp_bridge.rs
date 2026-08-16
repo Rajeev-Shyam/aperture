@@ -30,8 +30,8 @@ use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
 use aperture_privacy::audit_log::{AuditLog, AuditSink, CloudSendRecord};
 use aperture_reasoning_gateway::transports::mcp::{
-    MCP_PIPE_NAME, TOOL_GET_CONTEXT, TOOL_LIST_RECENT, TOOL_SEARCH_HISTORY,
-    TOOL_SUBMIT_SUGGESTIONS,
+    MCP_PIPE_NAME, MCP_RESULT_MAX_BYTES, TOOL_GET_CONTEXT, TOOL_LIST_RECENT,
+    TOOL_SEARCH_HISTORY, TOOL_SUBMIT_SUGGESTIONS,
 };
 
 use crate::app_state::AppState;
@@ -155,7 +155,7 @@ async fn dispatch(app: &tauri::AppHandle, req: serde_json::Value) -> serde_json:
         .unwrap_or_else(|| serde_json::json!({}));
     let state = app.state::<AppState>();
     let outcome = match name {
-        TOOL_GET_CONTEXT => get_context(&state, &args).await,
+        TOOL_GET_CONTEXT => get_context(app, &state, &args).await,
         TOOL_LIST_RECENT => list_recent(&state).await,
         TOOL_SEARCH_HISTORY => search_history(app, &state, &args).await,
         TOOL_SUBMIT_SUGGESTIONS => submit_suggestions(app, &state, &args).await,
@@ -177,6 +177,7 @@ fn text_result(text: impl Into<String>, is_error: bool) -> serde_json::Value {
 
 /// `aperture_get_context` — release an APPROVED payload, audited + consumed.
 async fn get_context(
+    app: &tauri::AppHandle,
     state: &tauri::State<'_, AppState>,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
@@ -230,6 +231,23 @@ async fn get_context(
             "payload {id} changed after approval — it must be re-approved (doc 13 §3)"
         ));
     }
+    // Decision #42: the MCP transport's hard cap, enforced at the release gate
+    // (this IS where the wire bytes for MCP leave the app). Hard stop, no
+    // auto-shrink (decision #40); the approval is restored so the user can trim
+    // the payload in the preview and approve again.
+    if wire.len() > MCP_RESULT_MAX_BYTES {
+        let bytes = wire.len();
+        previews.sessions.insert(id, session);
+        previews.approved.insert(id, approved_hash);
+        return Ok(text_result(
+            format!(
+                "Payload {id} is {bytes} B — over Claude Desktop (MCP)'s hard cap of \
+                 {MCP_RESULT_MAX_BYTES} B. Nothing was released. Ask the user to trim the \
+                 payload in Aperture's preview and approve it again."
+            ),
+            true,
+        ));
+    }
     // If the release cannot be recorded, it must not happen (doc 13 §3):
     // restore the session so the user's approval isn't silently consumed.
     let audit = AuditLog::new(Arc::clone(&state.db));
@@ -242,6 +260,16 @@ async fn get_context(
     }) {
         previews.sessions.insert(id, session);
         previews.approved.insert(id, approved_hash);
+        // Decision #41: the MCP path fails CLOSED (no egress without an audit
+        // row), but the user must still see WHY nothing released — Claude's
+        // error text alone lands on the other side of the conversation.
+        let _ = events::emit_audit_alert(
+            app,
+            &format!(
+                "Claude Desktop requested an approved payload, but the audit log write \
+                 failed ({e}). The payload was NOT released — nothing left this machine."
+            ),
+        );
         return Err(format!("cloud_send audit write failed — payload NOT released: {e}"));
     }
     tracing::info!(payload_id = %id, bytes = wire.len(), "approved payload released to Claude Desktop (MCP)");

@@ -10,9 +10,6 @@
 //! the 3rd dismiss). ADR-032 makes the cap/sessionization adaptive with bounded
 //! ranges and conservative cold-start defaults.
 
-// TODO(M3): expose these via the settings store so the UI can adjust them live
-// (doc 08 §9); for now they are compile-time constants matching the doc.
-
 /// Trigger rule 1 — score threshold `τ_conf` (doc 08 §6.1, ADR-033: 0.6 ⟶ 0.7 —
 /// fewer, higher-confidence bubbles). `[VERIFY — tuned against SC7 at M3]`.
 pub const TAU_CONF: f64 = 0.7;
@@ -113,3 +110,160 @@ pub const NOVELTY_RECENT_FOCUS_MIN: i64 = 10;
 /// Weekly-prune support threshold (doc 08 §9, Q76: unchanged): signatures with
 /// weighted support below this are pruned to prevent pattern-table bloat.
 pub const PRUNE_SUPPORT_FLOOR: f64 = 0.5;
+
+/// The runtime-tunable subset of the engine's knobs — the `pattern_engine`
+/// settings block (doc 08 §9 "tunables exposed in settings", owner decision #17
+/// 2026-08-16). The compile-time constants above are the DEFAULTS: a missing or
+/// invalid key falls back to its constant, so a partial (or absent) settings
+/// block can never weaken the engine below its shipped posture. The dismissal
+/// ladder / mute / novelty constants stay compile-time on purpose — the settings
+/// block never named them.
+///
+/// `semantic_similarity_threshold` is parsed so the settings shape is honored
+/// in full, but the semantic assist itself (doc 08 §5) is not wired into the
+/// trigger path yet — the value is carried, not consulted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EngineConfig {
+    /// Trigger rule 1 (default [`TAU_CONF`]).
+    pub tau_conf: f64,
+    /// Trigger rule 2 (default [`COLD_START_SUPPORT_FLOOR`]).
+    pub cold_start_support_floor: f64,
+    /// Semantic-assist threshold (default [`SEMANTIC_SIMILARITY_THRESHOLD`]).
+    pub semantic_similarity_threshold: f64,
+    /// Trigger rule 4 base cooldown, minutes (default [`COOLDOWN_MIN`]).
+    pub cooldown_min: i64,
+    /// Adaptive-cap floor (default [`CAP_PER_HOUR_FLOOR`]).
+    pub cap_per_hour_floor: u32,
+    /// Adaptive-cap ceiling (default [`CAP_PER_HOUR_CEILING`]).
+    pub cap_per_hour_ceiling: u32,
+    /// Cold-start cap (default [`CAP_PER_HOUR_DEFAULT`]).
+    pub cap_per_hour_default: u32,
+    /// Sessionizer cold-start gap, minutes (default [`SESSION_GAP_COLD_START_MIN`]).
+    pub session_gap_cold_start_min: i64,
+    /// Sequence-pattern half-life, days (default [`HALF_LIFE_SEQUENCE_DAYS`]).
+    pub half_life_sequence_days: f64,
+    /// Temporal-pattern half-life, days (default [`HALF_LIFE_TEMPORAL_DAYS`]).
+    pub half_life_temporal_days: f64,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            tau_conf: TAU_CONF,
+            cold_start_support_floor: COLD_START_SUPPORT_FLOOR,
+            semantic_similarity_threshold: SEMANTIC_SIMILARITY_THRESHOLD,
+            cooldown_min: COOLDOWN_MIN,
+            cap_per_hour_floor: CAP_PER_HOUR_FLOOR,
+            cap_per_hour_ceiling: CAP_PER_HOUR_CEILING,
+            cap_per_hour_default: CAP_PER_HOUR_DEFAULT,
+            session_gap_cold_start_min: SESSION_GAP_COLD_START_MIN,
+            half_life_sequence_days: HALF_LIFE_SEQUENCE_DAYS,
+            half_life_temporal_days: HALF_LIFE_TEMPORAL_DAYS,
+        }
+    }
+}
+
+impl EngineConfig {
+    /// Parse the `pattern_engine` settings section (the shape seeded from
+    /// `config/settings.default.json`). Every key is optional; a value outside
+    /// its sane range is REJECTED in favor of the constant default (a typo must
+    /// never mean "bubble on everything" — same posture as
+    /// `retention_policy_from_settings`). The cap band is repaired to stay
+    /// ordered: `floor ≤ default ≤ ceiling`, all ≥ 1.
+    pub fn from_settings(section: &serde_json::Value) -> Self {
+        let mut cfg = Self::default();
+        let f64_in = |key: &str, lo: f64, hi: f64, dst: &mut f64| {
+            if let Some(v) = section.get(key).and_then(serde_json::Value::as_f64) {
+                if v > lo && v <= hi {
+                    *dst = v;
+                }
+            }
+        };
+        let i64_pos = |key: &str, dst: &mut i64| {
+            if let Some(v) = section.get(key).and_then(serde_json::Value::as_i64) {
+                if v >= 1 {
+                    *dst = v;
+                }
+            }
+        };
+        f64_in("tau_conf", 0.0, 1.0, &mut cfg.tau_conf);
+        f64_in("cold_start_support_floor", 0.0, 1e6, &mut cfg.cold_start_support_floor);
+        f64_in(
+            "semantic_similarity_threshold",
+            0.0,
+            1.0,
+            &mut cfg.semantic_similarity_threshold,
+        );
+        i64_pos("cooldown_min", &mut cfg.cooldown_min);
+        i64_pos("session_gap_cold_start_min", &mut cfg.session_gap_cold_start_min);
+        f64_in("half_life_sequence_days", 0.0, 3650.0, &mut cfg.half_life_sequence_days);
+        f64_in("half_life_temporal_days", 0.0, 3650.0, &mut cfg.half_life_temporal_days);
+
+        let u32_pos = |key: &str, dst: &mut u32| {
+            if let Some(v) = section.get(key).and_then(serde_json::Value::as_u64) {
+                if v >= 1 {
+                    *dst = v.min(u32::MAX as u64) as u32;
+                }
+            }
+        };
+        u32_pos("cap_per_hour_floor", &mut cfg.cap_per_hour_floor);
+        u32_pos("cap_per_hour_ceiling", &mut cfg.cap_per_hour_ceiling);
+        u32_pos("cap_per_hour_default", &mut cfg.cap_per_hour_default);
+        // Repair the band instead of silently mis-clamping later.
+        cfg.cap_per_hour_ceiling = cfg.cap_per_hour_ceiling.max(cfg.cap_per_hour_floor);
+        cfg.cap_per_hour_default = cfg
+            .cap_per_hour_default
+            .clamp(cfg.cap_per_hour_floor, cfg.cap_per_hour_ceiling);
+        cfg
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absent_or_empty_settings_yield_the_constant_defaults() {
+        let cfg = EngineConfig::from_settings(&serde_json::json!({}));
+        assert_eq!(cfg, EngineConfig::default());
+        assert!((cfg.tau_conf - TAU_CONF).abs() < 1e-12);
+        assert_eq!(cfg.cap_per_hour_default, CAP_PER_HOUR_DEFAULT);
+    }
+
+    #[test]
+    fn present_keys_override_and_absent_keys_keep_defaults() {
+        let cfg = EngineConfig::from_settings(&serde_json::json!({
+            "tau_conf": 0.85,
+            "cooldown_min": 45,
+            "half_life_sequence_days": 21.0
+        }));
+        assert!((cfg.tau_conf - 0.85).abs() < 1e-12);
+        assert_eq!(cfg.cooldown_min, 45);
+        assert!((cfg.half_life_sequence_days - 21.0).abs() < 1e-12);
+        // Untouched keys stay at their constants.
+        assert!((cfg.cold_start_support_floor - COLD_START_SUPPORT_FLOOR).abs() < 1e-12);
+        assert_eq!(cfg.session_gap_cold_start_min, SESSION_GAP_COLD_START_MIN);
+    }
+
+    #[test]
+    fn out_of_range_values_fall_back_instead_of_weakening_the_engine() {
+        let cfg = EngineConfig::from_settings(&serde_json::json!({
+            "tau_conf": 0.0,              // "fire on everything" typo
+            "cooldown_min": -5,           // negative cooldown
+            "half_life_temporal_days": 0  // divide-by-zero bait
+        }));
+        assert_eq!(cfg, EngineConfig::default());
+    }
+
+    #[test]
+    fn cap_band_is_repaired_to_stay_ordered() {
+        let cfg = EngineConfig::from_settings(&serde_json::json!({
+            "cap_per_hour_floor": 6,
+            "cap_per_hour_ceiling": 3,   // crossed band
+            "cap_per_hour_default": 100  // way outside
+        }));
+        assert_eq!(cfg.cap_per_hour_floor, 6);
+        assert_eq!(cfg.cap_per_hour_ceiling, 6, "ceiling lifted to the floor");
+        assert_eq!(cfg.cap_per_hour_default, 6, "default clamped into the band");
+    }
+}

@@ -48,7 +48,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::State;
+use axum::extract::{Multipart, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -106,10 +106,12 @@ pub enum Device {
     Cpu,
 }
 
-/// `POST /transcribe` request body. 16 kHz mono PCM WAV (doc 07 §2; matches
+/// `POST /transcribe` request, decoded from `multipart/form-data` (decision #33:
+/// the WAV rides as ONE raw binary part named `wav` — the JSON number-array
+/// encoding inflated it ~3.6×). 16 kHz mono PCM WAV (doc 07 §2; matches
 /// [`aperture_contracts::GpuJobKind::Stt`]). VAD trimming already happened upstream
 /// in the voice subsystem (doc 07 §2); the host just transcribes what it is given.
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub struct TranscribeRequest {
     /// 16 kHz mono PCM WAV bytes.
     pub wav: Vec<u8>,
@@ -351,10 +353,38 @@ fn confidence_from_body(body: &serde_json::Value) -> f32 {
 /// Shared axum state: the supervised child.
 type AppState = Arc<WhisperChild>;
 
+/// Decode the multipart `POST /transcribe` body (decision #33): one binary part
+/// named `wav` carrying the raw WAV bytes. The orchestration `SidecarRunner` is
+/// the only client and both sides ship together, so this replaced the JSON
+/// number-array encoding outright — no compatibility shim.
+async fn read_transcribe_multipart(
+    mut multipart: Multipart,
+) -> Result<TranscribeRequest, StatusCode> {
+    let mut wav: Option<Vec<u8>> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+    {
+        if field.name() == Some("wav") {
+            wav = Some(
+                field
+                    .bytes()
+                    .await
+                    .map_err(|_| StatusCode::BAD_REQUEST)?
+                    .to_vec(),
+            );
+        }
+    }
+    wav.map(|wav| TranscribeRequest { wav })
+        .ok_or(StatusCode::BAD_REQUEST)
+}
+
 async fn transcribe_handler(
     State(child): State<AppState>,
-    Json(req): Json<TranscribeRequest>,
+    multipart: Multipart,
 ) -> Result<Json<TranscribeResponse>, StatusCode> {
+    let req = read_transcribe_multipart(multipart).await?;
     match child.transcribe(&req).await {
         Ok(resp) => Ok(Json(resp)),
         Err(HostError::BadAudio) => Err(StatusCode::UNPROCESSABLE_ENTITY),
@@ -386,11 +416,10 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/transcribe", post(transcribe_handler))
         .route("/health", get(health_handler))
-        // The WAV rides as a JSON number array (~3.6 chars/byte): axum's 2 MB
-        // default body limit rejected any utterance past ~18 s with a 413 the
-        // caller saw only as SidecarDown (2026-08-15 review, HIGH). 64 MB
-        // covers the 30 s MAX_UTTERANCE ceiling with an order of magnitude to
-        // spare, still loopback-only.
+        // Decision #33: the WAV now arrives as one raw multipart part (no JSON
+        // number-array inflation). The 64 MB ceiling (2026-08-15 review, HIGH)
+        // is kept deliberately — it covers the 30 s MAX_UTTERANCE WAV with
+        // orders of magnitude to spare, still loopback-only.
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(Arc::clone(&child));
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, args.port)).await?;
@@ -447,5 +476,63 @@ mod tests {
     fn missing_text_is_an_empty_transcript_not_an_error() {
         let r = parse_transcription(&serde_json::json!({}), 10).unwrap();
         assert!(r.transcript.is_empty());
+    }
+
+    /// Decision #33 round trip: a WAV posted as multipart — built exactly the
+    /// way orchestration's `SidecarRunner` builds it — must decode
+    /// byte-identically through the real `read_transcribe_multipart` path.
+    /// (The echo route stands in for the whisper child, which tests can't spawn;
+    /// the decode fn IS the production one.)
+    #[tokio::test]
+    async fn transcribe_multipart_round_trips_wav_bytes_byte_identically() {
+        let app = Router::new()
+            .route(
+                "/transcribe",
+                post(|mp: Multipart| async move {
+                    read_transcribe_multipart(mp).await.map(|req| req.wav)
+                }),
+            )
+            .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024));
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // A WAV header plus every byte value, so nothing survives by accident.
+        let mut wav: Vec<u8> = b"RIFF\x00\x00\x00\x00WAVE".to_vec();
+        wav.extend((0u8..=255).cycle().take(4096));
+
+        // The client leg mirrors SidecarRunner's STT arm exactly (field `wav`).
+        let part = reqwest::multipart::Part::bytes(wav.clone())
+            .file_name("audio.wav")
+            .mime_str("audio/wav")
+            .unwrap();
+        let form = reqwest::multipart::Form::new().part("wav", part);
+        let client = reqwest::Client::new();
+        let echoed = client
+            .post(format!("http://127.0.0.1:{port}/transcribe"))
+            .multipart(form)
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(
+            echoed.as_ref(),
+            wav.as_slice(),
+            "byte-identical after the multipart round trip"
+        );
+
+        // A body with no `wav` part is a 400, not a hang or a 500.
+        let bad = reqwest::multipart::Form::new().text("prompt", "not audio");
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/transcribe"))
+            .multipart(bad)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400);
     }
 }

@@ -6,12 +6,15 @@
 //      of the exact bytes, the transport, and the byte count.
 //
 //  Plus the two controls that make the promises actionable: the exclusion list
-//  (add / disable / delete) and Purge All.
+//  (add / disable / delete — including the seeded defaults, decision #20) and
+//  Purge History.
 //
-//  Purge All is irreversible, so it uses a typed confirmation rather than a
+//  Purge History is irreversible, so it uses a typed confirmation rather than a
 //  one-click button — and it never triggers a browser `confirm()`, which would
-//  block the WebView. The panel states plainly what survives a purge, because a
-//  privacy control that quietly keeps data would be the worst possible surprise.
+//  block the WebView. It is deliberately NOT labelled "purge all" (decision
+//  #23): exclusion rules, consent, and 30 days of audit survive, and the panel
+//  states that plainly — a privacy control that quietly keeps data would be the
+//  worst possible surprise.
 //
 //  Opaque chrome, not glass: a full-height side panel would blow the ≤2 glass
 //  budget (doc 14 §5) on the largest surface in the app.
@@ -185,7 +188,8 @@ export function PrivacyPanel({ dbEncrypted, onClose }: Props) {
         <h3>Never capture these</h3>
         {rules.length === 0 && (
           <p className="privacy__note">
-            No exclusions. Nothing is excluded by default — that is your choice to make.
+            No rules — nothing is excluded right now. Deleted rules (including the
+            built-in defaults) never come back on their own.
           </p>
         )}
         <ul className="privacy__rules">
@@ -230,9 +234,9 @@ export function PrivacyPanel({ dbEncrypted, onClose }: Props) {
         </div>
       </section>
 
-      {/* --- Purge All (doc 13 §7) ------------------------------------------ */}
-      <section className="privacy__section privacy__danger" aria-label="Purge all data">
-        <h3>Purge everything</h3>
+      {/* --- Purge History (doc 13 §7) --------------------------------------- */}
+      <section className="privacy__section privacy__danger" aria-label="Purge history">
+        <h3>Purge history</h3>
         <p className="privacy__note">
           Deletes all captured history, patterns, and suggestions, then reclaims the
           disk space. This cannot be undone.
@@ -254,7 +258,7 @@ export function PrivacyPanel({ dbEncrypted, onClose }: Props) {
             onClick={() => void onPurge()}
             disabled={purgeInput !== PURGE_PHRASE}
           >
-            Purge all
+            Purge history
           </button>
         </div>
       </section>

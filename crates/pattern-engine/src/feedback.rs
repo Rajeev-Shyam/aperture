@@ -116,20 +116,29 @@ pub fn apply(stats: &mut PatternStats, mute: &mut MuteState, signal: Signal, now
     }
 }
 
-/// Weekly maintenance (doc 08 §9): prune signatures whose recency-weighted
+/// Maintenance prune (doc 08 §9): prune signatures whose recency-weighted
 /// support has decayed below [`config::PRUNE_SUPPORT_FLOOR`], preventing
 /// pattern-table bloat. Operates on the engine's in-memory cache; the caller
 /// mirrors the deletions to the `patterns` table (doc 03).
+///
+/// **This decay prune is the SOLE owner of `patterns`-row deletion** (owner
+/// decision #18, 2026-08-16): the DB retention job deliberately no longer
+/// age-prunes `patterns` — decay-based pruning strictly dominates the old
+/// 180-day age rule (any row untouched that long has long since decayed under
+/// the floor), and one owner means the two timers can never disagree.
+/// `half_life_days` is the configured sequence half-life (decision #17).
 ///
 /// Returns the pruned signatures.
 pub fn prune_stale_patterns(
     cache: &mut std::collections::HashMap<String, (PatternStats, MuteState)>,
     now_ms: i64,
+    half_life_days: f64,
 ) -> Vec<String> {
     let doomed: Vec<String> = cache
         .iter()
         .filter(|(_, (stats, _))| {
-            stats.decayed_to(now_ms).weighted_support < config::PRUNE_SUPPORT_FLOOR
+            stats.decayed_to(now_ms, half_life_days).weighted_support
+                < config::PRUNE_SUPPORT_FLOOR
         })
         .map(|(sig, _)| sig.clone())
         .collect();
@@ -205,19 +214,20 @@ mod tests {
 
     #[test]
     fn prune_removes_decayed_support() {
+        let h = config::HALF_LIFE_SEQUENCE_DAYS;
         let mut cache = std::collections::HashMap::new();
         let mut strong = PatternStats::new(0);
-        strong.credit_occurrence(0);
-        strong.credit_occurrence(0);
-        strong.credit_occurrence(0); // support 3 at t=0
+        strong.credit_occurrence(0, h);
+        strong.credit_occurrence(0, h);
+        strong.credit_occurrence(0, h); // support 3 at t=0
         let mut weak = PatternStats::new(0);
-        weak.credit_occurrence(0); // support 1 at t=0
+        weak.credit_occurrence(0, h); // support 1 at t=0
 
         cache.insert("strong".to_string(), (strong, MuteState::default()));
         cache.insert("weak".to_string(), (weak, MuteState::default()));
 
         // 28 days later (H=14): strong → 3×0.25 = 0.75 (kept); weak → 0.25 (pruned).
-        let pruned = prune_stale_patterns(&mut cache, 28 * DAY);
+        let pruned = prune_stale_patterns(&mut cache, 28 * DAY, h);
         assert_eq!(pruned, vec!["weak".to_string()]);
         assert!(cache.contains_key("strong"));
     }

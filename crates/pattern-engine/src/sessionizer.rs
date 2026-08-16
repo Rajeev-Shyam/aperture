@@ -32,7 +32,7 @@ const RESERVOIR: usize = 1024;
 const QUANTILE: f64 = 0.99;
 
 /// Tracks the current session boundary by wall-clock gap (doc 08 §3).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Sessionizer {
     /// Current session id; `None` until the first event is seen.
     current_session: Option<i64>,
@@ -44,6 +44,23 @@ pub struct Sessionizer {
     working_gaps: Vec<i64>,
     /// Ring cursor into `working_gaps` once full.
     cursor: usize,
+    /// The cold-start gap (ms) used until the adaptive threshold warms up —
+    /// runtime-tunable via `pattern_engine.session_gap_cold_start_min`
+    /// (decision #17); defaults to [`config::SESSION_GAP_COLD_START_MIN`].
+    cold_start_gap_ms: i64,
+}
+
+impl Default for Sessionizer {
+    fn default() -> Self {
+        Self {
+            current_session: None,
+            last_event_ts: None,
+            next_id: 0,
+            working_gaps: Vec::new(),
+            cursor: 0,
+            cold_start_gap_ms: config::SESSION_GAP_COLD_START_MIN * 60_000,
+        }
+    }
 }
 
 impl Sessionizer {
@@ -64,12 +81,20 @@ impl Sessionizer {
         }
     }
 
+    /// Set the cold-start gap in minutes (decision #17): the pattern task calls
+    /// this when it loads/reloads the `pattern_engine` settings block. Only the
+    /// cold-start default moves — the warmed-up adaptive threshold is the
+    /// user's own gap distribution and stays untouched (ADR-032).
+    pub fn set_cold_start_gap_min(&mut self, minutes: i64) {
+        self.cold_start_gap_ms = minutes.max(1) * 60_000;
+    }
+
     /// The gap (ms) that currently constitutes a session break (ADR-032):
     /// adaptive once warmed up, cold-start default before that, always clamped
     /// to `[MIN_GAP_MS, MAX_GAP_MS]`.
     pub fn current_gap_threshold_ms(&self) -> i64 {
         if self.working_gaps.len() < MIN_SAMPLES {
-            return config::SESSION_GAP_COLD_START_MIN * 60_000;
+            return self.cold_start_gap_ms;
         }
         let mut sorted = self.working_gaps.clone();
         sorted.sort_unstable();
@@ -155,6 +180,15 @@ mod tests {
         let b = s.assign(&ev_at(100 * 60_000));
         let c = s.assign(&ev_at(200 * 60_000));
         assert!(a < b && b < c, "sessions only roll forward (ADR-032)");
+    }
+
+    #[test]
+    fn configured_cold_start_gap_moves_the_boundary() {
+        let mut s = Sessionizer::new();
+        s.set_cold_start_gap_min(5);
+        let a = s.assign(&ev_at(0));
+        let b = s.assign(&ev_at(6 * 60_000)); // > 5 min, < the default 15 min
+        assert_ne!(a, b, "a configured 5 min gap breaks where the default would not (#17)");
     }
 
     #[test]

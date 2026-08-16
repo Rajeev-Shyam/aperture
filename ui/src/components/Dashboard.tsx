@@ -17,12 +17,19 @@ import {
   listEvents,
   listPatterns,
   listSuggestionHistory,
+  onVlmFetch,
   recordFeedback,
   setAutostart,
+  setSettings,
+  vlmDownload,
+  vlmStatus,
   type DashboardStats,
   type HistoryEvent,
   type PatternRow,
   type SuggestionHistoryRow,
+  type VlmFetchEvent,
+  type VlmStatus,
+  type VoiceSettings,
 } from "../lib/ipc";
 import { useDraggable } from "../state/useDraggable";
 import { useModalSurface } from "../state/useModalSurface";
@@ -167,6 +174,7 @@ function OverviewTab() {
         Capture is <strong>{stats.capture_enabled ? "on" : "off"}</strong>. At-rest encryption is{" "}
         <strong>{stats.db_encrypted ? "active" : "not active in this build"}</strong>.
       </p>
+      <VlmSection />
       <label className="dash__setting">
         <input
           type="checkbox"
@@ -188,6 +196,96 @@ function OverviewTab() {
 function spanLabel(s: DashboardStats): string | undefined {
   if (!s.first_event_ts) return undefined;
   return `since ${new Date(s.first_event_ts).toLocaleDateString()}`;
+}
+
+// --- VLM install (decision #30) ---------------------------------------------
+// The ~3.3 GB screen-understanding weights can't ship in the installer, and a
+// machine without them used to degrade to OCR-only SILENTLY. This section makes
+// the state honest: a visible notice + a strictly user-initiated download with
+// real progress. Nothing here runs without the click.
+
+function VlmSection() {
+  const [status, setStatus] = useState<VlmStatus | null>(null);
+  const [fetchEv, setFetchEv] = useState<VlmFetchEvent | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void vlmStatus().then(setStatus).catch((e) => setError(String(e)));
+    let unlisten: (() => void) | undefined;
+    void onVlmFetch((e) => {
+      setFetchEv(e);
+      if (e.phase === "error") setError(e.error ?? "download failed");
+      // Terminal success: re-read so `installed` flips from the file truth.
+      if (e.phase === "done") void vlmStatus().then(setStatus).catch(() => {});
+    }).then((u) => {
+      unlisten = u;
+    });
+    return () => unlisten?.();
+  }, []);
+
+  async function download() {
+    setError(null);
+    setFetchEv(null);
+    try {
+      await vlmDownload();
+      setStatus((s) => (s ? { ...s, downloading: true } : s));
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  if (!status) return null;
+
+  if (status.installed) {
+    return (
+      <p className="dash__facts">
+        Screen understanding (VLM) is <strong>installed</strong>
+        {fetchEv?.phase === "done"
+          ? " — it loads automatically the next time it's needed, no restart."
+          : "."}
+      </p>
+    );
+  }
+
+  const downloading = fetchEv?.phase === "downloading" || (status.downloading && fetchEv?.phase !== "error");
+  if (downloading) {
+    const received = fetchEv?.phase === "downloading" ? fetchEv.received_bytes : 0;
+    const total = fetchEv?.phase === "downloading" ? fetchEv.total_bytes : status.missing_bytes;
+    const pct = total > 0 ? Math.floor((received / total) * 100) : 0;
+    return (
+      <div className="dash__banner dash__vlm">
+        <p>Downloading screen understanding (VLM)…</p>
+        <div
+          className="dash__progress"
+          role="progressbar"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={pct}
+        >
+          <div className="dash__progress-fill" style={{ width: `${pct}%` }} />
+        </div>
+        <p className="dash__progress-label">
+          {pct}% · {fmtBytes(received)} of {fmtBytes(total)}
+          {fetchEv?.phase === "downloading" && fetchEv.file ? ` · ${fetchEv.file}` : ""}
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="dash__banner dash__vlm">
+      <p>
+        <strong>Screen understanding (VLM) is not installed</strong> — Aperture is running in
+        OCR-only mode. Everything still works; on-screen scenes are just read as plain text
+        instead of being understood. The model is a one-time download from Hugging Face and
+        happens only when you click — nothing of yours is uploaded.
+      </p>
+      {error && <p className="dash__error">{error} — the download resumes where it stopped.</p>}
+      <button className="btn btn--primary" onClick={() => void download()}>
+        {error ? "Retry download" : `Download (${fmtBytes(status.missing_bytes)})`}
+      </button>
+    </div>
+  );
 }
 
 // --- History (also serves the Voice tab, filtered) --------------------------
@@ -266,17 +364,34 @@ function HistoryTab({ kind }: { kind: string | null }) {
 
 // --- Voice: consent + how-to + transcripts -----------------------------------
 
+/** Human label for the confirm floor (decision #27). */
+function floorLabel(v: number): string {
+  if (v >= 1) return "always confirm";
+  if (v <= 0) return "never confirm";
+  return `below ${Math.round(v * 100)}% confidence`;
+}
+
 function VoiceTab() {
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const [chord, setChord] = useState<string>("Ctrl+Alt+Space");
+  // null until the settings read lands: the control renders disabled rather
+  // than showing (and potentially persisting over) a value that may be a lie.
+  const [floor, setFloor] = useState<number | null>(null);
+  // The whole voice section, kept so a floor write merges instead of clobbering
+  // ptt_hotkey etc. (set_settings replaces top-level keys wholesale).
+  const voiceSection = useRef<VoiceSettings>({});
   const [error, setError] = useState<string | null>(null);
 
   function refresh() {
     void dashboardStats().then(setStats).catch((e) => setError(String(e)));
     void getSettings()
       .then((s) => {
-        const v = s.voice as { ptt_hotkey?: string } | undefined;
-        if (v?.ptt_hotkey) setChord(v.ptt_hotkey);
+        const v = s.voice ?? {};
+        voiceSection.current = v;
+        if (v.ptt_hotkey) setChord(v.ptt_hotkey);
+        // Clamp for display exactly like the core clamps at read (decision #27).
+        const raw = typeof v.intent_confidence_floor === "number" ? v.intent_confidence_floor : 0.6;
+        setFloor(Math.min(1, Math.max(0, raw)));
       })
       .catch(() => {});
   }
@@ -292,6 +407,15 @@ function VoiceTab() {
     } catch (e) {
       setError(String(e));
     }
+  }
+
+  /** Persist the confirm floor (decision #27): merge into the voice section so
+   *  the write can't drop sibling keys. The core reads it per utterance — the
+   *  change applies to the very next press, no restart. */
+  function updateFloor(v: number) {
+    setFloor(v);
+    voiceSection.current = { ...voiceSection.current, intent_confidence_floor: v };
+    void setSettings({ voice: voiceSection.current }).catch((e) => setError(String(e)));
   }
 
   return (
@@ -314,6 +438,28 @@ function VoiceTab() {
           nothing you say leaves this machine.
         </p>
       )}
+      {/* Confirm-before-acting floor (decision #27): a slider whose top stop is
+          the "always confirm" 1.0 option. */}
+      <label className="dash__setting dash__setting--slider">
+        <input
+          type="range"
+          min={0}
+          max={1}
+          step={0.05}
+          value={floor ?? 0.6}
+          disabled={floor === null}
+          aria-label="Confirmation threshold"
+          onChange={(e) => updateFloor(Number(e.target.value))}
+        />
+        <span>
+          Ask “Did you say…?” {floor === null ? "…" : floorLabel(floor)}
+          <span className="dash__setting-sub">
+            When the transcription is less certain than this, Aperture shows the transcript and
+            waits for you instead of acting. Slide to 100% to always confirm first. Applies to
+            the next press — no restart.
+          </span>
+        </span>
+      </label>
       {error && <p className="dash__error">{error}</p>}
       <HistoryTab kind="voice_utterance" />
     </div>

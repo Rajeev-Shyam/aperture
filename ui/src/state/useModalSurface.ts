@@ -30,11 +30,14 @@ const FOCUSABLE =
  * and cycle Tab within it.
  *
  * `exclusive` (default `true`) additionally makes the WHOLE overlay window
- * accept input for the surface's lifetime — required for a dialog that must be
- * answerable with no prior click (first-run consent). Dismissible panels pass
- * `exclusive: false`: their own rect (published by `useHitTestRects`) makes
- * them clickable, while everywhere OUTSIDE the panel stays click-through to
- * the user's apps — a visible panel must not swallow the rest of the screen.
+ * accept input for the surface's lifetime. No current surface uses it —
+ * first-run was the last and went non-exclusive (decision #12): the
+ * `focusOverlay` path below already makes a surface answerable with no prior
+ * click, so exclusivity is reserved for a future dialog that must also eat
+ * every click on the monitor. Panels pass `exclusive: false`: their own rect
+ * (published by `useHitTestRects`) makes them clickable, while everywhere
+ * OUTSIDE the panel stays click-through to the user's apps — a visible panel
+ * must not swallow the rest of the screen.
  *
  * Returns the `onKeyDown` handler the surface must spread onto its root element.
  */

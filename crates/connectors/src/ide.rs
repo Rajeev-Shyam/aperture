@@ -53,7 +53,12 @@ pub struct ParsedIdeTitle {
 #[derive(Debug, Default, Clone)]
 pub struct IdeConnector;
 
-const TTL_7D: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// Decision #37 (per-connector-type staleness): source files stay resumable
+/// long-term — a file:line in a workspace is a durable target (line drift is
+/// tolerable; the file still opens), and `reconstruct` re-checks existence at
+/// click (gone ⇒ folder degrade). 30 d, up from the flat 7 d the audit flagged,
+/// matching the document connector.
+const TTL_30D: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 impl IdeConnector {
     pub fn new() -> Self {
@@ -171,8 +176,8 @@ impl Connector for IdeConnector {
     }
 
     fn staleness_ttl(&self) -> Duration {
-        // TTL 7 d (doc 10 §5).
-        TTL_7D
+        // Decision #37: per-type TTL — see [`TTL_30D`] for the reasoning.
+        TTL_30D
     }
 
     fn reconstruct(&self, st: &ConnectorState) -> Result<ResumeArtifact, ConnectorError> {
@@ -313,6 +318,8 @@ mod tests {
         let c = IdeConnector::new();
         assert!(c.can_capture(&ev));
         let st = c.capture(&ev).expect("captured");
+        // Decision #37: IDE files get the long 30 d TTL.
+        assert_eq!(st.stale_after_ts, Some(7_000 + 30 * 24 * 60 * 60 * 1000));
         match c.reconstruct(&st).unwrap() {
             ResumeArtifact::ProtocolUri(uri) => {
                 assert!(uri.starts_with("vscode://file/"));

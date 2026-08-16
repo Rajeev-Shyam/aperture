@@ -103,3 +103,24 @@ pub fn natural_key(connector_type: &str, reconstruct_payload: &serde_json::Value
         .and_then(|v| v.as_str())
         .map(str::to_string)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Decision #37: staleness TTLs are per connector *type*, not a flat value —
+    /// media goes stale fastest, files stay resumable longest. Pins the exact
+    /// defaults so a future connector can't silently regress to a flat TTL.
+    #[test]
+    fn staleness_ttls_are_differentiated_by_type() {
+        let reg = default_registry();
+        let ttl = |id: &str| reg.by_type(id).expect(id).staleness_ttl();
+        assert_eq!(ttl("browser"), Duration::from_secs(24 * 60 * 60));
+        assert_eq!(ttl("youtube"), Duration::from_secs(3 * 24 * 60 * 60));
+        assert_eq!(ttl("document"), Duration::from_secs(30 * 24 * 60 * 60));
+        assert_eq!(ttl("ide"), Duration::from_secs(30 * 24 * 60 * 60));
+        // The ordering invariant behind the values.
+        assert!(ttl("browser") < ttl("youtube"));
+        assert!(ttl("youtube") < ttl("document"));
+    }
+}

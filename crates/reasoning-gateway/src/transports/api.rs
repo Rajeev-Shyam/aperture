@@ -28,7 +28,16 @@ use aperture_contracts::{
 };
 
 use crate::suggestion_validator::parse_response;
-use crate::transports::{extract_json, render_prompt, SYSTEM_FRAMING};
+use crate::transports::{check_hard_cap, extract_json, render_prompt, SYSTEM_FRAMING};
+
+/// Hard cap on the serialized request body (decision #42). Source: the Anthropic
+/// Messages API rejects requests whose total body exceeds **32 MB** (Anthropic
+/// API docs, request size limits — researched 2026-08). Base64 inflates any
+/// binary content by ~4/3 and the prompt envelope adds overhead on top of the
+/// payload, so the enforced wire-body cap is 20 MB — comfortable margin under
+/// the 32 MB rejection line. Distinct from the 50 KB soft preview warning
+/// (doc 09 §5); a violation is a hard stop, never an auto-shrink (decision #40).
+pub const API_BODY_MAX_BYTES: usize = 20 * 1024 * 1024;
 
 /// Per-NG8 wire knobs, all sourced from settings — never hard-coded (doc 09 §3).
 #[derive(Debug, Clone)]
@@ -127,6 +136,13 @@ impl ReasoningTransport for ApiTransport {
         // the user message (doc 09 §5). Body built via build_body so wire_bytes and
         // the audited hash are the same bytes.
         let body = self.build_body(payload);
+        // Decision #42 self-guard (mirrors the CLI transport): never open an
+        // HTTPS call the API will reject for size — the gateway also checks
+        // this pre-egress; both share `check_hard_cap` so the boundary is one.
+        let body_len = serde_json::to_vec(&body)
+            .map_err(|e| TransportError::Other(e.to_string()))?
+            .len();
+        check_hard_cap(TransportId::MessagesApi, body_len)?;
 
         let mut req = self
             .http
@@ -156,5 +172,42 @@ impl ReasoningTransport for ApiTransport {
         // One repair round-trip on malformed JSON is possible here (doc 09 §6); left
         // as a [VERIFY] follow-up — the strict-JSON instruction usually suffices.
         parse_response(json).map_err(|_| TransportError::MalformedResponse)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aperture_contracts::{Intent, PayloadItem, TransportTarget};
+
+    /// Decision #42: the transport's own guard refuses an oversized body BEFORE
+    /// any socket opens — the bogus endpoint would fail with a different error
+    /// if the request were ever attempted.
+    #[tokio::test]
+    async fn c42_oversized_body_is_refused_before_any_socket() {
+        let api = ApiTransport::new(
+            ApiSettings {
+                endpoint: "https://invalid.localhost/v1/messages".into(),
+                model: "claude-opus-5".into(),
+                anthropic_version: "2023-06-01".into(),
+                beta_headers: vec![],
+                cache_ttl: "5m".into(),
+                max_tokens: 512,
+            },
+            "key",
+        );
+        let payload = ContextPayload {
+            payload_id: uuid::Uuid::nil(),
+            created_ts: 0,
+            intent: Intent::AnswerQuery,
+            items: vec![PayloadItem::UserAddition { text: "x".repeat(API_BODY_MAX_BYTES) }],
+            redactions: vec![],
+            enrichment_offered: false,
+            transport_target: TransportTarget::MessagesApi,
+            user_approved: true,
+        };
+        let err = api.send(&payload).await.unwrap_err();
+        assert!(matches!(err, TransportError::PayloadTooLarge(_)), "{err:?}");
+        assert!(err.to_string().contains("Messages API"), "names the transport: {err}");
     }
 }
