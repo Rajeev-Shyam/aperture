@@ -62,12 +62,15 @@ pub enum EventType {
     CaptureToggle,
     /// Audit: bytes left the machine (doc 09). Survives Purge All for 30 d.
     CloudSend,
+    /// Audit: a cloud model queried local history over MCP (ADR-037 — every
+    /// search is recorded whether or not it matched). Survives like `CloudSend`.
+    McpSearch,
 }
 
 impl EventType {
     /// All variants — used by the M0 gate test that round-trips every event type
     /// through the schema (doc 16 M0).
-    pub const ALL: [EventType; 13] = [
+    pub const ALL: [EventType; 14] = [
         EventType::WindowFocus,
         EventType::WindowOpen,
         EventType::WindowClose,
@@ -81,5 +84,6 @@ impl EventType {
         EventType::SuggestionDismissed,
         EventType::CaptureToggle,
         EventType::CloudSend,
+        EventType::McpSearch,
     ];
 }

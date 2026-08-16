@@ -36,6 +36,9 @@ pub const DASHBOARD_OPEN: &str = "dashboard_open";
 /// Ask the primary overlay to open the Context-Preview panel for a payload the
 /// core staged (the MCP gated-search flow, ADR-037). Carries the full payload.
 pub const PREVIEW_REQUEST: &str = "preview_request";
+/// Ask the primary overlay to open the Activity & Privacy panel (bubble
+/// overflow "Exclusions…" — the panel exists exactly once, on the primary).
+pub const PRIVACY_OPEN: &str = "privacy_open";
 
 /// The capture-indicator state the overlay/tray render (doc 12 §6).
 /// `Releasing` covers the <3 s toggle-OFF window (doc 12 §6 step 5). Internal
@@ -126,6 +129,13 @@ pub fn emit_preview_request(
     payload: &aperture_contracts::ContextPayload,
 ) -> tauri::Result<()> {
     app.emit_to(crate::overlay::OVERLAY_LABEL, PREVIEW_REQUEST, payload)
+}
+
+/// Ask the primary overlay to open the Activity & Privacy panel (exclusions
+/// manager). Targeted like `dashboard_open` — a broadcast would open one panel
+/// per monitor.
+pub fn emit_privacy_open(app: &AppHandle) -> tauri::Result<()> {
+    app.emit_to(crate::overlay::OVERLAY_LABEL, PRIVACY_OPEN, ())
 }
 
 /// Emit a suggestion-lifecycle transition (doc 11 §3). The matching

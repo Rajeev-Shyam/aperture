@@ -435,6 +435,10 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/infer", post(infer_handler))
         .route("/health", get(health_handler))
+        // The JPEG rides as a JSON number array (~3.6 chars/byte): axum's 2 MB
+        // default body limit 413'd large desktop frames into a silent OCR-only
+        // degrade (2026-08-15 review). 64 MB, loopback-only.
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(Arc::clone(&child));
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, args.port)).await?;
     tracing::info!("aperture-vlm-host listening on 127.0.0.1:{}", args.port);

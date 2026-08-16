@@ -110,6 +110,7 @@ fn run(app: tauri::AppHandle, mut deps: VoiceDeps) {
     let mut warm = PttWarmKeep::new();
     let mut warm_pinned = false;
     let mut last_lapse_check = std::time::Instant::now();
+    let mut last_level_emit = std::time::Instant::now();
 
     loop {
         pump_win32_messages();
@@ -161,6 +162,16 @@ fn run(app: tauri::AppHandle, mut deps: VoiceDeps) {
         if vs.recording_elapsed().is_some_and(|el| el >= MAX_UTTERANCE) {
             tracing::info!("max utterance ceiling hit — finalizing capture");
             finish_utterance(&app, &rt, &mut vs, &deps);
+        }
+
+        // 4b. Live mic level for the listening pill at ~10 Hz — without it the
+        // "waveform" sat frozen for the whole hold, indistinguishable from a
+        // dead mic (2026-08-15 review).
+        if let Some(level) = vs.live_level() {
+            if last_level_emit.elapsed() >= Duration::from_millis(100) {
+                last_level_emit = std::time::Instant::now();
+                emit(&app, serde_json::json!({ "surface": "listening", "level": level }));
+            }
         }
 
         // 5. Warm-keep lapse: the pin drops as presses age out (doc 12 §7).

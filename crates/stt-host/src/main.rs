@@ -386,6 +386,12 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/transcribe", post(transcribe_handler))
         .route("/health", get(health_handler))
+        // The WAV rides as a JSON number array (~3.6 chars/byte): axum's 2 MB
+        // default body limit rejected any utterance past ~18 s with a 413 the
+        // caller saw only as SidecarDown (2026-08-15 review, HIGH). 64 MB
+        // covers the 30 s MAX_UTTERANCE ceiling with an order of magnitude to
+        // spare, still loopback-only.
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(Arc::clone(&child));
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, args.port)).await?;
     tracing::info!("aperture-stt-host listening on 127.0.0.1:{}", args.port);

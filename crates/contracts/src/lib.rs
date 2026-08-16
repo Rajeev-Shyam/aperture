@@ -18,6 +18,7 @@
 //! migration. Because every boundary type lives in this one crate, drift is a
 //! compile error — not a runtime surprise.
 
+pub mod agent;
 pub mod connector;
 pub mod context_payload;
 pub mod event;

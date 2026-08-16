@@ -123,24 +123,59 @@ impl Db {
         // Register sqlite-vec as an auto-extension BEFORE opening, so the
         // migration's `CREATE VIRTUAL TABLE ... USING vec0` works (doc 03 §3).
         let vec_loaded = register_sqlite_vec();
+        // Serialize the one-time migration (and its backup deletion below)
+        // against a concurrent second launch — autostart plus a Start-menu
+        // click at login races two processes through this path before the
+        // single-instance plugin can arbitrate. The OS drops the lock on
+        // process death, so a crash can never wedge it.
+        #[cfg(feature = "sqlcipher")]
+        let _migration_lock = {
+            let lock_path = path.with_extension("db.migrate-lock");
+            let lock = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&lock_path)
+                .map_err(|e| DbError::Io(format!("migration lock open: {e}")))?;
+            lock.lock()
+                .map_err(|e| DbError::Io(format!("migration lock: {e}")))?;
+            lock
+        };
         // An install upgraded from a plaintext build carries a plaintext DB the
         // keyed open below cannot read — convert it in place first (doc 13 §6).
+        // `migrated` = the conversion ran to completion in THIS call.
         #[cfg(feature = "sqlcipher")]
-        migrate_plaintext_if_needed(&path, key)?;
+        let migrated = migrate_plaintext_if_needed(&path, key)?;
         let conn = Connection::open(&path)?;
         // MUST precede every other statement on this connection (doc 13 §6).
         let encrypted = apply_key(&conn, key)?;
         // The keyed open above verified the encrypted file reads back — only
         // now is it safe to drop the plaintext original the migration parked.
+        // Guarded twice (2026-08-15 review, HIGH): delete ONLY when this file is
+        // verifiably the migrated data — the conversion ran in THIS process, or
+        // the file already carries real schema from a prior verified migration
+        // whose backup deletion failed. A freshly-created EMPTY file has no
+        // schema yet (migrations run below), so a bare `bak.exists()` here used
+        // to destroy the only copy of the user's history after a crash between
+        // the migration's two renames.
         #[cfg(feature = "sqlcipher")]
         if encrypted {
             let bak = plaintext_backup_path(&path);
             if bak.exists() {
-                match std::fs::remove_file(&bak) {
-                    Ok(()) => tracing::info!(
-                        "plaintext→SQLCipher migration verified; plaintext original deleted (doc 13 §6)"
-                    ),
-                    Err(e) => tracing::warn!(%e, "plaintext backup could not be deleted — remove it manually"),
+                let schema_objects: i64 = conn
+                    .query_row("SELECT count(*) FROM sqlite_schema", [], |r| r.get(0))
+                    .unwrap_or(0);
+                if migrated || schema_objects > 0 {
+                    match std::fs::remove_file(&bak) {
+                        Ok(()) => tracing::info!(
+                            "plaintext→SQLCipher migration verified; plaintext original deleted (doc 13 §6)"
+                        ),
+                        Err(e) => tracing::warn!(%e, "plaintext backup could not be deleted — remove it manually"),
+                    }
+                } else {
+                    tracing::warn!(
+                        "plaintext backup present but the opened DB is empty — keeping the \
+                         backup; delete it manually only if the history is intact (doc 13 §6)"
+                    );
                 }
             }
         }
@@ -515,20 +550,22 @@ impl Db {
                 // sqlite-vec did not load).
                 let _ = conn.execute(
                     "DELETE FROM ctx_vec WHERE event_id IN \
-                     (SELECT id FROM events WHERE type NOT IN ('capture_toggle','cloud_send') OR ts < ?1)",
+                     (SELECT id FROM events WHERE type NOT IN ('capture_toggle','cloud_send','mcp_search') OR ts < ?1)",
                     [audit_floor],
                 );
                 // Events: everything except audit rows inside the survival window.
                 // `screen_context` cascades (real table, FK ON DELETE CASCADE).
                 let events_deleted = conn.execute(
                     "DELETE FROM events \
-                     WHERE type NOT IN ('capture_toggle','cloud_send') OR ts < ?1",
+                     WHERE type NOT IN ('capture_toggle','cloud_send','mcp_search') OR ts < ?1",
                     [audit_floor],
                 )?;
                 conn.execute_batch(
                     "DELETE FROM suggestions; \
                      DELETE FROM patterns; \
-                     DELETE FROM connector_state;",
+                     DELETE FROM connector_state; \
+                     DELETE FROM task_steps; \
+                     DELETE FROM tasks;",
                 )?;
                 Ok(events_deleted)
             })();
@@ -571,7 +608,7 @@ impl Db {
             let mut stmt = conn.prepare(
                 "SELECT id, ts, type, app, process, window_title, payload, connector_id, \
                         session_id, redaction_flags \
-                 FROM events WHERE type IN ('capture_toggle','cloud_send') \
+                 FROM events WHERE type IN ('capture_toggle','cloud_send','mcp_search') \
                  ORDER BY ts DESC, id DESC LIMIT ?1",
             )?;
             let rows = stmt.query_map([limit], row_to_event)?;
@@ -722,9 +759,30 @@ fn plaintext_backup_path(path: &std::path::Path) -> PathBuf {
 /// [`Db::open_encrypted`]); a crash at any step leaves at least one complete
 /// copy of the data on disk, and re-running the migration cleans up.
 #[cfg(feature = "sqlcipher")]
-fn migrate_plaintext_if_needed(path: &std::path::Path, key: &[u8]) -> Result<(), DbError> {
-    if key.is_empty() || !is_plaintext_sqlite(path)? {
-        return Ok(());
+fn migrate_plaintext_if_needed(path: &std::path::Path, key: &[u8]) -> Result<bool, DbError> {
+    if key.is_empty() {
+        return Ok(false);
+    }
+    // Crash recovery FIRST (2026-08-15 review, HIGH): a crash between the two
+    // renames below leaves no `history.db`, the complete plaintext parked at
+    // the backup path, and the encrypted export stranded at the temp path.
+    // Without this restore the next launch would create a fresh EMPTY DB,
+    // "verify" it trivially, and delete the parked plaintext — the user's
+    // entire history gone with a success log. Restore the plaintext and re-run
+    // the conversion from scratch instead.
+    let bak = plaintext_backup_path(path);
+    if !path.exists() && bak.exists() {
+        tracing::warn!(
+            "interrupted plaintext→SQLCipher migration detected — restoring the \
+             parked plaintext and re-running the conversion (doc 13 §6)"
+        );
+        let _ = std::fs::remove_file(path.with_extension("db.encrypting"));
+        std::fs::rename(&bak, path).map_err(|e| {
+            DbError::Io(format!("could not restore the parked plaintext DB: {e}"))
+        })?;
+    }
+    if !is_plaintext_sqlite(path)? {
+        return Ok(false);
     }
     tracing::info!(
         "plaintext history DB found — converting to SQLCipher in place (doc 13 §6)"
@@ -762,7 +820,7 @@ fn migrate_plaintext_if_needed(path: &std::path::Path, key: &[u8]) -> Result<(),
         let _ = std::fs::rename(&bak, path);
         return Err(DbError::Io(format!("could not activate the encrypted DB: {e}")));
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Does `path` hold a **plaintext** SQLite file? (16-byte header magic.)
@@ -1156,6 +1214,43 @@ mod sqlcipher_tests {
         // A second open is a plain keyed open (no re-migration) and still reads.
         let db = Db::open_encrypted(path, &key).expect("reopen");
         assert!(db.is_encrypted());
+    }
+
+    /// Crash between the migration's two renames (2026-08-15 review, HIGH):
+    /// `history.db` is gone, the full plaintext sits at the backup path, the
+    /// encrypted export at the temp path. The next open must RESTORE and
+    /// re-migrate — never create a fresh empty DB and delete the backup.
+    #[test]
+    fn interrupted_migration_restores_the_parked_plaintext_and_retries() {
+        let dir = std::env::temp_dir().join(format!("aperture-crashwin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("history.db");
+        let bak = plaintext_backup_path(&path);
+        let tmp = path.with_extension("db.encrypting");
+        for f in [&path, &bak, &tmp] {
+            let _ = std::fs::remove_file(f);
+        }
+        // Simulate the crash window: plaintext parked at bak, nothing at path,
+        // a (stale) export at tmp.
+        {
+            let conn = Connection::open(&bak).expect("plaintext create");
+            conn.execute_batch(
+                "CREATE TABLE legacy(v TEXT); INSERT INTO legacy VALUES ('survives');",
+            )
+            .expect("seed");
+        }
+        std::fs::write(&tmp, b"stale partial export").expect("stale tmp");
+
+        let key = [9u8; 32];
+        let db = Db::open_encrypted(path.clone(), &key).expect("open restores + migrates");
+        assert!(db.is_encrypted());
+        let v: String = db
+            .with_conn(|c| c.query_row("SELECT v FROM legacy", [], |r| r.get(0)))
+            .expect("history must survive the interrupted migration");
+        assert_eq!(v, "survives");
+        drop(db);
+        assert!(!bak.exists(), "backup deleted only after the re-run verified");
+        assert!(!is_plaintext_sqlite(&path).expect("magic"), "file is ciphertext");
     }
 
     /// A wrong key on an already-encrypted file must surface `Decryption`,

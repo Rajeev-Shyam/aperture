@@ -1,0 +1,15 @@
+[package]
+name = "aperture-screen-serializer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "v2 screen-state serializer (Doc 22 §3.2, SKELETON): composes capture/OCR/redaction into the per-step StepPayload Claude receives. Redaction runs on EVERY payload before it is built (v1 pipeline reused); screenshot downscales to 768 px (ADR-032 path). Payload-size limits are Q-V2-02, measured at V2-M1."
+
+[dependencies]
+aperture-contracts = { workspace = true }
+aperture-privacy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+sha2 = "0.10"

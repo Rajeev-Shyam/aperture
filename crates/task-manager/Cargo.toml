@@ -1,0 +1,16 @@
+[package]
+name = "aperture-task-manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "v2 task store (Doc 22 §3.4, SKELETON): CRUD + legal state transitions over the tasks/task_steps tables (migration 0003). Every step row carries the payload hash — the per-task audit trail locked decision 6 requires. Retention: tasks 90 d, steps 30 d (nightly pruner)."
+
+[dependencies]
+aperture-contracts = { workspace = true }
+aperture-db = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+rusqlite = { workspace = true }

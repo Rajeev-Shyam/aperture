@@ -36,6 +36,16 @@ sha2 = "0.10"  # [VERIFY]
 # `uuid` to stamp each assembled ContextPayload with its payload_id (contract 2).
 uuid = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+# aperture-mcp verifies the pipe SERVER is the real aperture.exe before
+# forwarding any tool arguments (anti-squat, 2026-08-15 review): pipe server
+# PID + process image query.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Pipes",       # GetNamedPipeServerProcessId
+    "Win32_System_Threading",   # OpenProcess / QueryFullProcessImageNameW
+] }
+
 [dev-dependencies]
 # The `fakes` feature gives the gateway tests a `FakeTransport` (canned health +
 # response) to exercise fall-through + the egress chokepoint fully offline.

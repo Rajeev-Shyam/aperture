@@ -23,28 +23,35 @@
   --canvas-0: #0b0c0e; /* conceptual base behind glass */
 
   /* Surface fills — rgba alpha, NEVER `opacity`.
-   * DARK, near-opaque glass (2026-08-14, user report): the original white-tint
-   * fills (α 0.06–0.15) put white ink on a white haze — unreadable over any
-   * light window/desktop. Surfaces must be legible on EVERY backdrop, so the
-   * fill carries the contrast itself; the backdrop blur is edge softness, not
-   * the legibility mechanism. */
-  --glass-1: rgba(17, 19, 26, 0.88);
-  --glass-2: rgba(17, 19, 26, 0.92); /* the bubble default fill */
-  --glass-3: rgba(24, 27, 36, 0.95); /* hover lift target */
+   * DARK, effectively-opaque glass (2026-08-14 + 2026-08-15, user reports):
+   * white-tint fills put white ink on a white haze, and even α .88–.92 darks
+   * still let a busy light backdrop bleed through enough to fight the text.
+   * Surfaces must be legible on EVERY backdrop, so the fill carries ALL of the
+   * contrast itself (α ≥ .96); the backdrop blur is edge softness only.
+   * glass-3 is deliberately LIGHTER, not just more opaque — hover/lift must be
+   * a visible fill delta on these dark surfaces (2026-08-15 review). */
+  --glass-1: rgba(13, 15, 20, 0.96); /* inset wells: inputs, item cards, chips */
+  --glass-2: rgba(17, 19, 26, 0.97); /* the bubble/panel default fill */
+  --glass-3: rgba(36, 40, 52, 0.97); /* hover lift target — clearly lighter */
 
-  --border-hairline: rgba(255, 255, 255, 0.08);
-  --border-hairline-hover: rgba(255, 255, 255, 0.2);
+  /* Raised/hover tints for elements sitting ON a dark surface (2026-08-15
+   * review: dark-on-dark hovers were invisible). Light overlays, glass-free. */
+  --lift-1: rgba(255, 255, 255, 0.07);
+  --lift-2: rgba(255, 255, 255, 0.13);
 
-  --ink-primary: rgba(255, 255, 255, 0.92);
-  --ink-secondary: rgba(255, 255, 255, 0.6);
-  --ink-faint: rgba(255, 255, 255, 0.38);
+  --border-hairline: rgba(255, 255, 255, 0.12);
+  --border-hairline-hover: rgba(255, 255, 255, 0.28);
+
+  --ink-primary: rgba(255, 255, 255, 0.95);
+  --ink-secondary: rgba(255, 255, 255, 0.72);
+  --ink-faint: rgba(255, 255, 255, 0.5);
 
   /* Chrome-cyan OKLCH accent. [VERIFY] ramp with real tooling (doc 14 §2). */
   --accent: oklch(0.82 0.1 220);
   --accent-ink: #0b0c0e; /* text on a filled accent chip */
 
   /* Opaque fallback for the degrade-under-load contract (doc 14 §5). */
-  --fallback-opaque: rgba(22, 24, 28, 0.95);
+  --fallback-opaque: rgba(22, 24, 28, 0.98);
 
   /* Health dot states (preview footer, doc 11 §4). */
   --health-ready: var(--accent);

@@ -15,13 +15,17 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
-import type { BubbleLifecycleState } from "../lib/ipc";
+import { openPrivacy, type BubbleLifecycleState } from "../lib/ipc";
 import { DEFAULTS, DwellTimer, type BubbleInstance } from "../state/bubbleLifecycle";
 
 interface Props {
   instance: BubbleInstance;
   onResume: () => void;
   onDismiss: () => void;
+  /** Overflow → "Mute this pattern": 7-day mute + dismiss (doc 08 §7). */
+  onMute: () => void;
+  /** The explicit "useful?" thumbs — the SC7 signal (doc 11 §3, Q81). */
+  onRate: (kind: "up" | "down") => void;
   /** Fired after the exit animation completes — container drops the bubble. */
   onExited: () => void;
   /** Report a self-driven transition (e.g. entering->idle, expired). */
@@ -39,6 +43,8 @@ export function Bubble({
   instance,
   onResume,
   onDismiss,
+  onMute,
+  onRate,
   onExited,
   onLifecycle,
   onAskClaude,
@@ -46,6 +52,8 @@ export function Bubble({
 }: Props) {
   const { spec, state } = instance;
   const [overflowOpen, setOverflowOpen] = useState(false);
+  // Local echo of the "useful?" rating so the pressed thumb stays visibly set.
+  const [rated, setRated] = useState<"up" | "down" | null>(null);
   // The overflow menu is PORTALLED to <body>: `.bubble` sets `contain: strict`
   // (bound rasterization, doc 14 §3), which clips any absolutely-positioned
   // descendant — so an in-tree menu never paints. We render it fixed-positioned
@@ -141,6 +149,30 @@ export function Bubble({
         <button className="btn btn--primary" onClick={onResume}>
           Resume
         </button>
+        {/* The explicit "useful?" thumbs — SC7's data source (doc 11 §3, Q81).
+            Rating does not dismiss: the user judged it, the bubble stays. */}
+        <button
+          className={`btn btn--icon bubble__thumb ${rated === "up" ? "bubble__thumb--set" : ""}`}
+          aria-label="Useful"
+          aria-pressed={rated === "up"}
+          onClick={() => {
+            setRated("up");
+            onRate("up");
+          }}
+        >
+          👍
+        </button>
+        <button
+          className={`btn btn--icon bubble__thumb ${rated === "down" ? "bubble__thumb--set" : ""}`}
+          aria-label="Not useful"
+          aria-pressed={rated === "down"}
+          onClick={() => {
+            setRated("down");
+            onRate("down");
+          }}
+        >
+          👎
+        </button>
         <button className="btn btn--icon" aria-label="Dismiss" onClick={onDismiss}>
           ×
         </button>
@@ -181,8 +213,8 @@ export function Bubble({
               role="menuitem"
               onClick={() => {
                 setOverflowOpen(false);
-                // TODO(M3:) invoke a mute-pattern command (feedback -> doc 08 §7).
-                onDismiss();
+                // Straight to the 7-day mute (doc 08 §7) — no ladder counting.
+                onMute();
               }}
             >
               Mute this pattern
@@ -191,11 +223,13 @@ export function Bubble({
               role="menuitem"
               onClick={() => {
                 setOverflowOpen(false);
-                // TODO(M9:) invoke an exclude-app command (-> exclusion list, doc 13 §4).
-                onDismiss();
+                // Opens the exclusion manager on the primary overlay — the
+                // bubble doesn't know its source process, so the user picks
+                // the app there (doc 13 §4). The bubble stays.
+                void openPrivacy().catch(() => {});
               }}
             >
-              Exclude this app
+              Exclusions…
             </button>
           </div>,
           document.body,

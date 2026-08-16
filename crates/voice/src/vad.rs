@@ -100,7 +100,15 @@ fn speech_threshold(rms: &[f32]) -> f32 {
     let mut sorted = rms.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let floor = sorted[sorted.len() / 5];
-    (floor * SPEECH_OVER_FLOOR_FACTOR).clamp(SPEECH_RMS_FLOOR, SPEECH_RMS_CEILING)
+    let adaptive = (floor * SPEECH_OVER_FLOOR_FACTOR).clamp(SPEECH_RMS_FLOOR, SPEECH_RMS_CEILING);
+    // A continuous quiet utterance may contain no true gap frames: the 20th
+    // percentile is then itself speech, and 3× it can exceed every frame below
+    // the ceiling — rediscarding exactly the quiet-mic speech this gate exists
+    // to keep (2026-08-15 review). Cap the bar at half the utterance's own
+    // loudest frame so the loudest stretches always qualify once they clear
+    // the absolute floor; digital silence stays excluded by the floor.
+    let peak = rms.iter().copied().fold(0.0f32, f32::max);
+    adaptive.min((0.5 * peak).max(SPEECH_RMS_FLOOR))
 }
 
 /// Trim leading/trailing silence (doc 07 §2): find the first and last speech
@@ -165,6 +173,23 @@ mod tests {
         let t = trim(&PcmBuffer { samples }).unwrap();
         assert!(t.speech_ms < MIN_SPEECH_MS, "got {} ms", t.speech_ms);
         assert!(t.is_accidental_tap());
+    }
+
+    /// Quiet mic + continuous talking (no inter-word gap frames): every frame
+    /// sits near RMS ≈ 0.005, far under the 0.012 ceiling. The 3×p20 bar alone
+    /// would call ALL of it silence (2026-08-15 review); the peak-relative cap
+    /// must keep it.
+    #[test]
+    fn continuous_quiet_speech_is_not_discarded() {
+        let n = (TARGET_SAMPLE_RATE as usize * 600) / 1000;
+        // Square wave at amplitude 150/32767 ⇒ frame RMS ≈ 0.0046 throughout.
+        let samples: Vec<i16> = (0..n).map(|i| if i % 2 == 0 { 150 } else { -150 }).collect();
+        let t = trim(&PcmBuffer { samples }).unwrap();
+        assert!(
+            !t.is_accidental_tap(),
+            "600 ms of continuous quiet speech was discarded (speech_ms = {})",
+            t.speech_ms
+        );
     }
 
     #[test]

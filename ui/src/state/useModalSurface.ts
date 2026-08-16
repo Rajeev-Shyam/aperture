@@ -20,7 +20,7 @@
 
 import { useEffect, type RefObject } from "react";
 
-import { setOverlayInteractive } from "../lib/ipc";
+import { focusOverlay, setOverlayInteractive } from "../lib/ipc";
 
 const FOCUSABLE =
   'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
@@ -50,6 +50,13 @@ export function useModalSurface(
       void setOverlayInteractive(true).catch((e) =>
         console.error("overlay did not become interactive; this modal may be unclickable", e),
       );
+    } else {
+      // Non-exclusive panels still need OS keyboard focus: the overlay window
+      // is created focus:false, so DOM focus alone leaves Escape/Tab/typing
+      // going to the user's foreground app until they click inside — panels
+      // opened with no click (tray, MCP preview_request) were keyboard-dead
+      // (2026-08-15 review). Click-through outside the panel is unaffected.
+      void focusOverlay().catch(() => {});
     }
     const opener = document.activeElement as HTMLElement | null;
     ref.current?.focus();

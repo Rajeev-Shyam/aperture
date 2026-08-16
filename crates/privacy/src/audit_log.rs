@@ -58,6 +58,22 @@ pub struct CloudSendRecord {
     pub ts: i64,
 }
 
+/// The structured `mcp_search` audit record (ADR-037): a cloud model ran a
+/// query over local history. Written for EVERY search — hit, miss, or error —
+/// so the trail answers "what has Claude asked about?" even when nothing was
+/// ever staged or released.
+#[derive(Debug, Clone)]
+pub struct McpSearchRecord {
+    /// The verbatim query string the model sent.
+    pub query: String,
+    /// How many rows the retrieval matched (never revealed to the model).
+    pub hit_count: u64,
+    /// The preview session the results were staged under, if any.
+    pub payload_id: Option<uuid::Uuid>,
+    /// epoch milliseconds.
+    pub ts: i64,
+}
+
 impl ToggleReason {
     /// The stable wire string persisted in the audit payload.
     pub fn as_str(self) -> &'static str {
@@ -133,6 +149,32 @@ impl AuditLog {
                 "enabled": rec.enabled,
                 "reason": rec.reason.as_str(),
                 "source": "consent",
+            }),
+            connector_id: None,
+            session_id: None,
+            redaction_flags: 0,
+        };
+        self.db
+            .insert_event(&ev)
+            .map(|_| ())
+            .map_err(|e| PrivacyError::Audit(e.to_string()))
+    }
+
+    /// Record one MCP history search (ADR-037). Called by the bridge for every
+    /// `aperture_search_history` call BEFORE the tool result is returned — an
+    /// audit-write failure means the search must fail, not run unrecorded.
+    pub fn record_mcp_search(&self, rec: McpSearchRecord) -> Result<(), PrivacyError> {
+        let ev = Event {
+            id: 0,
+            ts: rec.ts,
+            r#type: EventType::McpSearch,
+            app: None,
+            process: None,
+            window_title: None,
+            payload: serde_json::json!({
+                "query": rec.query,
+                "hit_count": rec.hit_count,
+                "payload_id": rec.payload_id.map(|id| id.to_string()),
             }),
             connector_id: None,
             session_id: None,

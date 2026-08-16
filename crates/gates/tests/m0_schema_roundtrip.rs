@@ -47,7 +47,7 @@ fn m0_every_event_type_round_trips_through_the_schema() {
     // updated (doc 16 M0 demands *every* type round-trips).
     assert_eq!(
         EventType::ALL.len(),
-        13,
+        14, // +mcp_search (ADR-037 audit row, 2026-08-15)
         "EventType::ALL drifted from the taxonomy in event.rs; update the gate"
     );
 

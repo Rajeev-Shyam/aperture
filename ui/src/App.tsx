@@ -9,17 +9,19 @@
 //  The body stays transparent (doc 11 §2); each surface opts back into pointer
 //  events via `.surface-interactive`.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import {
   getConsent,
   onDashboardOpen,
   onPreviewRequest,
+  onPrivacyOpen,
   onVoiceSurface,
   previewCancel,
   requestPreview,
   resetOverlayInteractivity,
+  voiceDismiss,
   voiceRunTranscript,
   type ConsentState,
   type ContextPayload,
@@ -37,6 +39,7 @@ import { Dashboard } from "./components/Dashboard";
 import { FirstRunConsent } from "./components/FirstRunConsent";
 import { Hud } from "./components/Hud";
 import { PrivacyPanel } from "./components/PrivacyPanel";
+import { SnoozeControl } from "./components/SnoozeControl";
 import { VoiceSurfaces } from "./components/VoiceSurfaces";
 
 // Which monitor's overlay is this root running in? The primary window keeps
@@ -51,6 +54,10 @@ export default function App() {
   // The previewed payload, or null when no panel is open. Editing this object
   // in the panel IS editing what will ship (doc 11 §4 invariant).
   const [preview, setPreview] = useState<ContextPayload | null>(null);
+  // Core-staged payloads that arrived while a panel was already open: they
+  // QUEUE instead of clobbering the user's mid-review edits (2026-08-15
+  // review); each opens when the current panel closes.
+  const previewQueue = useRef<ContextPayload[]>([]);
 
   // Latest voice surface event (listening pill / transcript chip / answer).
   const [voice, setVoice] = useState<VoiceSurfaceEvent>({ surface: "hidden" });
@@ -91,8 +98,24 @@ export default function App() {
       else unlisteners.push(u);
     });
     // The core staged a payload (Claude Desktop's gated search, ADR-037):
-    // open the trust surface on it so the user decides what leaves.
-    void onPreviewRequest((p) => setPreview(p)).then((u) => {
+    // open the trust surface on it so the user decides what leaves. If a panel
+    // is already open (possibly mid-edit), the request queues — the trust
+    // surface must never swap its contents under the user's cursor.
+    void onPreviewRequest((p) => {
+      setPreview((cur) => {
+        if (cur) {
+          previewQueue.current.push(p);
+          return cur;
+        }
+        return p;
+      });
+    }).then((u) => {
+      if (cancelled) u();
+      else unlisteners.push(u);
+    });
+    // A bubble's "Exclusions…" (any monitor) opens the privacy panel here on
+    // the primary (the event is targeted, never broadcast).
+    void onPrivacyOpen(() => setPrivacyOpen(true)).then((u) => {
       if (cancelled) u();
       else unlisteners.push(u);
     });
@@ -125,11 +148,22 @@ export default function App() {
    * Asks the core to BUILD the payload; the returned object is rendered + edited
    * in place. `seedActionRef` ties the preview to the bubble/answer it came from.
    *
+   * An explicit user open REPLACES an open panel — but cancels the displaced
+   * session core-side first, so nothing lingers staged (2026-08-15 review).
+   *
    * TODO(M7:) surface build errors (size warnings come from the panel footer).
    */
   async function openPreview(intent: Intent, seedActionRef?: string): Promise<void> {
     const payload = await requestPreview(intent, seedActionRef);
-    setPreview(payload);
+    setPreview((cur) => {
+      if (cur) void previewCancel(cur.payload_id).catch(() => {});
+      return payload;
+    });
+  }
+
+  /** Close the panel and surface the next queued core-staged request, if any. */
+  function closePreview(): void {
+    setPreview(previewQueue.current.shift() ?? null);
   }
 
   // First run owns the whole overlay: privacy setup precedes every other surface
@@ -156,7 +190,13 @@ export default function App() {
       <VoiceSurfaces
         event={voice}
         onAskClaude={(actionRef) => void openPreview("answer_query", actionRef)}
-        onDismiss={() => setVoice({ surface: "hidden" })}
+        onDismiss={() => {
+          // Hide locally NOW, then converge every monitor's clone through the
+          // core broadcast (2026-08-15 review: local-only dismissal left live
+          // copies on the other overlays).
+          setVoice({ surface: "hidden" });
+          void voiceDismiss().catch(() => {});
+        }}
         onRun={(transcript) => {
           // Re-issue the confirmed transcript through the query path (doc 07
           // §4.4); the resulting answer/empty surface arrives via voice_surface.
@@ -175,6 +215,8 @@ export default function App() {
       <Hud>
         <CaptureIndicator />
         <div className="hud__buttons">
+          {/* Global snooze (doc 11 §6, ADR-040): quiet bubbles, keep learning. */}
+          <SnoozeControl />
           <button
             className="privacy-open"
             aria-label={dashboardOpen ? "Close the Aperture dashboard" : "Open the Aperture dashboard"}
@@ -219,9 +261,10 @@ export default function App() {
           onChange={setPreview}
           onClose={(result) => {
             // Cancel (no result): tell the core to drop its in-process session
-            // — zero residue (doc 13 §3). After a Send the session is consumed.
+            // — zero residue (doc 13 §3). After a Send the session is consumed;
+            // after an MCP approve the panel passes `{}` so the approval stays.
             if (!result) void previewCancel(preview.payload_id).catch(() => {});
-            setPreview(null);
+            closePreview();
           }}
         />
       )}

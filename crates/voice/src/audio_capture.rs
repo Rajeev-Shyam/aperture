@@ -240,6 +240,25 @@ impl Recorder {
         self.started.elapsed()
     }
 
+    /// Live meter for the listening pill (2026-08-15 review — the waveform was
+    /// a dead meter): RMS of the most recent ~100 ms of native audio, mapped to
+    /// a 0..1 display level with a square-root curve so quiet mics (speech at
+    /// ~1 % FS on the dev laptop) still move the bars visibly. `0.0` until the
+    /// first callback delivers audio.
+    pub fn live_level(&self) -> f32 {
+        let Ok(buf) = self.buf.lock() else { return 0.0 };
+        let window = (self.src_rate as usize / 10).max(1) * self.channels.max(1) as usize;
+        let start = buf.len().saturating_sub(window);
+        let tail = &buf[start..];
+        if tail.is_empty() {
+            return 0.0;
+        }
+        let sum_sq: f32 = tail.iter().map(|s| s * s).sum();
+        let rms = (sum_sq / tail.len() as f32).sqrt();
+        // 0.02 RMS (≈ −34 dBFS) renders full scale; sqrt lifts the quiet range.
+        (rms / 0.02).sqrt().min(1.0)
+    }
+
     /// Stop the stream and return the captured audio resampled to 16 kHz mono PCM
     /// (doc 07 §2). Called on key-up or at the [`crate::MAX_UTTERANCE`] ceiling.
     pub fn stop(self) -> Result<PcmBuffer, CaptureError> {
