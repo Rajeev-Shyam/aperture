@@ -196,6 +196,26 @@
    * (2026-08-15 review — glass-3 here was invisible). */
   background: var(--lift-2);
 }
+/* Decision #8: the confirmation that replaces the offer once applied, with its
+ * inline Undo. Kept inside the menu so the rule and its reversal live in the
+ * same place the user just clicked. */
+.bubble__overflow-note {
+  padding: 8px 10px;
+  color: var(--ink-secondary);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.bubble__overflow-note button {
+  padding: 4px 0 0;
+  color: var(--ink-primary);
+  text-decoration: underline;
+}
+.bubble__overflow-error {
+  padding: 8px 10px;
+  color: var(--health-down);
+  font-size: 12px;
+  line-height: 1.4;
+}
 
 /* ---- Lifecycle state treatments (doc 14 §4) — opacity/transform only ----- */
 /* enter: scale .96 -> 1 + fade, 180ms */

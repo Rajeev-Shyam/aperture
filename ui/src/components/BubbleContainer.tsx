@@ -14,9 +14,14 @@
 //  Core-driven transitions arriving via `suggestion_lifecycle` are NOT
 //  re-recorded — the core already knows.
 //
-//  TODO(M3-followup): the 👍/👎 "useful?" thumbs affordance (doc 11 §3, Q81) —
-//  `recordFeedback(id, "up" | "down")` is wired and waiting. Also pending:
-//  draggable stack + persisted position (doc 11 §3/§8, Q66).
+//  Slot admission is freshness × confidence (owner decision #5) and the visible
+//  cap is enforced in one place (`promote`), shared by arrivals and by the
+//  freed-slot path. Ratings live here rather than in each Bubble so a thumb
+//  pressed on one monitor lights on all of them (decision #10), and the
+//  tunables re-read on `settings_changed` so the Dashboard's dwell control is
+//  live (decision #7).
+//
+//  TODO(M3-followup): draggable stack + persisted position (doc 11 §3/§8, Q66).
 
 import { useEffect, useRef, useState } from "react";
 
@@ -25,13 +30,21 @@ import {
   getSettings,
   listSuggestions,
   onBubbleSpec,
+  onSettingsChanged,
   onSuggestionLifecycle,
+  onSuggestionRated,
   recordFeedback,
   type BubbleLifecycleState,
   type UnlistenFn,
 } from "../lib/ipc";
-import { admit, type BubbleInstance } from "../state/bubbleLifecycle";
-import { DEFAULT_GLASS_CAP, isOpaqueForBudget } from "../state/glassBudget";
+import {
+  admit,
+  promote,
+  tuningFromSettings,
+  type BubbleInstance,
+  type BubbleTuning,
+} from "../state/bubbleLifecycle";
+import { isOpaqueForBudget } from "../state/glassBudget";
 import { Bubble } from "./Bubble";
 
 interface Props {
@@ -41,39 +54,84 @@ interface Props {
 
 export function BubbleContainer({ onAskClaude }: Props) {
   const [bubbles, setBubbles] = useState<BubbleInstance[]>([]);
-  // doc 11 §3 / doc 14 §5 hard cap; refreshed from settings on mount.
-  const maxVisibleRef = useRef(3);
-  // ADR-039 glass-surface cap; from `ui.max_glass_surfaces`, default 2 (doc 14 §5).
-  const glassCapRef = useRef(DEFAULT_GLASS_CAP);
+  // The recorded 👍/👎 per suggestion id. Held HERE, not in each Bubble, so a
+  // thumb pressed on one monitor lights on all of them (decision #10) and
+  // survives the Bubble remounting.
+  const [ratings, setRatings] = useState<Record<string, "up" | "down">>({});
+  // Live tunables (decision #7): caps + dwell + the freshness half-life. In a
+  // ref because the event handlers below are registered once and must read the
+  // CURRENT value; mirrored into state so a change re-renders the dwell prop.
+  const [tuning, setTuning] = useState<BubbleTuning>(() => tuningFromSettings(null));
+  const tuningRef = useRef(tuning);
+  tuningRef.current = tuning;
 
   useEffect(() => {
     const unlisteners: UnlistenFn[] = [];
     let cancelled = false;
 
-    // Pull runtime caps from settings (ui.max_concurrent_bubbles).
-    void getSettings().then((s) => {
-      const n = s.ui?.max_concurrent_bubbles;
-      if (typeof n === "number" && n > 0) maxVisibleRef.current = n;
-      const g = s.ui?.max_glass_surfaces;
-      if (typeof g === "number" && g >= 0) glassCapRef.current = g;
-    });
+    const readTuning = () =>
+      getSettings()
+        .then((s) => {
+          if (!cancelled) setTuning(tuningFromSettings(s));
+        })
+        .catch(() => {
+          // Keep the previous (or default) tunables — never fall back to
+          // something wider than the caps the user configured.
+        });
+    void readTuning();
 
-    // Restore any queued suggestions surviving in SQLite (doc 11 §7).
+    // Restore any queued suggestions surviving in SQLite (doc 11 §7). Reversed:
+    // `list_suggestions` returns newest-first, and the stack is column-reverse,
+    // so admitting oldest-first puts the newest visually on top — the same
+    // order a live session produces.
     void listSuggestions().then((specs) => {
       if (cancelled) return;
+      const now = Date.now();
       setBubbles((cur) =>
-        specs.reduce((acc, e) => admit(acc, { id: e.id, spec: e.spec }, maxVisibleRef.current), cur),
+        [...specs]
+          .reverse()
+          .reduce(
+            (acc, e) =>
+              admit(
+                acc,
+                { id: e.id, spec: e.spec },
+                tuningRef.current.maxVisible,
+                now,
+                tuningRef.current.freshnessHalfLifeMs,
+              ),
+            cur,
+          ),
       );
     });
 
     // New suggestions arriving from the pipeline (doc 08 §6 -> doc 11 §3).
     void onBubbleSpec((e) => {
-      setBubbles((cur) => admit(cur, { id: e.id, spec: e.spec }, maxVisibleRef.current));
+      setBubbles((cur) =>
+        admit(
+          cur,
+          { id: e.id, spec: e.spec },
+          tuningRef.current.maxVisible,
+          Date.now(),
+          tuningRef.current.freshnessHalfLifeMs,
+        ),
+      );
     }).then((u) => (cancelled ? u() : unlisteners.push(u)));
 
-    // Core-driven lifecycle transitions (e.g. server-side expiry on staleness).
+    // Core-driven lifecycle transitions (e.g. server-side expiry on staleness)
+    // AND the cross-monitor convergence broadcast for user-driven ones.
     void onSuggestionLifecycle((e) => {
       applyLifecycle(e.id, e.state);
+    }).then((u) => (cancelled ? u() : unlisteners.push(u)));
+
+    // A thumb was recorded — on this window or another (decision #10).
+    void onSuggestionRated((e) => {
+      setRatings((cur) => ({ ...cur, [e.id]: e.rating }));
+    }).then((u) => (cancelled ? u() : unlisteners.push(u)));
+
+    // Settings were written (decision #7): re-read rather than wait for a
+    // restart. Only `ui` matters here.
+    void onSettingsChanged((e) => {
+      if (e.sections.includes("ui")) void readTuning();
     }).then((u) => (cancelled ? u() : unlisteners.push(u)));
 
     return () => {
@@ -83,29 +141,33 @@ export function BubbleContainer({ onAskClaude }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /** Apply an external lifecycle transition (or remove on terminal `exit`). */
-  function applyLifecycle(id: string, state: BubbleLifecycleState) {
-    setBubbles((cur) => {
-      if (state === "exit") return cur.filter((b) => b.id !== id);
-      return cur.map((b) => (b.id === id ? { ...b, state } : b));
-    });
-  }
+  // A raised cap must fill its new slots immediately, not on the next arrival.
+  useEffect(() => {
+    setBubbles((cur) => promote(cur, tuning.maxVisible));
+  }, [tuning.maxVisible]);
 
-  /** A bubble finished its exit animation -> drop it and promote a queued one. */
-  function removeBubble(id: string) {
-    setBubbles((cur) => {
-      const rest = cur.filter((b) => b.id !== id);
-      // Promote the highest-scored queued bubble into the freed visible slot.
-      const queued = rest
-        .filter((b) => b.state === "queued")
-        .sort((a, b) => b.score - a.score);
-      const visibleCount = rest.filter((b) => b.state !== "queued").length;
-      if (queued.length && visibleCount < maxVisibleRef.current) {
-        const promote = queued[0].id;
-        return rest.map((b) => (b.id === promote ? { ...b, state: "entering" } : b));
-      }
-      return rest;
-    });
+  /**
+   * Apply a lifecycle transition; on terminal `exit`, drop the bubble and fill
+   * the slot it just freed with the highest-scoring queued bubble.
+   *
+   * Promotion belongs HERE, on the only path that actually runs. It used to
+   * live in a separate `removeBubble` wired to the Bubble's `onExited`, which
+   * never fired: `onLifecycle("exit")` removes the bubble from this list, so
+   * the Bubble unmounts and the effect that would have called `onExited` is
+   * torn down first. That was invisible while a cap bug in `admit` let every
+   * arrival become visible immediately — with the cap now enforced, bubbles
+   * really do queue, and a queue that is never drained is a bubble that never
+   * appears at all.
+   */
+  function applyLifecycle(id: string, state: BubbleLifecycleState) {
+    setBubbles((cur) =>
+      state === "exit"
+        ? promote(
+            cur.filter((b) => b.id !== id),
+            tuningRef.current.maxVisible,
+          )
+        : cur.map((b) => (b.id === id ? { ...b, state } : b)),
+    );
   }
 
   function onResume(b: BubbleInstance) {
@@ -137,7 +199,9 @@ export function BubbleContainer({ onAskClaude }: Props) {
           instance={b}
           // ADR-039/C4 (R2): the glass-surface budget; the 3rd+ visible renders
           // opaque (cap from ui.max_glass_surfaces, default 2 — doc 14 §5).
-          opaque={isOpaqueForBudget(i, glassCapRef.current)}
+          opaque={isOpaqueForBudget(i, tuning.glassCap)}
+          rated={ratings[b.id] ?? null}
+          dwellMs={tuning.dwellMs}
           onResume={() => onResume(b)}
           onDismiss={() => {
             // User-driven: persist + teach the ladder (doc 08 §7) so the
@@ -154,10 +218,15 @@ export function BubbleContainer({ onAskClaude }: Props) {
           }}
           onRate={(kind) => {
             // The explicit "useful?" thumbs — SC7's signal (Q81). The bubble
-            // stays; only the rating is recorded.
+            // stays; only the rating is recorded. Echo locally for instant
+            // feedback; the core's `suggestion_rated` broadcast then converges
+            // every other monitor (decision #10).
+            setRatings((cur) => ({ ...cur, [b.id]: kind }));
             void recordFeedback(b.id, kind);
           }}
-          onExited={() => removeBubble(b.id)}
+          // Belt-and-braces: if the exit transition above ever stops removing
+          // the bubble, the animation's own completion still retires it.
+          onExited={() => applyLifecycle(b.id, "exit")}
           onLifecycle={(state) => {
             // Dwell expiry originates in this WebView -> record it once.
             if (state === "expired") void recordFeedback(b.id, "expired");

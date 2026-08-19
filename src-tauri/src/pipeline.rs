@@ -263,7 +263,9 @@ async fn maybe_enrich_vlm(
 /// the toggle into the engine (rule 7); `feedback_rx` carries bubble feedback
 /// into the decay/mute ladder (doc 08 §7); `snooze_until` gates bubble EMISSION
 /// only — capture + learning continue while snoozed (ADR-040/Q95);
-/// `current_session` mirrors the sessionizer outward for heartbeat stamping (M4).
+/// `current_session` mirrors the sessionizer outward for heartbeat stamping (M4);
+/// `settings_reload_rx` carries `set_settings` writes so a `pattern_engine` edit
+/// applies at once instead of on the next daily tick (decision #17's UI half).
 pub fn spawn_pattern_task(
     bus: &EventBus,
     db: Arc<Db>,
@@ -274,6 +276,7 @@ pub fn spawn_pattern_task(
         i64,
         aperture_pattern_engine::FeedbackEvent,
     )>,
+    mut settings_reload_rx: tokio::sync::broadcast::Receiver<Vec<String>>,
     snooze_until: Arc<std::sync::atomic::AtomicI64>,
     current_session: Arc<std::sync::atomic::AtomicI64>,
     app: tauri::AppHandle,
@@ -296,9 +299,10 @@ pub fn spawn_pattern_task(
 
         // Decision #17: the engine's tunables come from the `pattern_engine`
         // settings block (seeded from settings.default.json), constants as
-        // fallback. Re-read on the daily maintenance tick below — the same
-        // per-pass cadence the retention job uses; the shell has no push-style
-        // settings-reload path yet.
+        // fallback. Re-read on TWO triggers: `settings_reload_rx` (a
+        // `set_settings` write — so the Dashboard's Advanced sliders are live,
+        // decision #17's UI half) and the daily maintenance tick, which stays as
+        // the backstop for edits made outside the app.
         let mut engine_cfg = engine_config_from_settings(&db);
         engine.set_config(engine_cfg.clone());
 
@@ -378,12 +382,34 @@ pub fn spawn_pattern_task(
                             Err(e) => tracing::error!(%e, "pattern prune DB mirror failed"),
                         }
                     }
-                    // Decision #17: pick up settings edits at the daily cadence.
+                    // Decision #17: the backstop re-read (an edit made outside
+                    // the app still lands, just a day later).
                     let fresh_cfg = engine_config_from_settings(&db);
                     if fresh_cfg != engine_cfg {
                         tracing::info!("pattern_engine settings changed; reconfiguring engine (#17)");
                         engine.set_config(fresh_cfg.clone());
                         engine_cfg = fresh_cfg;
+                    }
+                }
+                sections = settings_reload_rx.recv() => {
+                    // A settings write landed. Re-read only when it could have
+                    // touched us; a Lagged receiver re-reads unconditionally,
+                    // since the dropped ping may well have been ours.
+                    let ours = match sections {
+                        Ok(s) => s.iter().any(|s| s == "pattern_engine"),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => true,
+                        // Sender dropped = shutdown; the other arms end the loop.
+                        Err(_) => continue,
+                    };
+                    if ours {
+                        let fresh_cfg = engine_config_from_settings(&db);
+                        if fresh_cfg != engine_cfg {
+                            tracing::info!(
+                                "pattern_engine settings written; reconfiguring engine now (#17)"
+                            );
+                            engine.set_config(fresh_cfg.clone());
+                            engine_cfg = fresh_cfg;
+                        }
                     }
                 }
                 state = capture_rx.recv() => {
@@ -497,8 +523,8 @@ pub fn spawn_pattern_task(
                         // Persist the suggestion row (doc 03 §3) then emit to the overlay.
                         let insert = db.with_conn(|c| {
                             c.execute(
-                                "INSERT INTO suggestions (pattern_id, connector_id, source, title, glyph, confidence, state, shown_ts) \
-                                 VALUES (?1, ?2, 'local', ?3, ?4, ?5, ?6, ?7)",
+                                "INSERT INTO suggestions (pattern_id, connector_id, source, title, glyph, confidence, state, shown_ts, created_ts) \
+                                 VALUES (?1, ?2, 'local', ?3, ?4, ?5, ?6, ?7, ?8)",
                                 rusqlite::params![
                                     pattern_id,
                                     cand.connector_id,
@@ -507,6 +533,12 @@ pub fn spawn_pattern_task(
                                     spec.confidence,
                                     if snoozed { "queued" } else { "shown" },
                                     (!snoozed).then_some(now_ms),
+                                    // Decision #5: the durable creation time, so a
+                                    // WebView respawn restores the queue with real
+                                    // ages instead of "everything just arrived".
+                                    // Snoozed rows need it MOST — they surface
+                                    // hours later and shown_ts is still NULL.
+                                    now_ms,
                                 ],
                             )?;
                             Ok(c.last_insert_rowid())
@@ -967,11 +999,19 @@ pub fn surface_cloud_suggestions(
             source: SuggestionSource::Claude,
             // User-requested content, not a mined guess — full confidence tag.
             confidence: 1.0,
+            // Decisions #5/#8: cloud bubbles flatten to the identical shape
+            // (doc 15 §5) — same freshness scoring, same one-click "stop
+            // capturing this" offers as a locally mined one.
+            created_ts: Some(now_ms),
+            exclusion_offers: conn_state
+                .as_ref()
+                .map(aperture_suggestion_generator::exclusion_offers_for)
+                .unwrap_or_default(),
         };
         let insert = state.db.with_conn(|c| {
             c.execute(
-                "INSERT INTO suggestions (pattern_id, connector_id, source, title, glyph, confidence, state, shown_ts) \
-                 VALUES (NULL, ?1, 'claude', ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO suggestions (pattern_id, connector_id, source, title, glyph, confidence, state, shown_ts, created_ts) \
+                 VALUES (NULL, ?1, 'claude', ?2, ?3, ?4, ?5, ?6, ?7)",
                 rusqlite::params![
                     (!action_ref.is_empty()).then_some(action_ref.as_str()),
                     spec.title,
@@ -979,6 +1019,7 @@ pub fn surface_cloud_suggestions(
                     spec.confidence,
                     if snoozed { "queued" } else { "shown" },
                     (!snoozed).then_some(now_ms),
+                    now_ms,
                 ],
             )?;
             Ok(c.last_insert_rowid())

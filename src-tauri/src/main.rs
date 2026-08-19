@@ -179,6 +179,13 @@ fn main() {
     let (feedback_tx, feedback_rx) = tokio::sync::mpsc::unbounded_channel();
     let snooze_until = Arc::new(std::sync::atomic::AtomicI64::new(0));
 
+    // Settings-write notifier (decision #17's UI half): `set_settings` pings it,
+    // the pattern task re-reads its block immediately instead of on the next
+    // 24-hour maintenance tick. Capacity 8 is generous for a channel whose
+    // traffic is "a human moved a slider"; a lagged receiver just misses one
+    // ping and picks the value up on the daily re-read.
+    let (settings_reload_tx, settings_reload_rx) = tokio::sync::broadcast::channel(8);
+
     // The capture driver + pattern task spawn inside Tauri's setup — both need
     // the AppHandle (indicator events / bubble_spec events).
     let state = AppState::new(
@@ -190,13 +197,21 @@ fn main() {
         snooze_until,
         connectors,
         consent,
-        Arc::new(gateway),
+        gateway,
         push_target,
         voice_handle,
         exclusions,
         vlm_fetch,
+        settings_reload_tx,
     );
-    run_tauri(state, feedback_rx, current_session, voice_deps, &rt);
+    run_tauri(
+        state,
+        feedback_rx,
+        settings_reload_rx,
+        current_session,
+        voice_deps,
+        &rt,
+    );
 }
 
 /// Seed the encrypted `settings` table from `config/settings.default.json` on
@@ -265,7 +280,7 @@ impl aperture_reasoning_gateway::suggestion_validator::ConnectorLookup for Regis
 /// id, and headers come from settings — never code) and inject the DB-backed
 /// audit log (doc 13 §3). Also returns the first *push* transport target in the
 /// configured order — the preview's intended-transport line (MCP is pull-only).
-fn build_gateway(
+pub(crate) fn build_gateway(
     db: &Arc<aperture_db::Db>,
     connectors: Arc<aperture_connectors::ConnectorRegistry>,
 ) -> (
@@ -836,12 +851,15 @@ fn run_tauri(
         i64,
         aperture_pattern_engine::FeedbackEvent,
     )>,
+    settings_reload_rx: tokio::sync::broadcast::Receiver<Vec<String>>,
     current_session: Arc<std::sync::atomic::AtomicI64>,
     voice_deps: voice::VoiceDeps,
     _rt: &tokio::runtime::Runtime,
 ) {
     let setup_state = state.clone();
     let mut voice_deps = Some(voice_deps);
+    // Moved into Tauri's setup closure (which is FnMut) alongside feedback_rx.
+    let mut settings_reload_rx = Some(settings_reload_rx);
     tauri::Builder::default()
         // FIRST plugin, deliberately: a second launch (autostart + a shortcut
         // double-click) must hand off to the running instance — two instances
@@ -951,6 +969,9 @@ fn run_tauri(
                 std::sync::Arc::clone(&setup_state.db),
                 engine_rx,
                 feedback_rx,
+                settings_reload_rx
+                    .take()
+                    .unwrap_or_else(|| setup_state.settings_reload_tx.subscribe()),
                 Arc::clone(&setup_state.snooze_until),
                 Arc::clone(&current_session),
                 app.handle().clone(),

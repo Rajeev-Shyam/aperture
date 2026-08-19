@@ -669,12 +669,79 @@ pub async fn vlm_download(
     Ok(())
 }
 
+/// The durable state a terminal feedback kind resolves a suggestions row to.
+/// `None` for the thumbs, which rate a row without resolving it.
+pub(crate) fn terminal_state(kind: &str) -> Option<&'static str> {
+    match kind {
+        "clicked" => Some("clicked"),
+        // Explicit "Mute this pattern" (doc 11 §3): the row resolves as
+        // dismissed; the engine jumps straight to the 7-day mute.
+        "dismissed" | "muted" => Some("dismissed"),
+        "expired" => Some("expired"),
+        _ => None,
+    }
+}
+
+/// The durable half of [`record_feedback`], split out so the exactly-once rule
+/// (owner decision #10) is testable against a real DB rather than only through
+/// a running Tauri app. Returns `(applied, pattern_id)`.
+///
+/// `applied == false` means this signal was a duplicate — the row was already
+/// resolved, or the rating already said this — and the caller must NOT forward
+/// it to the engine's decay/mute ladder or re-broadcast it. One `UPDATE …
+/// WHERE` decides that: the durable row is the arbiter, not any window's local
+/// belief, which is what makes the answer correct across N monitors, a retry,
+/// and a WebView respawn alike.
+pub(crate) fn record_feedback_row(
+    db: &aperture_db::Db,
+    row_id: i64,
+    kind: &str,
+    now: i64,
+) -> Result<(bool, Option<i64>), String> {
+    db.with_conn(|c| {
+        let changed = match terminal_state(kind) {
+            Some(next) => c.execute(
+                "UPDATE suggestions SET state = ?3, resolved_ts = ?2 \
+                 WHERE id = ?1 AND state IN ('queued','shown')",
+                rusqlite::params![row_id, now, next],
+            )?,
+            None => c.execute(
+                "UPDATE suggestions SET useful_rating = ?2 \
+                 WHERE id = ?1 AND (useful_rating IS NULL OR useful_rating <> ?2)",
+                rusqlite::params![row_id, kind],
+            )?,
+        };
+        let pattern_id = c.query_row(
+            "SELECT pattern_id FROM suggestions WHERE id = ?1",
+            [row_id],
+            |r| r.get::<_, Option<i64>>(0),
+        )?;
+        Ok((changed > 0, pattern_id))
+    })
+    .map_err(|e| e.to_string())
+}
+
 /// Record bubble feedback (doc 08 §7, ADR-040/Q81): update the durable
 /// suggestions row (state/resolved_ts/useful_rating — dismissed bubbles must
 /// not resurrect on a WebView respawn) and forward the signal to the pattern
-/// engine's decay/mute ladder. `kind`: "clicked" | "dismissed" | "expired" |
-/// "up" | "down". The 👍/👎 affordance renders at the next UI pass (doc 11 §3);
-/// this seam already accepts it.
+/// engine's decay/mute ladder. `kind`: "clicked" | "dismissed" | "muted" |
+/// "expired" | "up" | "down".
+///
+/// **Exactly-once by construction (owner decision #10, 2026-08-16).** Every
+/// monitor runs its own overlay root with its own dwell timer, so one bubble's
+/// 20 s expiry fires N times — once per monitor — within milliseconds of
+/// itself. The 08-15 lifecycle broadcast converges the *rendering*, but it
+/// races the sibling timers, so the ladder was being multiplied: N monitors
+/// meant `EXPIRE_DECAY_MULT` applied N times for one ignored bubble, silently
+/// suppressing a pattern faster the more screens the user owns.
+///
+/// The fix is here rather than in the overlay, because the same duplicate
+/// arrives from a double-click, a queued retry, and a respawn re-report: the
+/// terminal UPDATE is guarded on the row still being live (`queued`/`shown`),
+/// and a 0-row update means someone else already resolved it — no engine
+/// signal, no second broadcast. Thumbs are guarded on the rating actually
+/// CHANGING for the same reason (👍👍👍 was ×1.5 compounding); they are
+/// deliberately not state-guarded, since the Dashboard rates resolved rows.
 #[tauri::command]
 pub async fn record_feedback(
     id: String,
@@ -684,69 +751,46 @@ pub async fn record_feedback(
 ) -> Result<(), String> {
     let row_id: i64 = id.parse().map_err(|_| format!("bad suggestion id: {id}"))?;
     let now = crate::pipeline::epoch_ms();
-    let (fb, sql, uses_ts) = match kind.as_str() {
-        "clicked" => (
-            aperture_pattern_engine::FeedbackEvent::Clicked,
-            "UPDATE suggestions SET state='clicked', resolved_ts=?2 WHERE id=?1",
-            true,
-        ),
-        "dismissed" => (
-            aperture_pattern_engine::FeedbackEvent::Dismissed,
-            "UPDATE suggestions SET state='dismissed', resolved_ts=?2 WHERE id=?1",
-            true,
-        ),
-        // Explicit "Mute this pattern" (doc 11 §3): the row resolves as
-        // dismissed; the engine jumps the ladder straight to the 7-day mute.
-        "muted" => (
-            aperture_pattern_engine::FeedbackEvent::Muted,
-            "UPDATE suggestions SET state='dismissed', resolved_ts=?2 WHERE id=?1",
-            true,
-        ),
-        "expired" => (
-            aperture_pattern_engine::FeedbackEvent::Expired,
-            "UPDATE suggestions SET state='expired', resolved_ts=?2 WHERE id=?1",
-            true,
-        ),
-        "up" => (
-            aperture_pattern_engine::FeedbackEvent::ThumbsUp,
-            "UPDATE suggestions SET useful_rating='up' WHERE id=?1",
-            false,
-        ),
-        "down" => (
-            aperture_pattern_engine::FeedbackEvent::ThumbsDown,
-            "UPDATE suggestions SET useful_rating='down' WHERE id=?1",
-            false,
-        ),
+    let fb = match kind.as_str() {
+        "clicked" => aperture_pattern_engine::FeedbackEvent::Clicked,
+        "dismissed" => aperture_pattern_engine::FeedbackEvent::Dismissed,
+        "muted" => aperture_pattern_engine::FeedbackEvent::Muted,
+        "expired" => aperture_pattern_engine::FeedbackEvent::Expired,
+        "up" => aperture_pattern_engine::FeedbackEvent::ThumbsUp,
+        "down" => aperture_pattern_engine::FeedbackEvent::ThumbsDown,
         other => return Err(format!("unknown feedback kind: {other}")),
     };
-    let pattern_id = state
-        .db
-        .with_conn(|c| {
-            if uses_ts {
-                c.execute(sql, rusqlite::params![row_id, now])?;
-            } else {
-                c.execute(sql, rusqlite::params![row_id])?;
-            }
-            c.query_row(
-                "SELECT pattern_id FROM suggestions WHERE id = ?1",
-                [row_id],
-                |r| r.get::<_, Option<i64>>(0),
-            )
-        })
-        .map_err(|e| e.to_string())?;
+    let resolved_state = terminal_state(&kind);
+    let (applied, pattern_id) = record_feedback_row(&state.db, row_id, &kind, now)?;
+
+    if !applied {
+        tracing::debug!(
+            %id,
+            %kind,
+            "duplicate suggestion feedback ignored (already resolved / unchanged rating)"
+        );
+        return Ok(());
+    }
+
     if let Some(pid) = pattern_id {
         let _ = state.feedback_tx.send((pid, fb)); // task gone = shutdown; fine
     }
-    // Terminal transitions broadcast so EVERY overlay window converges — a
-    // dismissal on one monitor removed the bubble there only, leaving live
-    // clones on the others (2026-08-15 review). The originating window applies
-    // the same state locally first; re-applying is idempotent.
-    if matches!(kind.as_str(), "clicked" | "dismissed" | "muted" | "expired") {
-        let lifecycle_state = if kind == "muted" { "dismissed" } else { kind.as_str() };
-        let _ = crate::events::emit_suggestion_lifecycle(
-            &app,
-            &serde_json::json!({ "id": id, "state": lifecycle_state }),
-        );
+    // Broadcast so EVERY overlay window converges — a dismissal on one monitor
+    // removed the bubble there only, leaving live clones on the others
+    // (2026-08-15 review). The originating window applies the same state
+    // locally first; re-applying is idempotent. Ratings converge too
+    // (decision #10): the pressed thumb is the visible receipt that the signal
+    // was recorded, and it was lighting on one monitor only.
+    match resolved_state {
+        Some(next) => {
+            let _ = crate::events::emit_suggestion_lifecycle(
+                &app,
+                &serde_json::json!({ "id": id, "state": next }),
+            );
+        }
+        None => {
+            let _ = crate::events::emit_suggestion_rated(&app, &id, &kind);
+        }
     }
     Ok(())
 }
@@ -795,19 +839,56 @@ pub async fn list_suggestions(
     if snoozed {
         return Ok(Vec::new());
     }
-    state
-        .db
+    restorable_suggestions(&state.db)
+}
+
+/// The durable half of [`list_suggestions`] — the queue as SQLite holds it,
+/// split out so the respawn path (decisions #5 and #8 both ride it) is testable
+/// without a running Tauri app.
+pub(crate) fn restorable_suggestions(
+    db: &aperture_db::Db,
+) -> Result<Vec<BubbleSpecEnvelope>, String> {
+    db
         .with_conn(|c| {
+            // The LEFT JOIN rebuilds what the live `bubble_spec` emit carries in
+            // memory: the subject's connector state, from which the ⋯ menu's
+            // one-click exclusion offers are derived (decision #8). LEFT, not
+            // INNER — a Claude answer bubble has no connector row and must still
+            // restore. Ordering falls back to `created_ts` because a snoozed
+            // (queued) row has no `shown_ts` at all, so the old ORDER BY put
+            // every queued row in an arbitrary NULL block.
             let mut stmt = c.prepare(
-                "SELECT id, title, glyph, confidence, connector_id, source \
-                 FROM suggestions WHERE state IN ('queued','shown') \
-                 ORDER BY shown_ts DESC LIMIT 16",
+                "SELECT s.id, s.title, s.glyph, s.confidence, s.connector_id, s.source, \
+                        s.created_ts, cs.connector_type, cs.reconstruct_payload \
+                 FROM suggestions s \
+                 LEFT JOIN connector_state cs ON cs.id = s.connector_id \
+                 WHERE s.state IN ('queued','shown') \
+                 ORDER BY COALESCE(s.shown_ts, s.created_ts, 0) DESC LIMIT 16",
             )?;
             let rows = stmt.query_map([], |row| {
                 let id: i64 = row.get(0)?;
                 let source = match row.get::<_, Option<String>>(5)?.as_deref() {
                     Some("claude") => SuggestionSource::Claude,
                     _ => SuggestionSource::Local,
+                };
+                // A malformed/absent payload yields no offers — never a guess.
+                let exclusion_offers = match (
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ) {
+                    (Some(connector_type), Some(payload)) => serde_json::from_str(&payload)
+                        .ok()
+                        .map(|reconstruct_payload| aperture_contracts::ConnectorState {
+                            id: String::new(),
+                            connector_type,
+                            reconstruct_payload,
+                            payload_version: 1,
+                            captured_ts: 0,
+                            stale_after_ts: None,
+                        })
+                        .map(|st| aperture_suggestion_generator::exclusion_offers_for(&st))
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
                 };
                 Ok(BubbleSpecEnvelope {
                     id: id.to_string(),
@@ -818,6 +899,10 @@ pub async fn list_suggestions(
                         action_ref: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
                         source,
                         confidence: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+                        // Decision #5: the restored queue carries its real ages,
+                        // so a respawn cannot make an hours-old bubble look new.
+                        created_ts: row.get::<_, Option<i64>>(6)?,
+                        exclusion_offers,
                     },
                 })
             })?;
@@ -1066,7 +1151,7 @@ pub async fn request_preview(
     let (payload, report) = aperture_reasoning_gateway::payload_builder::build(
         intent,
         items,
-        state.push_target,
+        state.push_target(),
         &redactor,
         crate::pipeline::epoch_ms(),
     )
@@ -1184,7 +1269,7 @@ pub async fn transport_health(
         )
     }
     let health = state
-        .gateway
+        .gateway()
         .health_report()
         .await
         .into_iter()
@@ -1336,7 +1421,7 @@ pub async fn preview_send(
         .approve(aperture_reasoning_gateway::preview::PreviewDecision::Send)
         .ok_or_else(|| "preview_send: session cancelled".to_string())?;
 
-    match state.gateway.send_with_preview(&approved, true).await {
+    match state.gateway().send_with_preview(&approved, true).await {
         Ok(outcome) => {
             // Decision #41: an audit-write failure after a successful egress
             // must be VISIBLE — the audit log is the sole record of what left
@@ -1513,11 +1598,33 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Valu
 }
 
 /// Persist settings (doc 13 §6): each top-level key of `patch` upserts one
-/// `settings` row. Some changes (e.g. loadout L1<->L2) are applied by
-/// orchestration on the next job; the shell only stores them.
+/// `settings` row.
+///
+/// **A write is announced, not just stored** (owner decisions #7, #17, #39,
+/// 2026-08-16). Every consumer here cached its settings at startup or at mount,
+/// which quietly made each of them a next-launch preference: the overlay read
+/// `ui.bubble_dwell_sec` once per WebView, the pattern task re-read its block on
+/// a 24-hour tick, and the gateway's transport order was frozen when the process
+/// started. Three things therefore happen after a successful write:
+///
+/// 1. the `settings_changed` event tells every window to re-read (the overlay's
+///    bubble tunables, decision #7);
+/// 2. `settings_reload_tx` pings the long-lived Rust tasks (the pattern task's
+///    `pattern_engine` block, decision #17);
+/// 3. a `reasoning` write REBUILDS the gateway in place, so switching transport
+///    is one click rather than an edit plus a relaunch (decision #39).
+///
+/// Note the whole-section semantics the callers must respect: each top-level key
+/// REPLACES its row, so a partial section write drops its siblings. The UI merges
+/// before calling (see the Dashboard's `voice`/`ui`/`pattern_engine` sections).
+///
+/// Only the persist can fail the command. A notification that does not land is
+/// logged and swallowed: the value IS stored, and every listener re-reads on its
+/// own schedule anyway — failing the write here would be a lie about the store.
 #[tauri::command]
 pub async fn set_settings(
     patch: serde_json::Value,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let serde_json::Value::Object(map) = patch else {
@@ -1535,7 +1642,28 @@ pub async fn set_settings(
             }
             Ok(())
         })
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    let sections: Vec<String> = map.keys().cloned().collect();
+
+    // Decision #39: the transport order is read when the gateway is COMPOSED, so
+    // a rebuild is what makes the switch take effect. Cheap (health is probed
+    // per call, not cached) and safe mid-flight: an in-progress Send holds its
+    // own `Arc<Gateway>` and finishes on the transport it started with.
+    if sections.iter().any(|s| s == "reasoning") {
+        let (gateway, push_target) =
+            crate::build_gateway(&state.db, Arc::clone(&state.connectors));
+        state.swap_gateway(gateway, push_target);
+        tracing::info!(?push_target, "reasoning transports rebuilt from settings (#39)");
+    }
+
+    // Long-lived Rust tasks (decision #17). No receivers = nothing cares yet.
+    let _ = state.settings_reload_tx.send(sections.clone());
+    // Every overlay window (decision #7).
+    if let Err(e) = crate::events::emit_settings_changed(&app, sections) {
+        tracing::warn!(%e, "settings saved but the change notification did not emit");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1607,6 +1735,157 @@ mod tests {
     use super::*;
     use aperture_contracts::{Event, EventType, PayloadItem};
     use aperture_db::{Db, ScreenContextInsert};
+
+    /// A live (`shown`) suggestion row, optionally tied to a pattern.
+    fn insert_suggestion(db: &Db, state: &str, pattern_id: Option<i64>) -> i64 {
+        db.with_conn(|c| {
+            if let Some(pid) = pattern_id {
+                c.execute(
+                    "INSERT INTO patterns (id, signature) VALUES (?1, 'a=>b') \
+                     ON CONFLICT(id) DO NOTHING",
+                    rusqlite::params![pid],
+                )?;
+            }
+            c.execute(
+                "INSERT INTO suggestions (pattern_id, source, title, confidence, state, shown_ts, created_ts) \
+                 VALUES (?1, 'local', 't', 0.9, ?2, 1000, 1000)",
+                rusqlite::params![pattern_id, state],
+            )?;
+            Ok(c.last_insert_rowid())
+        })
+        .unwrap()
+    }
+
+    fn row_state(db: &Db, id: i64) -> (Option<String>, Option<i64>, Option<String>) {
+        db.with_conn(|c| {
+            c.query_row(
+                "SELECT state, resolved_ts, useful_rating FROM suggestions WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+        })
+        .unwrap()
+    }
+
+    /// Decision #10, the multi-monitor bug this closes: every overlay window
+    /// runs its own dwell timer, so ONE ignored bubble reported `expired` once
+    /// per monitor. Each report used to reach the engine, multiplying the
+    /// decay — a pattern was suppressed faster the more screens the user owns.
+    #[test]
+    fn only_the_first_terminal_report_counts() {
+        let db = Db::open_in_memory().unwrap();
+        let id = insert_suggestion(&db, "shown", Some(7));
+
+        let (applied, pattern_id) = record_feedback_row(&db, id, "expired", 2000).unwrap();
+        assert!(applied, "the first monitor's report is the real one");
+        assert_eq!(pattern_id, Some(7), "and it carries the pattern to decay");
+
+        // Monitors 2..N fire milliseconds later, before the convergence
+        // broadcast cancels their timers.
+        for _ in 0..3 {
+            let (applied, _) = record_feedback_row(&db, id, "expired", 2100).unwrap();
+            assert!(!applied, "duplicates must not reach the decay ladder");
+        }
+        assert_eq!(
+            row_state(&db, id),
+            (Some("expired".into()), Some(2000), None),
+            "resolved_ts stays the moment it actually resolved"
+        );
+    }
+
+    /// A click on one monitor must also win against a sibling's expiry racing
+    /// it — first terminal transition wins, whichever kind it is.
+    #[test]
+    fn a_resolved_row_cannot_be_re_resolved_by_another_kind() {
+        let db = Db::open_in_memory().unwrap();
+        let id = insert_suggestion(&db, "shown", None);
+
+        assert!(record_feedback_row(&db, id, "clicked", 2000).unwrap().0);
+        assert!(!record_feedback_row(&db, id, "expired", 2001).unwrap().0);
+        assert!(!record_feedback_row(&db, id, "dismissed", 2002).unwrap().0);
+        assert_eq!(row_state(&db, id).0.as_deref(), Some("clicked"));
+    }
+
+    /// "Mute this pattern" resolves the row as dismissed (doc 11 §3) — the
+    /// distinct ENGINE signal is the caller's business, not the row's.
+    #[test]
+    fn mute_resolves_the_row_as_dismissed() {
+        let db = Db::open_in_memory().unwrap();
+        let id = insert_suggestion(&db, "queued", None);
+        assert!(record_feedback_row(&db, id, "muted", 2000).unwrap().0);
+        assert_eq!(row_state(&db, id).0.as_deref(), Some("dismissed"));
+    }
+
+    /// Thumbs are rate-limited by VALUE, not by row state: the Dashboard rates
+    /// long-resolved rows (that is the whole point of retroactive thumbs,
+    /// decision #9), but pressing 👍 three times must not compound ×1.5 three
+    /// times through the ladder.
+    #[test]
+    fn a_rating_counts_once_per_change_and_works_on_resolved_rows() {
+        let db = Db::open_in_memory().unwrap();
+        let id = insert_suggestion(&db, "expired", None);
+
+        assert!(record_feedback_row(&db, id, "up", 3000).unwrap().0, "resolved rows are ratable");
+        assert!(!record_feedback_row(&db, id, "up", 3001).unwrap().0, "same rating = no signal");
+        assert!(record_feedback_row(&db, id, "down", 3002).unwrap().0, "a changed mind counts");
+        assert_eq!(row_state(&db, id).2.as_deref(), Some("down"));
+    }
+
+    /// Decision #5: the restored queue must carry real ages, and decision #8:
+    /// the restored bubble must still offer its one-click exclusion — both come
+    /// from the same `list_suggestions` read, which is why they are tested
+    /// together against the same rows.
+    #[test]
+    fn the_restored_queue_carries_ages_and_exclusion_offers() {
+        let db = Db::open_in_memory().unwrap();
+        let st = aperture_contracts::ConnectorState {
+            id: "conn-1".into(),
+            connector_type: "browser".into(),
+            reconstruct_payload: serde_json::json!({"url": "https://docs.rs/tokio", "title": "T"}),
+            payload_version: 1,
+            captured_ts: 500,
+            stale_after_ts: None,
+        };
+        db.insert_connector_state(&st).unwrap();
+        db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO suggestions (connector_id, source, title, glyph, confidence, state, shown_ts, created_ts) \
+                 VALUES ('conn-1', 'local', 'Return to docs.rs', 'globe', 0.8, 'shown', 900, 900)",
+                [],
+            )
+            .map(|_| ())
+        })
+        .unwrap();
+
+        let rows = restorable_suggestions(&db).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].spec.created_ts, Some(900), "age survives the respawn");
+        let offers = &rows[0].spec.exclusion_offers;
+        assert_eq!(offers.len(), 1, "the ⋯ menu can still stop capturing the site");
+        assert_eq!(offers[0].label, "docs.rs");
+    }
+
+    /// A Claude answer bubble has no connector row. The LEFT JOIN must still
+    /// restore it (an INNER JOIN would silently drop it) — with no offers,
+    /// which is the honest answer rather than a guessed rule.
+    #[test]
+    fn a_connectorless_suggestion_still_restores_with_no_offers() {
+        let db = Db::open_in_memory().unwrap();
+        db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO suggestions (source, title, confidence, state, created_ts) \
+                 VALUES ('claude', 'An answer', 1.0, 'queued', 700)",
+                [],
+            )
+            .map(|_| ())
+        })
+        .unwrap();
+
+        let rows = restorable_suggestions(&db).unwrap();
+        assert_eq!(rows.len(), 1, "queued rows survive; the LEFT JOIN keeps them");
+        assert!(rows[0].spec.exclusion_offers.is_empty());
+        assert_eq!(rows[0].spec.created_ts, Some(700), "queued rows have no shown_ts to fall back on");
+    }
 
     fn insert_screen(db: &Db, ts: i64, text: &str, redaction_flags: u32) -> i64 {
         let ev = Event {

@@ -9,3 +9,10 @@ description = "Renders a pattern-engine SuggestionCandidate + ConnectorState int
 aperture-contracts = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# Decision #8: the exclusion patterns this crate emits are compiled + matched in
+# tests with the SAME builder the capture gate uses, so a bad escape is a test
+# failure here rather than a rule the Privacy panel shows as active protection
+# while it silently matches nothing. Not a runtime dependency.
+regex = "1"

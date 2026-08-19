@@ -57,6 +57,16 @@ pub const AUDIT_ALERT: &str = "audit_alert";
 /// VLM weight download progress/terminal state (decision #30): the Dashboard's
 /// user-initiated ~3.3 GB fetch streams `{ phase, file, bytes }` here.
 pub const VLM_FETCH: &str = "vlm_fetch";
+/// A bubble's 👍/👎 was recorded (decision #10). Broadcast so the pressed thumb
+/// lights on EVERY monitor's copy of that bubble — the rating is a one-shot
+/// signal and its only receipt is the visibly-set thumb, which was appearing on
+/// the window the click landed in and nowhere else.
+pub const SUGGESTION_RATED: &str = "suggestion_rated";
+/// Settings were written (`set_settings`). Broadcast so every surface that
+/// CACHED a settings value re-reads it instead of waiting for a restart
+/// (decisions #7, #17, #39). Carries the top-level section names in the patch,
+/// so a listener can ignore writes it does not care about.
+pub const SETTINGS_CHANGED: &str = "settings_changed";
 
 /// The capture-indicator state the overlay/tray render (doc 12 §6).
 /// `Releasing` covers the <3 s toggle-OFF window (doc 12 §6 step 5). Internal
@@ -220,6 +230,42 @@ pub struct VlmFetchPayload {
 /// same split as `audit_alert`.
 pub fn emit_vlm_fetch(app: &AppHandle, payload: &VlmFetchPayload) -> tauri::Result<()> {
     app.emit(VLM_FETCH, payload.clone())
+}
+
+/// The `suggestion_rated` wire payload (matches the UI's `SuggestionRatedEvent`).
+#[derive(Debug, Clone, Serialize)]
+pub struct SuggestionRatedPayload {
+    pub id: String,
+    /// `"up"` | `"down"`.
+    pub rating: String,
+}
+
+/// Broadcast a recorded 👍/👎 so every overlay window sets the same thumb
+/// (decision #10). Emitted only when the rating actually CHANGED — the caller
+/// (`record_feedback`) drops duplicates before reaching here, so this can never
+/// re-announce a no-op.
+pub fn emit_suggestion_rated(app: &AppHandle, id: &str, rating: &str) -> tauri::Result<()> {
+    app.emit(
+        SUGGESTION_RATED,
+        SuggestionRatedPayload { id: id.to_string(), rating: rating.to_string() },
+    )
+}
+
+/// The `settings_changed` wire payload (matches the UI's `SettingsChangedEvent`).
+#[derive(Debug, Clone, Serialize)]
+pub struct SettingsChangedPayload {
+    /// Top-level sections in the write, e.g. `["ui"]` / `["reasoning"]`.
+    pub sections: Vec<String>,
+}
+
+/// Announce a settings write to every window (decisions #7, #17, #39).
+///
+/// Cached-at-mount settings were the reason a Dashboard control could only ever
+/// be a next-launch preference: the overlay read `ui.bubble_dwell_sec` once and
+/// the pattern task re-read its block on a 24-hour tick. This makes a write
+/// observable, so "changes it at runtime" is literally true.
+pub fn emit_settings_changed(app: &AppHandle, sections: Vec<String>) -> tauri::Result<()> {
+    app.emit(SETTINGS_CHANGED, SettingsChangedPayload { sections })
 }
 
 /// Emit a suggestion-lifecycle transition (doc 11 §3). The matching

@@ -14,7 +14,7 @@
 //! the source tag (doc 15 §5, doc 11 §3).
 
 use aperture_contracts::suggestions::SuggestionSource;
-use aperture_contracts::{BubbleSpec, ConnectorState, SuggestionCandidate};
+use aperture_contracts::{BubbleSpec, ConnectorState, ExclusionOffer, SuggestionCandidate};
 
 /// Render a local [`SuggestionCandidate`] (+ its resolved [`ConnectorState`])
 /// into a [`BubbleSpec`] for the Bubble UI (doc 08 §6 -> doc 11 §3).
@@ -54,7 +54,115 @@ pub fn render(candidate: &SuggestionCandidate, state: &ConnectorState, now_ms: i
         action_ref: state.id.clone(),
         source: SOURCE,
         confidence: candidate.confidence,
+        // Freshness input for the overlay's slot-admission score (decision #5):
+        // the moment the suggestion was made, not the moment its context was
+        // captured (`state.captured_ts` is already the sublabel's "2h ago").
+        created_ts: Some(now_ms),
+        // Decision #8: the ⋯ menu's real "stop capturing this" action.
+        exclusion_offers: exclusion_offers_for(state),
     }
+}
+
+/// The `(match_kind, pattern)` rules a bubble's ⋯ menu can apply in one click
+/// (owner decision #8, 2026-08-16) for the context this bubble is *about*.
+///
+/// Derived here, core-side, rather than in the WebView for two reasons: the
+/// regex escaping must match what
+/// `aperture_capture::exclusion::validate_pattern` will accept (a pattern that
+/// fails to compile becomes a rule the Privacy panel shows as active protection
+/// while it silently matches nothing), and the choice of *which* rule is
+/// right-sized is a product decision, not a rendering one:
+///
+/// - **browser / youtube** → the site (`url_pattern`). Excluding the whole
+///   browser process from one page's bubble is far more than the user asked
+///   for; "stop capturing docs.rs" is the honest reading. The whole-browser
+///   rule is still one click away in the exclusion manager.
+/// - **document / app_focus** → the owning app (`process`). Here the app IS the
+///   subject ("you keep switching to Slack"), so the process rule is the
+///   right-sized one.
+/// - **ide** → nothing. The stored payload (`path`/`line`/`workspace`) names no
+///   process, and guessing one would produce a rule that protects nothing.
+///
+/// An empty result is honest: the menu then offers only the exclusion manager.
+pub fn exclusion_offers_for(state: &ConnectorState) -> Vec<ExclusionOffer> {
+    let payload = &state.reconstruct_payload;
+    let field = |k: &str| {
+        payload
+            .get(k)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+
+    match state.connector_type.as_str() {
+        "browser" | "youtube" => match field("url").and_then(host_of) {
+            Some(host) => vec![ExclusionOffer {
+                label: host.clone(),
+                match_kind: "url_pattern".to_string(),
+                pattern: host_url_pattern(&host),
+            }],
+            None => Vec::new(),
+        },
+        "document" | "app_focus" => {
+            // `app_hint` (document) / `process` (app_focus) hold the image name;
+            // `app` is app_focus's display form ("Slack") for the menu label.
+            let Some(process) = field("app_hint").or_else(|| field("process")) else {
+                return Vec::new();
+            };
+            // Process matching is an exact (case-insensitive) match on the full
+            // image name: a bare brand string like "chrome" would never fire, so
+            // offering it would be a rule that quietly protects nothing.
+            if !process.to_ascii_lowercase().ends_with(".exe") {
+                return Vec::new();
+            }
+            let label = field("app").unwrap_or(process).to_string();
+            vec![ExclusionOffer {
+                label,
+                match_kind: "process".to_string(),
+                pattern: process.to_ascii_lowercase(),
+            }]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Registrable host of a URL, lowercased, `www.` dropped (the pattern below
+/// re-admits it as a subdomain). `None` for anything without a usable host.
+fn host_of(url: &str) -> Option<String> {
+    let after = url.split_once("://").map(|(_, r)| r)?;
+    let host = after.split(['/', '?', '#']).next()?;
+    // Drop userinfo and port.
+    let host = host.rsplit('@').next()?;
+    let host = host.split(':').next()?.trim_end_matches('.');
+    if host.is_empty() || !host.contains('.') {
+        return None;
+    }
+    let host = host.to_ascii_lowercase();
+    Some(host.strip_prefix("www.").unwrap_or(&host).to_string())
+}
+
+/// A `url_pattern` regex for one host, in the same shape as the shipped
+/// defaults (`crates/capture/src/exclusion.rs`): scheme-anchored, one optional
+/// subdomain label, terminated so `docs.rs` cannot match `docs.rs.evil.com`.
+/// Compiled case-insensitively by the matcher, so no `(?i)` is needed.
+fn host_url_pattern(host: &str) -> String {
+    format!(r"^https?://([a-z0-9-]+\.)?{}([:/?#]|$)", regex_escape(host))
+}
+
+/// Escape regex metacharacters — the `regex` crate's `escape`, inlined so this
+/// pure formatting crate keeps no runtime regex dependency. The dev-dependency
+/// test below compiles every pattern this produces, which is what actually
+/// proves the escaping right.
+fn regex_escape(s: &str) -> String {
+    const META: &str = r"\.+*?()|[]{}^$#&-~";
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        if META.contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Expand `{placeholder}`s from the connector's versioned `reconstruct_payload`
@@ -160,6 +268,9 @@ pub fn glyph_for(connector_type: &str) -> &'static str {
         "browser" => "globe",
         "document" => "doc",
         "ide" => "code",
+        // Decision #15's "Switch to X" bubbles: their own semantic token so the
+        // overlay does not render them with the generic fallback mark.
+        "app_focus" => "switch",
         _ => "spark",
     }
 }
@@ -256,5 +367,112 @@ mod tests {
     #[test]
     fn unknown_connector_type_gets_neutral_glyph() {
         assert_eq!(glyph_for("slack-thread"), "spark", "v2 seam renders (doc 15 §3)");
+    }
+
+    // --- decision #8: the bubble's one-click "stop capturing this" ------------
+
+    fn state_of(connector_type: &str, payload: serde_json::Value) -> ConnectorState {
+        ConnectorState {
+            id: "c".into(),
+            connector_type: connector_type.into(),
+            reconstruct_payload: payload,
+            payload_version: 1,
+            captured_ts: 0,
+            stale_after_ts: None,
+        }
+    }
+
+    /// Compile with the SAME configuration `exclusion::validate_pattern` uses.
+    fn compiled(pattern: &str) -> regex::Regex {
+        regex::RegexBuilder::new(pattern)
+            .case_insensitive(true)
+            .build()
+            .expect("every emitted pattern must compile")
+    }
+
+    #[test]
+    fn browser_offers_the_site_not_the_whole_browser() {
+        let st = state_of(
+            "browser",
+            serde_json::json!({"url": "https://docs.rs/tokio/latest", "browser": "chrome.exe"}),
+        );
+        let offers = exclusion_offers_for(&st);
+        assert_eq!(offers.len(), 1, "one right-sized rule, not the browser process");
+        assert_eq!(offers[0].match_kind, "url_pattern");
+        assert_eq!(offers[0].label, "docs.rs");
+
+        let re = compiled(&offers[0].pattern);
+        assert!(re.is_match("https://docs.rs/tokio/latest"));
+        assert!(re.is_match("https://DOCS.RS/"), "matcher is case-insensitive");
+        assert!(re.is_match("http://www.docs.rs/x"), "www is a subdomain, not a different site");
+        assert!(!re.is_match("https://docs.rs.evil.com/"), "host is terminated");
+        assert!(!re.is_match("https://notdocs.rs/"), "subdomain label needs its dot");
+        assert!(!re.is_match("https://example.com/?q=docs.rs"), "not just a substring");
+    }
+
+    #[test]
+    fn youtube_offers_the_site_from_its_watch_url() {
+        let st = state_of(
+            "youtube",
+            serde_json::json!({"url": "https://www.youtube.com/watch?v=abc", "video_id": "abc"}),
+        );
+        let offers = exclusion_offers_for(&st);
+        assert_eq!(offers[0].label, "youtube.com", "www dropped from the label");
+        assert!(compiled(&offers[0].pattern).is_match("https://www.youtube.com/watch?v=abc"));
+    }
+
+    #[test]
+    fn app_focus_offers_the_process_with_its_display_label() {
+        let st = state_of("app_focus", serde_json::json!({"process": "Slack.exe", "app": "Slack"}));
+        let offers = exclusion_offers_for(&st);
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].match_kind, "process");
+        assert_eq!(offers[0].label, "Slack", "the menu reads the display name");
+        assert_eq!(offers[0].pattern, "slack.exe", "matcher compares lowercased");
+    }
+
+    #[test]
+    fn document_offers_its_owning_app() {
+        let st = state_of(
+            "document",
+            serde_json::json!({"path": r"C:\U\budget.xlsx", "app_hint": "EXCEL.EXE"}),
+        );
+        let offers = exclusion_offers_for(&st);
+        assert_eq!(offers[0].pattern, "excel.exe");
+        assert_eq!(offers[0].label, "EXCEL.EXE", "no display name stored — say the real thing");
+    }
+
+    #[test]
+    fn nothing_derivable_offers_nothing_rather_than_a_rule_that_protects_nothing() {
+        // A bare brand string can never match the exact-image-name matcher.
+        let bare = state_of("document", serde_json::json!({"path": "x", "app_hint": "chrome"}));
+        assert!(exclusion_offers_for(&bare).is_empty());
+        // IDE payloads name no process; guessing one would be a dead rule.
+        let ide = state_of("ide", serde_json::json!({"path": "x", "workspace": "aperture"}));
+        assert!(exclusion_offers_for(&ide).is_empty());
+        // A URL with no host is not a site.
+        let odd = state_of("browser", serde_json::json!({"url": "about:blank"}));
+        assert!(exclusion_offers_for(&odd).is_empty());
+        // Bare-hostname intranet URLs have no registrable dot — no honest rule.
+        let intranet = state_of("browser", serde_json::json!({"url": "http://intranet/home"}));
+        assert!(exclusion_offers_for(&intranet).is_empty());
+    }
+
+    #[test]
+    fn hosts_with_regex_metacharacters_are_escaped_not_interpreted() {
+        // Odd hosts must never turn into a wildcard rule.
+        let st = state_of("browser", serde_json::json!({"url": "https://a+b.example.com/x"}));
+        let offers = exclusion_offers_for(&st);
+        let re = compiled(&offers[0].pattern);
+        assert!(re.is_match("https://a+b.example.com/x"));
+        assert!(!re.is_match("https://ab.example.com/x"), "'+' stayed a literal");
+    }
+
+    #[test]
+    fn render_stamps_the_creation_time_for_the_admission_score() {
+        // Decision #5: without this the overlay cannot tell a just-arrived
+        // bubble from one restored hours later out of SQLite.
+        let spec = render(&candidate("Continue {title}"), &yt_state(), 1_700_000_000_000);
+        assert_eq!(spec.created_ts, Some(1_700_000_000_000));
     }
 }

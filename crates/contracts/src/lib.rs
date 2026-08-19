@@ -38,4 +38,4 @@ pub use context_payload::{
 pub use event::{Event, EventType};
 pub use gpu_job::{GpuJob, GpuJobKind, GpuScheduler, JobError, JobOutput};
 pub use reasoning::{Health, ReasoningTransport, TransportError, TransportId};
-pub use suggestions::{BubbleSpec, StructuredSuggestions, SuggestionCandidate};
+pub use suggestions::{BubbleSpec, ExclusionOffer, StructuredSuggestions, SuggestionCandidate};

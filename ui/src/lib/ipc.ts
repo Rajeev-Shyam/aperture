@@ -25,17 +25,40 @@ import { listen, type UnlistenFn, type Event as TauriEvent } from "@tauri-apps/a
  *  differently is the small "via Claude" source tag. */
 export type SuggestionSource = "local" | "claude";
 
+/** Mirror of `suggestions::ExclusionOffer` — a ready-to-apply "stop capturing
+ *  this" rule for the bubble's ⋯ menu (decision #8). The core derives BOTH the
+ *  match kind and the (escaped) pattern, because a hand-built regex that fails
+ *  to compile becomes a rule the Privacy panel shows as active protection while
+ *  it silently matches nothing. The UI only renders `label` and passes the pair
+ *  straight to `addExclusion`. */
+export interface ExclusionOffer {
+  /** What the menu item names, e.g. `"docs.rs"` or `"Slack"`. */
+  label: string;
+  match_kind: ExclusionKind;
+  pattern: string;
+}
+
 /** Mirror of `suggestions::BubbleSpec` (contracts/src/suggestions.rs).
  *  `action_ref` resolves to a connector on click (Critical Path B, doc 02 §5). */
 export interface BubbleSpec {
   title: string;
-  /** Connector-type glyph. */
+  /** Connector-type glyph — a SEMANTIC token (`"video" | "globe" | "doc" |
+   *  "code" | "switch" | "spark"`), not a character. Presentation is the UI's
+   *  (see `glyphMark` in Bubble.tsx), so persisted rows and new ones render the
+   *  same mark even after the design pass changes it. */
   glyph: string;
   /** e.g. `"12:34 · 2h ago"`. */
   sublabel: string | null;
   action_ref: string;
   source: SuggestionSource;
   confidence: number;
+  /** Epoch ms this suggestion was created — the freshness half of the slot
+   *  admission score (decision #5). Absent/null on rows written before the
+   *  column existed; the score then falls back to confidence alone. */
+  created_ts?: number | null;
+  /** One-click exclusion rules for the ⋯ menu (decision #8). May be empty:
+   *  nothing honestly derivable (e.g. an IDE payload names no process). */
+  exclusion_offers?: ExclusionOffer[];
 }
 
 /** Mirror of `connector::OpenOutcome` (externally-tagged serde). The result of a
@@ -125,8 +148,15 @@ export type Health =
 
 export interface UiSettings {
   max_concurrent_bubbles: number;
+  /** How long a bubble sits in `idle` before mild-decay expiry (decision #7).
+   *  Read live: a `settings_changed` event re-applies it to bubbles that have
+   *  not started their dwell yet — no restart. */
   bubble_dwell_sec: number;
   max_glass_surfaces: number;
+  /** Half-life, seconds, of the freshness factor in the slot-admission score
+   *  (decision #5). Advanced/settings-only: it tunes queue ordering, not
+   *  anything the user can see happen. */
+  bubble_freshness_half_life_sec?: number;
   /** Where the HUD cluster (indicator + buttons) is anchored — user-draggable. */
   hud_anchor?: HudAnchor;
 }
@@ -155,13 +185,38 @@ export interface VoiceSettings {
   [key: string]: unknown;
 }
 
+/** The `reasoning` settings section. The Dashboard's Advanced tab edits
+ *  `transport_order` (decision #39); like `voice`, writes must merge the WHOLE
+ *  section — `set_settings` replaces top-level keys. Changing it REBUILDS the
+ *  gateway core-side, so the new order is live on the next Send. */
+export interface ReasoningSettings {
+  transport_order?: TransportTarget[];
+  payload_size_warn_kb?: number;
+  per_send_approval?: boolean;
+  [key: string]: unknown;
+}
+
+/** The `pattern_engine` settings section (decision #17). Every key is optional
+ *  and range-validated core-side — an out-of-range value falls back to the
+ *  crate constant rather than weakening the engine. */
+export interface PatternEngineSettings {
+  tau_conf?: number;
+  cold_start_support_floor?: number;
+  semantic_similarity_threshold?: number;
+  cooldown_min?: number;
+  cap_per_hour_floor?: number;
+  cap_per_hour_ceiling?: number;
+  cap_per_hour_default?: number;
+  session_gap_cold_start_min?: number;
+  half_life_sequence_days?: number;
+  half_life_temporal_days?: number;
+  [key: string]: unknown;
+}
+
 export interface Settings {
   ui?: UiSettings;
-  reasoning?: {
-    transport_order?: TransportTarget[];
-    payload_size_warn_kb?: number;
-    per_send_approval?: boolean;
-  };
+  reasoning?: ReasoningSettings;
+  pattern_engine?: PatternEngineSettings;
   voice?: VoiceSettings;
   // …other sections (capture/loadout/pattern_engine/privacy) are passed
   // through untyped; the overlay reads the `ui` + `reasoning` + `voice` blocks.
@@ -239,6 +294,24 @@ export type BubbleLifecycleState =
 export interface SuggestionLifecycleEvent {
   id: string;
   state: BubbleLifecycleState;
+}
+
+/** `"suggestion_rated"` — a 👍/👎 was recorded (decision #10). Broadcast so the
+ *  pressed thumb lights on EVERY monitor's copy of that bubble; the set thumb is
+ *  the only receipt the user gets that the signal landed, and it was appearing
+ *  on the window the click hit and nowhere else. Emitted only when the rating
+ *  actually changed, so it can never re-announce a no-op. */
+export interface SuggestionRatedEvent {
+  id: string;
+  rating: "up" | "down";
+}
+
+/** `"settings_changed"` — a `set_settings` write landed (decisions #7/#17/#39).
+ *  Surfaces that cached a settings value re-read it instead of waiting for a
+ *  restart. `sections` names the patch's top-level keys, so a listener can
+ *  ignore writes that are not its own. */
+export interface SettingsChangedEvent {
+  sections: string[];
 }
 
 /** `"audit_alert"` — an audit-trail write failed (decision #41): what egressed
@@ -697,6 +770,14 @@ export const onVoiceSurface = (h: (e: VoiceSurfaceEvent) => void) =>
 
 export const onSuggestionLifecycle = (h: (e: SuggestionLifecycleEvent) => void) =>
   on<SuggestionLifecycleEvent>("suggestion_lifecycle", h);
+
+/** `"suggestion_rated"` — a thumb was recorded; every window sets it. */
+export const onSuggestionRated = (h: (e: SuggestionRatedEvent) => void) =>
+  on<SuggestionRatedEvent>("suggestion_rated", h);
+
+/** `"settings_changed"` — re-read the settings you cached (decisions #7/#17). */
+export const onSettingsChanged = (h: (e: SettingsChangedEvent) => void) =>
+  on<SettingsChangedEvent>("settings_changed", h);
 
 /** `"audit_alert"` — an audit write failed (decision #41); the primary overlay
  *  shows the dismissible warning banner. */

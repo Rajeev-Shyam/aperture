@@ -21,12 +21,18 @@ import {
   recordFeedback,
   setAutostart,
   setSettings,
+  transportHealth,
   vlmDownload,
   vlmStatus,
   type DashboardStats,
+  type Health,
   type HistoryEvent,
+  type PatternEngineSettings,
   type PatternRow,
+  type ReasoningSettings,
   type SuggestionHistoryRow,
+  type TransportTarget,
+  type UiSettings,
   type VlmFetchEvent,
   type VlmStatus,
   type VoiceSettings,
@@ -34,7 +40,7 @@ import {
 import { useDraggable } from "../state/useDraggable";
 import { useModalSurface } from "../state/useModalSurface";
 
-type Tab = "overview" | "history" | "patterns" | "suggestions" | "voice";
+type Tab = "overview" | "history" | "patterns" | "suggestions" | "voice" | "advanced";
 
 const TABS: { id: Tab; label: string; hint: string }[] = [
   { id: "overview", label: "Overview", hint: "What Aperture holds right now" },
@@ -42,6 +48,7 @@ const TABS: { id: Tab; label: string; hint: string }[] = [
   { id: "patterns", label: "Patterns", hint: "Habits the engine has mined" },
   { id: "suggestions", label: "Suggestions", hint: "Every bubble ever surfaced" },
   { id: "voice", label: "Voice", hint: "Push-to-talk transcripts" },
+  { id: "advanced", label: "Advanced", hint: "Tuning: bubbles, habits, transport" },
 ];
 
 interface Props {
@@ -110,6 +117,7 @@ export function Dashboard({ onClose, onOpenPrivacy }: Props) {
           {tab === "patterns" && <PatternsTab />}
           {tab === "suggestions" && <SuggestionsTab />}
           {tab === "voice" && <VoiceTab />}
+          {tab === "advanced" && <AdvancedTab />}
         </main>
       </div>
     </div>
@@ -462,6 +470,270 @@ function VoiceTab() {
       </label>
       {error && <p className="dash__error">{error}</p>}
       <HistoryTab kind="voice_utterance" />
+    </div>
+  );
+}
+
+// --- Advanced: the knobs that were settings-only ------------------------------
+// Everything here was already read by the core but had no control (decisions
+// #7, #17, #39): the dwell was a compile-time constant, the pattern_engine
+// block was re-read once a day, and the transport order was frozen at launch.
+// `set_settings` now announces its write, so each of these applies live —
+// that is the difference between a control and a next-launch preference.
+//
+// Every write MERGES its whole section: `set_settings` replaces top-level keys,
+// so patching one field alone would drop its siblings.
+
+/** One labelled slider over a settings number. */
+function Knob({
+  label,
+  hint,
+  min,
+  max,
+  step,
+  value,
+  format,
+  onChange,
+}: {
+  label: string;
+  hint: string;
+  min: number;
+  max: number;
+  step: number;
+  value: number | null;
+  format: (v: number) => string;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <label className="dash__setting dash__setting--slider">
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value ?? min}
+        // null = the settings read has not landed. Disabled rather than
+        // showing (and potentially persisting over) a value that may be a lie.
+        disabled={value === null}
+        aria-label={label}
+        onChange={(e) => onChange(Number(e.target.value))}
+      />
+      <span>
+        {label} — <strong>{value === null ? "…" : format(value)}</strong>
+        <span className="dash__setting-sub">{hint}</span>
+      </span>
+    </label>
+  );
+}
+
+/** The push transports, in the order the radio offers them. MCP is deliberately
+ *  absent: it is pull-only (Claude Desktop asks Aperture), so it can never be
+ *  what a Send uses — offering it as a "preferred transport" would be a lie. */
+const PUSH_TRANSPORTS: { id: TransportTarget; label: string; hint: string }[] = [
+  {
+    id: "claude-cli",
+    label: "Claude CLI",
+    hint: "Runs the local `claude` binary. No API key, uses your CLI login.",
+  },
+  {
+    id: "messages-api",
+    label: "Messages API",
+    hint: "Direct HTTPS to api.anthropic.com. Needs an API key in settings.",
+  },
+];
+
+const ALL_TRANSPORTS: TransportTarget[] = [
+  "claude-desktop-mcp",
+  "claude-cli",
+  "messages-api",
+];
+
+function healthLabel(h: Health | undefined): string {
+  if (!h) return "checking…";
+  if (h.kind === "ready") return "ready";
+  return `${h.kind === "needs_setup" ? "needs setup" : "unavailable"} — ${h.detail}`;
+}
+
+function AdvancedTab() {
+  // Whole sections, kept so each write merges instead of clobbering siblings.
+  const ui = useRef<UiSettings | null>(null);
+  const reasoning = useRef<ReasoningSettings>({});
+  const engine = useRef<PatternEngineSettings>({});
+
+  const [dwellSec, setDwellSec] = useState<number | null>(null);
+  const [order, setOrder] = useState<TransportTarget[] | null>(null);
+  const [knobs, setKnobs] = useState<PatternEngineSettings | null>(null);
+  const [health, setHealth] = useState<Partial<Record<TransportTarget, Health>>>({});
+  const [error, setError] = useState<string | null>(null);
+
+  function refresh() {
+    void getSettings()
+      .then((s) => {
+        ui.current = s.ui ?? null;
+        reasoning.current = s.reasoning ?? {};
+        engine.current = s.pattern_engine ?? {};
+        setDwellSec(typeof s.ui?.bubble_dwell_sec === "number" ? s.ui.bubble_dwell_sec : 20);
+        setOrder(s.reasoning?.transport_order ?? null);
+        setKnobs(s.pattern_engine ?? {});
+      })
+      .catch((e) => setError(String(e)));
+  }
+
+  function refreshHealth() {
+    ALL_TRANSPORTS.forEach((t) => {
+      void transportHealth(t)
+        .then((h) => setHealth((cur) => ({ ...cur, [t]: h })))
+        .catch(() => {});
+    });
+  }
+
+  useEffect(() => {
+    refresh();
+    refreshHealth();
+  }, []);
+
+  /** Persist a merged patch and surface (never swallow) a failed write. */
+  function save(patch: Parameters<typeof setSettings>[0]) {
+    setError(null);
+    void setSettings(patch).catch((e) => setError(String(e)));
+  }
+
+  function updateDwell(sec: number) {
+    setDwellSec(sec);
+    ui.current = { ...(ui.current ?? ({} as UiSettings)), bubble_dwell_sec: sec };
+    save({ ui: ui.current });
+  }
+
+  function updateKnob(key: keyof PatternEngineSettings, v: number) {
+    setKnobs((cur) => ({ ...(cur ?? {}), [key]: v }));
+    engine.current = { ...engine.current, [key]: v };
+    save({ pattern_engine: engine.current });
+  }
+
+  /** Decision #39: move `pick` to the front of the order. MCP keeps its place
+   *  in the list — dropping it would silently unregister the pull path the
+   *  Claude Desktop flow uses; only the PUSH preference changes here. */
+  function preferTransport(pick: TransportTarget) {
+    const current = order ?? ALL_TRANSPORTS;
+    const next = [pick, ...current.filter((t) => t !== pick)];
+    setOrder(next);
+    reasoning.current = { ...reasoning.current, transport_order: next };
+    save({ reasoning: reasoning.current });
+    // The core rebuilds the gateway on this write; re-probe so the dots below
+    // describe the transports as they are NOW composed.
+    setTimeout(refreshHealth, 300);
+  }
+
+  // The transport a Send would actually use: first PUSH entry in the order.
+  const activePush =
+    (order ?? ALL_TRANSPORTS).find((t) => t !== "claude-desktop-mcp") ?? "claude-cli";
+
+  return (
+    <div>
+      <h2>Advanced</h2>
+      <p className="dash__lede">
+        Tuning for how often Aperture speaks up and where “Ask Claude” sends things. Every
+        control here applies immediately — no restart.
+      </p>
+      {error && <p className="dash__error">{error}</p>}
+
+      <h3 className="dash__subhead">Bubbles</h3>
+      <Knob
+        label="How long a bubble stays"
+        hint="Hovering pauses the countdown, so this is the time it waits while you are not looking at it."
+        min={5}
+        max={120}
+        step={1}
+        value={dwellSec}
+        format={(v) => `${v}s`}
+        onChange={updateDwell}
+      />
+
+      <h3 className="dash__subhead">When Aperture speaks up</h3>
+      <p className="dash__facts">
+        These tune the habit engine directly. Out-of-range values are ignored by the core in
+        favour of the shipped defaults, so a bad number can never make it noisier than its
+        built-in ceiling.
+      </p>
+      <Knob
+        label="Certainty before suggesting"
+        hint="Higher means fewer, more confident bubbles. Shipped default: 70%."
+        min={0.5}
+        max={0.95}
+        step={0.05}
+        value={typeof knobs?.tau_conf === "number" ? knobs.tau_conf : knobs ? 0.7 : null}
+        format={(v) => `${Math.round(v * 100)}%`}
+        onChange={(v) => updateKnob("tau_conf", v)}
+      />
+      <Knob
+        label="Repeats before it counts as a habit"
+        hint="How many times you must repeat a sequence before it can produce a bubble. Shipped default: 3."
+        min={2}
+        max={10}
+        step={1}
+        value={
+          typeof knobs?.cold_start_support_floor === "number"
+            ? knobs.cold_start_support_floor
+            : knobs
+              ? 3
+              : null
+        }
+        format={(v) => `${v}×`}
+        onChange={(v) => updateKnob("cold_start_support_floor", v)}
+      />
+      <Knob
+        label="Quiet time per habit"
+        hint="The same habit will not surface again inside this window. Shipped default: 30 minutes."
+        min={5}
+        max={180}
+        step={5}
+        value={typeof knobs?.cooldown_min === "number" ? knobs.cooldown_min : knobs ? 30 : null}
+        format={(v) => `${v} min`}
+        onChange={(v) => updateKnob("cooldown_min", v)}
+      />
+      <Knob
+        label="Suggestions per hour"
+        hint="The starting budget. Aperture opens or closes it on its own between 2 and 8 depending on whether you click them."
+        min={2}
+        max={8}
+        step={1}
+        value={
+          typeof knobs?.cap_per_hour_default === "number"
+            ? knobs.cap_per_hour_default
+            : knobs
+              ? 4
+              : null
+        }
+        format={(v) => `${v}/hr`}
+        onChange={(v) => updateKnob("cap_per_hour_default", v)}
+      />
+
+      <h3 className="dash__subhead">Where “Ask Claude” sends things</h3>
+      <p className="dash__facts">
+        Nothing is sent until you approve it in the preview — this only decides the route it
+        takes once you do.
+      </p>
+      {PUSH_TRANSPORTS.map((t) => (
+        <label key={t.id} className="dash__setting">
+          <input
+            type="radio"
+            name="push-transport"
+            checked={activePush === t.id}
+            disabled={order === null}
+            onChange={() => preferTransport(t.id)}
+          />
+          <span>
+            {t.label} <span className="dash__health">· {healthLabel(health[t.id])}</span>
+            <span className="dash__setting-sub">{t.hint}</span>
+          </span>
+        </label>
+      ))}
+      <p className="dash__facts">
+        Claude Desktop (MCP) is <strong>{healthLabel(health["claude-desktop-mcp"])}</strong>. It
+        is a pull route — Claude Desktop asks Aperture for context and you approve the request
+        — so it is never what a Send uses, and it stays available regardless of the choice
+        above.
+      </p>
     </div>
   );
 }
