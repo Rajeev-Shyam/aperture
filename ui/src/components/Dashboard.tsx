@@ -29,10 +29,8 @@ import {
   type HistoryEvent,
   type PatternEngineSettings,
   type PatternRow,
-  type ReasoningSettings,
   type SuggestionHistoryRow,
   type TransportTarget,
-  type UiSettings,
   type VlmFetchEvent,
   type VlmStatus,
   type VoiceSettings,
@@ -555,23 +553,22 @@ function healthLabel(h: Health | undefined): string {
 }
 
 function AdvancedTab() {
-  // Whole sections, kept so each write merges instead of clobbering siblings.
-  const ui = useRef<UiSettings | null>(null);
-  const reasoning = useRef<ReasoningSettings>({});
-  const engine = useRef<PatternEngineSettings>({});
-
   const [dwellSec, setDwellSec] = useState<number | null>(null);
   const [order, setOrder] = useState<TransportTarget[] | null>(null);
   const [knobs, setKnobs] = useState<PatternEngineSettings | null>(null);
   const [health, setHealth] = useState<Partial<Record<TransportTarget, Health>>>({});
   const [error, setError] = useState<string | null>(null);
 
+  // Edits waiting to be written, keyed by settings section. A range input fires
+  // onChange for EVERY step of a drag, and each write is a DB row + a
+  // broadcast to every window + a pattern-engine reconfigure — so the slider is
+  // debounced into one write per gesture rather than one per pixel.
+  const pending = useRef<Record<string, Record<string, unknown>>>({});
+  const flushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   function refresh() {
     void getSettings()
       .then((s) => {
-        ui.current = s.ui ?? null;
-        reasoning.current = s.reasoning ?? {};
-        engine.current = s.pattern_engine ?? {};
         setDwellSec(typeof s.ui?.bubble_dwell_sec === "number" ? s.ui.bubble_dwell_sec : 20);
         setOrder(s.reasoning?.transport_order ?? null);
         setKnobs(s.pattern_engine ?? {});
@@ -590,24 +587,58 @@ function AdvancedTab() {
   useEffect(() => {
     refresh();
     refreshHealth();
+    // A gesture still in flight when the panel closes must not be lost.
+    return () => {
+      if (flushTimer.current) clearTimeout(flushTimer.current);
+      void flush();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /** Persist a merged patch and surface (never swallow) a failed write. */
-  function save(patch: Parameters<typeof setSettings>[0]) {
+  /**
+   * Write every pending edit, merging each into the settings as they are RIGHT
+   * NOW rather than into a copy read when this tab mounted.
+   *
+   * `set_settings` replaces a whole top-level key, and `ui` has a second writer
+   * — the draggable HUD persists `ui.hud_anchor`. Merging into a mount-time
+   * snapshot would silently revert whatever that writer did in between, which
+   * is a lost update the user would experience as "my HUD jumped back".
+   */
+  async function flush() {
+    const batch = pending.current;
+    pending.current = {};
+    if (Object.keys(batch).length === 0) return;
+    try {
+      const current = await getSettings();
+      const patch: Record<string, unknown> = {};
+      for (const [section, fields] of Object.entries(batch)) {
+        const existing = (current[section] ?? {}) as Record<string, unknown>;
+        patch[section] = { ...existing, ...fields };
+      }
+      await setSettings(patch as Parameters<typeof setSettings>[0]);
+    } catch (e) {
+      // Never swallowed: a control that silently failed to persist is worse
+      // than one that says so — the user would keep trusting the slider.
+      setError(String(e));
+    }
+  }
+
+  /** Queue one field for the debounced write. */
+  function queueSave(section: string, fields: Record<string, unknown>) {
     setError(null);
-    void setSettings(patch).catch((e) => setError(String(e)));
+    pending.current[section] = { ...(pending.current[section] ?? {}), ...fields };
+    if (flushTimer.current) clearTimeout(flushTimer.current);
+    flushTimer.current = setTimeout(() => void flush(), 300);
   }
 
   function updateDwell(sec: number) {
     setDwellSec(sec);
-    ui.current = { ...(ui.current ?? ({} as UiSettings)), bubble_dwell_sec: sec };
-    save({ ui: ui.current });
+    queueSave("ui", { bubble_dwell_sec: sec });
   }
 
   function updateKnob(key: keyof PatternEngineSettings, v: number) {
     setKnobs((cur) => ({ ...(cur ?? {}), [key]: v }));
-    engine.current = { ...engine.current, [key]: v };
-    save({ pattern_engine: engine.current });
+    queueSave("pattern_engine", { [key]: v });
   }
 
   /** Decision #39: move `pick` to the front of the order. MCP keeps its place
@@ -617,11 +648,15 @@ function AdvancedTab() {
     const current = order ?? ALL_TRANSPORTS;
     const next = [pick, ...current.filter((t) => t !== pick)];
     setOrder(next);
-    reasoning.current = { ...reasoning.current, transport_order: next };
-    save({ reasoning: reasoning.current });
-    // The core rebuilds the gateway on this write; re-probe so the dots below
-    // describe the transports as they are NOW composed.
-    setTimeout(refreshHealth, 300);
+    // A radio is one click, not a drag — write it straight through so the
+    // gateway rebuild (and the health re-probe below) are not waiting on a
+    // debounce the user cannot see.
+    pending.current.reasoning = { ...(pending.current.reasoning ?? {}), transport_order: next };
+    void flush().then(() => {
+      // The core rebuilds the gateway on that write; re-probe so the dots
+      // describe the transports as they are NOW composed.
+      refreshHealth();
+    });
   }
 
   // The transport a Send would actually use: first PUSH entry in the order.
