@@ -17,7 +17,11 @@
 
 Verification at session end: `cargo test --workspace` green (0 failures, **0 warnings**), `tsc --noEmit` clean, `vite build` clean, `cargo run -p xtask -- lint-emitters` OK. 6 new shell tests, 7 new suggestion-generator tests, plus a 16-assertion scratch check of the pure admission helpers (the repo has no JS test runner; see "Verification" below for how to re-run it).
 
+Four of the 08-16 bridge's "small leftovers" are also closed (settings migration for upgraded installs, the Doc 04/ADR-030 amendment for #43, Doc 10's TTL values, the stale m9 assertion message) — see "Small leftovers" below.
+
 **Not done, deliberately:** batch 5 (the trust items, #3 + #1), and the rebuild/installer QA. The ⚠️ rebuild warning from the 08-16 bridge **still stands and now has one more reason** — see below.
+
+**On batch 5's sequencing, for whoever picks it up:** `PayloadItem::Screenshot` currently has **zero producers** — nothing in the codebase constructs one, and the enrichment toggle is still the disabled "(v2)" control in `ContextPreviewPanel.tsx`. So #3 is not "add redaction to a shipping feature", it is "build the image-redaction gate so the feature can be switched on at all". Scoping note from reading it: `Windows.Media.Ocr`'s `OcrWord` **does** carry a bounding rect, but `windows_media_ocr::aggregate_lines` takes `Vec<String>` and throws the geometry away — so a real OCR-then-redact-then-recompose pass needs the `OcrEngine` trait widened to return word boxes first, plus the `image` crate in `privacy`. That is a genuine multi-crate feature with a Windows-only, hard-to-unit-test leg; budget it as its own batch rather than a tail-end task.
 
 ## What was done, by decision
 
@@ -77,7 +81,7 @@ The sibling session (batches 1–3) left `docs/handoff/note-from-doc24-session-2
 
 ## Verification
 
-- `cargo test --workspace` — green, 0 failures, **0 warnings**. New: 6 in `aperture::commands::tests` (exactly-once feedback, mute→dismissed, rating-once-per-change, restored queue keeps ages + offers, connectorless rows still restore), 7 in `aperture-suggestion-generator` (per-connector offers, escaping, honest empties, `created_ts` stamp).
+- `cargo test --workspace` — green, 0 failures, **0 warnings**. New: 6 in `aperture::commands::tests` (exactly-once feedback, mute→dismissed, rating-once-per-change, restored queue keeps ages + offers, connectorless rows still restore), 7 in `aperture-suggestion-generator` (per-connector offers, escaping, honest empties, `created_ts` stamp), 6 in `aperture::tests` (the settings backfill's additive-only rule).
 - `tsc --noEmit` clean; `vite build` clean; `lint-emitters` OK (no new egress surface — the gateway rebuild reuses `build_gateway`).
 - **The pure UI helpers have no test runner.** They were verified with a scratch script kept at
   `…/scratchpad/check_admit.mjs` (16 assertions: score decay, the cap regression, single-slot promotion, ageing flipping the ranking, tuning clamps). Re-run by transpiling `ui/src/state/{bubbleLifecycle,glassBudget}.ts` to a temp dir and running it under node. **If a future session adds vitest, port these first** — they cover the two bugs above.
@@ -94,8 +98,15 @@ Everything in the 08-16 bridge's QA list, plus this session's: bubbles queueing 
 ### Deferred (owner/hardware-dependent)
 Unchanged: #25 GPU STT, #26 VAD/mic validation, SC3/SC4/PresentMon runs, the M5 load-times gate switch to `BudgetEnforcer::ceiling_gb()`.
 
-### Small leftovers (fold into any nearby session)
-Carried over from 08-16: doc 04/ADR-030 amendment for #43; docs 10 §2-5 TTL values; `gates/m9_privacy.rs:329` assertion message; Bearer-rule capture-group variant; Slack `xapp-`/`xoxe-`; `position_rank` treating Estimated as exact; persist temporal histograms + `app_class→process` map across restarts; VLM download cancel button; **settings-migration pass for upgraded installs** (now more pressing — `ui.bubble_freshness_half_life_sec` is a new key upgraded installs will not receive; the code default mirrors the seed, so behavior is correct, but the Advanced tab cannot show a value that was never seeded).
+### Small leftovers — four of the 08-16 list are CLOSED this session
+Closed here:
+- **Settings migration for upgraded installs** — `main::backfill_new_settings_keys` runs at every launch and adds seed keys the install never received, recursively and **additive-only** (a stored value is never overwritten at any depth; type mismatches are skipped rather than merged; `$comment` keys are skipped). This was made pressing by this batch's own new key: behavior was always correct (code defaults mirror the seed) but the Advanced tab cannot show a value that was never seeded. 6 tests, including "a current install is a no-op" over every section of the real seed file.
+- **Doc 04 + ADR-030 amendment for #43** — 7.0 GB is now documented as the *fallback*, with the ceiling derived at startup as `GPU total − 1.0 GB` clamped [2.0, 31.0]. Identical on the 8 GB dev machine; the invariant status is unchanged.
+- **Doc 10 §2-5 TTL values** — corrected to the code (browser 24 h, youtube 3 d, document 30 d, ide 30 d) after decision #37.
+- **`gates/m9_privacy.rs` assertion message** — reworded (and the test renamed) to say what it actually asserts since decision #20: the *compiled* bootstrap stays empty on purpose, because a compiled-in rule could never be deleted; the shipped defaults are a durable, deletable seed.
+
+Still open, carried over: Bearer-rule capture-group variant; Slack `xapp-`/`xoxe-`; `position_rank` treating Estimated as exact; persist temporal histograms + `app_class→process` map across restarts; VLM download cancel button; the M5 load-times gate still asserting the VRAM constant instead of `BudgetEnforcer::ceiling_gb()`.
+
 New from this session: the `promote`/`admissionScore` scratch checks want a real test runner; `Bubble.onExited` is now belt-and-braces dead code (kept deliberately, documented).
 
 ### Decisions explicitly "No action" (do NOT re-open without asking)

@@ -25,18 +25,18 @@ Registry: connectors self-register at startup; the pattern engine and Bubble UI 
   1. the **browser extension content script** reads `video.currentTime` directly — the primary, reliable position source;
   2. `t=` present in the observed URL (e.g., after the user used "copy at current time") — exact fallback;
   3. otherwise position unknown ⇒ store `position_s = null` (the bubble then says "from the start").
-- **Payload v1:** `{video_id, url, title, position_s|null, observed_ts}`; TTL **7 d** [ASSUMPTION].
+- **Payload v1:** `{video_id, url, title, position_s|null, observed_ts, position_source}`; TTL **3 d** (owner decision #37, 2026-08-16: 7 d → 3 d — a video position goes stale fast, and "resume where you left off" on a week-old watch is noise).
 - **Reconstruct:** `https://www.youtube.com/watch?v=<id>&t=<s>s` (use `&` when params exist, `?` otherwise; `youtu.be/<id>?t=<s>` equivalent). `null` position ⇒ plain watch URL and the bubble says "from the start" (US1 acceptance d).
 - This is the **first connector built at M4** (Q75) — it exercises the whole extension + native-messaging path earliest; the `t=` and `null`→"from the start" rungs remain as fallbacks.
 
 ## 4. Documents
 - **Capture:** on `document_state` / focus of known editors — path resolution ladder: (1) full path present in the window title; (2) title filename matched against Windows Recent Items; (3) **per-app MRU registry reads** (e.g. each app's recent-files list under its registry hive) — more robust than title-parse but **`[VERIFY]` / version-fragile per app**; (4) unresolved ⇒ no capture (the floor — never guess a path).
-- **Payload v1:** `{path, app_hint, title}`; TTL **7 d**, and `reconstruct` re-checks the file exists. The opt-in `app_hint` is unchanged.
+- **Payload v1:** `{path, app_hint, title}`; TTL **30 d** (decision #37: 7 d → 30 d — a document you were editing stays worth reopening far longer than a video stays worth resuming), and `reconstruct` re-checks the file exists. The opt-in `app_hint` is unchanged.
 - **Open:** `ShellExecuteW(path)` (default handler); `app_hint` used only if the default differs and the user opted into "open with same app" [ASSUMPTION]. Missing file ⇒ offer the containing folder.
 
 ## 5. IDE files (VS Code first)
 - **Capture:** `ide_state` — the resolution **method (title-parse vs reading `state.vscdb` vs `code -g`) is decided at the M4 spike, per VS Code version** (Q56). Baseline is title parsing — `"● {file} - {workspace} - Visual Studio Code"` (dirty-dot aware) [VERIFY per VS Code version]; path resolved via workspace MRU when the title holds only a filename. Line/col are best-effort (a prior precise `ide_state` if any); else null.
-- **Payload v1:** `{path, line|null, col|null, workspace}`; TTL **7 d**.
+- **Payload v1:** `{path, line|null, col|null, workspace}`; TTL **30 d** (decision #37, same reasoning as documents).
 - **Reconstruct:** `vscode://file/{abs_path}:{line}:{col}` (documented URI form) → protocol handler; fallback `code -g {path}:{line}` CLI [VERIFY availability]; final fallback: plain file open.
 - Other editors are v2 connectors behind the same trait (each needs its own scheme: `jetbrains://`, etc.).
 
@@ -53,3 +53,11 @@ CPU-trivial; capture work rides the existing event pipeline; no GPU, no network.
 
 ---
 > **R2 amendments applied** (see docs/19–21): ADR-027 (browser extension is v1 — browser URL + YouTube position), ADR-035 (validate-on-click); Q90 (v2 comms-thread expansion), Q75 (YouTube built first at M4), Q62 (per-app MRU registry reads), Q56 (VS Code method at M4 spike), Q57 (browser TTL 24 h unchanged).
+
+## Implementation status (2026-08-19) — TTL values reconciled with the code
+
+Owner decision #37 (Doc 24) differentiated the staleness TTLs on 2026-08-16; the per-type values above were still the pre-decision flat 7 d and are now corrected to match `crates/connectors` (browser 24 h, youtube 3 d, document 30 d, ide 30 d — pinned by a test in `connectors/src/lib.rs`). The `Connector::staleness_ttl` trait method was already per-type before that decision; only the values were flat, which is why Doc 23 read this as "flat 7 days for every connector type".
+
+`config/settings.default.json`'s `connectors.*_ttl_*` keys mirror these numbers and remain **informational** — the values live as constants in the crate until a settings-load pass wires overrides.
+
+The bubble's ⋯ menu now also offers a one-click exclusion derived from the connector state (owner decision #8): the *site* for browser/youtube, the owning *process* for document, and nothing for ide — its payload names no process, and a guessed rule protects nothing. See doc 11's 2026-08-19 status section.

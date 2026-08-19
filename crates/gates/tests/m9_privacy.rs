@@ -322,11 +322,23 @@ fn m9_private_windows_are_excluded_with_no_rules_configured() {
     assert!(!out[0].capture_frame, "incognito is never framed (doc 13 §4)");
 }
 
-/// ADR-029/Q15 held: nothing ships excluded by default, and detect-and-suggest
-/// only ever produces candidates — it must never auto-apply.
+/// The COMPILED bootstrap list stays empty, and detect-and-suggest only ever
+/// produces candidates — it must never auto-apply.
+///
+/// Note what this does and does not assert since owner decision #20 (Doc 24,
+/// 2026-08-16) amended ADR-029/Q15: Aperture *does* now ship curated default
+/// exclusions (password managers, banking patterns), but they are seeded ONCE
+/// into the durable `exclusion_list` table, where the user can disable or
+/// permanently delete them. `shipped_defaults()` stays empty on purpose —
+/// a compiled-in list could never be deleted, and would resurrect rules the
+/// user removed. That distinction is exactly what this asserts.
 #[test]
-fn m9_defaults_ship_empty_and_suggestions_are_not_applied() {
-    assert!(ExclusionList::shipped_defaults().is_empty(), "ADR-029/Q15: empty defaults");
+fn m9_compiled_defaults_stay_empty_and_suggestions_are_not_applied() {
+    assert!(
+        ExclusionList::shipped_defaults().is_empty(),
+        "the compiled bootstrap must stay empty (decision #20): out-of-box rules \
+         ship as a durable, deletable seed, never as a list the user cannot remove"
+    );
 
     let suggestions =
         aperture_privacy::detect_suggest::suggest_from(&["1password.exe".into()], &[]);
