@@ -39,6 +39,30 @@ pub struct PreviewStore {
     pub approved: std::collections::HashMap<uuid::Uuid, String>,
 }
 
+/// The reasoning gateway **and** the push target derived from the same
+/// `reasoning.transport_order` (owner decision #39, 2026-08-16), kept in one
+/// swappable cell.
+///
+/// They travel together because they are two readings of one setting: the
+/// gateway walks the order to pick a healthy PUSH transport, and `push_target`
+/// is the intended-transport line the preview shows the user before they
+/// approve. Storing them apart made it possible to update one and not the
+/// other, i.e. to show a transport that Send would not use.
+///
+/// Swappable because the order was previously frozen at process start: changing
+/// transports meant editing settings and relaunching. Decision #39 asks for the
+/// switch to be trivial, so `set_settings` rebuilds this cell in place. An
+/// in-flight Send is unaffected — it holds its own `Arc<Gateway>` clone and
+/// finishes on the transport it started with.
+pub struct GatewaySlot {
+    /// The ONLY field that may reach the network, and only via `preview_send`
+    /// with an approved payload (doc 13 §2).
+    pub gateway: Arc<Gateway>,
+    /// First *push* transport in the configured order (MCP is pull-only and
+    /// serves the handoff path, so it is never this).
+    pub push_target: aperture_contracts::TransportTarget,
+}
+
 /// Injected into every `#[tauri::command]` via `tauri::State<AppState>`.
 ///
 /// Clonable: every field is an `Arc` so commands share one set of handles.
@@ -85,18 +109,16 @@ pub struct AppState {
     /// Mutex because every mutation persists to the encrypted DB.
     pub consent: Arc<tokio::sync::Mutex<aperture_privacy::consent::ConsentManager>>,
 
-    /// The reasoning gateway (doc 09) — the ONLY field that may reach the
-    /// network, and only via `preview_send` with an approved payload (doc 13 §2).
+    /// The reasoning gateway + its push target (doc 09), rebuildable at runtime
+    /// when `reasoning` settings change (decision #39). Read through
+    /// [`AppState::gateway`] / [`AppState::push_target`]: both clone out of the
+    /// lock immediately, so no guard is ever held across an `await`.
     /// Carries the DB-backed `AuditLog` via `Gateway::with_audit`.
-    pub gateway: Arc<Gateway>,
+    pub reasoning: Arc<std::sync::RwLock<GatewaySlot>>,
 
     /// In-flight preview sessions (doc 13 §3): built by `request_preview`,
     /// approved by `preview_set_approved`, consumed by `preview_send`.
     pub previews: Arc<tokio::sync::Mutex<PreviewStore>>,
-
-    /// The intended transport line the preview shows: the first *push* transport
-    /// in the settings order (MCP is pull-only and serves the handoff path).
-    pub push_target: aperture_contracts::TransportTarget,
 
     /// Voice subsystem handle (doc 07, M6): commands + the last completed
     /// transcript (seeds the `answer_query` preview's `user_addition`).
@@ -111,6 +133,22 @@ pub struct AppState {
     /// spawner uses (= where a download lands) + the in-flight guard. Read by
     /// `vlm_status`; `vlm_download` runs the user-initiated fetch against it.
     pub vlm_fetch: Arc<crate::vlm_fetch::VlmFetchState>,
+
+    /// Settings-write notifier (owner decision #17's UI half, 2026-08-16).
+    ///
+    /// Long-lived tasks that cached a settings block need to be told it moved.
+    /// The pattern task re-read its `pattern_engine` block on a **24-hour**
+    /// maintenance tick, which is a fine cadence for a config file and a
+    /// useless one for a Dashboard slider — the user changes τ_conf and sees
+    /// nothing happen until tomorrow. `set_settings` pings this after the write
+    /// so the re-read is immediate; the daily tick stays as the backstop for
+    /// edits made outside the app.
+    ///
+    /// Carries the patch's top-level section names, so a listener can ignore
+    /// writes that are not its own. A broadcast channel because the set of
+    /// listeners will grow; a lagged/absent receiver is never an error here —
+    /// the daily re-read still covers it.
+    pub settings_reload_tx: tokio::sync::broadcast::Sender<Vec<String>>,
 }
 
 impl AppState {
@@ -129,11 +167,12 @@ impl AppState {
         snooze_until: Arc<std::sync::atomic::AtomicI64>,
         connectors: Arc<aperture_connectors::ConnectorRegistry>,
         consent: Arc<tokio::sync::Mutex<aperture_privacy::consent::ConsentManager>>,
-        gateway: Arc<Gateway>,
+        gateway: Gateway,
         push_target: aperture_contracts::TransportTarget,
         voice: crate::voice::VoiceHandle,
         exclusions: ExclusionList,
         vlm_fetch: Arc<crate::vlm_fetch::VlmFetchState>,
+        settings_reload_tx: tokio::sync::broadcast::Sender<Vec<String>>,
     ) -> Self {
         Self {
             bus,
@@ -144,12 +183,38 @@ impl AppState {
             snooze_until,
             connectors,
             consent,
-            gateway,
+            reasoning: Arc::new(std::sync::RwLock::new(GatewaySlot {
+                gateway: Arc::new(gateway),
+                push_target,
+            })),
             previews: Arc::new(tokio::sync::Mutex::new(PreviewStore::default())),
-            push_target,
             voice,
             exclusions,
             vlm_fetch,
+            settings_reload_tx,
         }
+    }
+
+    /// The live gateway. Returns an owned `Arc` so the caller can `await` a Send
+    /// without holding the lock — a rebuild mid-Send is then simply invisible to
+    /// that Send (decision #39).
+    pub fn gateway(&self) -> Arc<Gateway> {
+        Arc::clone(&self.reasoning.read().unwrap_or_else(|p| p.into_inner()).gateway)
+    }
+
+    /// The transport a Send would use right now — what the preview footer must
+    /// name, read from the same cell the gateway comes from so the two can never
+    /// disagree after a switch.
+    pub fn push_target(&self) -> aperture_contracts::TransportTarget {
+        self.reasoning.read().unwrap_or_else(|p| p.into_inner()).push_target
+    }
+
+    /// Install a rebuilt gateway + push target (decision #39). Called only from
+    /// `set_settings` after a `reasoning` write; the previous gateway stays
+    /// alive for as long as any in-flight Send holds it.
+    pub fn swap_gateway(&self, gateway: Gateway, push_target: aperture_contracts::TransportTarget) {
+        let mut slot = self.reasoning.write().unwrap_or_else(|p| p.into_inner());
+        slot.gateway = Arc::new(gateway);
+        slot.push_target = push_target;
     }
 }

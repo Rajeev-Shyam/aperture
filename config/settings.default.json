@@ -47,7 +47,7 @@
   },
 
   "pattern_engine": {
-    "$comment": "Read by the pattern task at startup and re-read on its daily maintenance tick (decision #17, 2026-08-16). Missing/invalid keys fall back to the crate constants in pattern-engine/src/config.rs — a typo can never weaken the engine.",
+    "$comment": "Read by the pattern task at startup, on any set_settings write (decision #17's UI half — the Dashboard Advanced tab edits tau_conf / cold_start_support_floor / cooldown_min / cap_per_hour_default live), and on its daily maintenance tick as the backstop for edits made outside the app. Missing/invalid keys fall back to the crate constants in pattern-engine/src/config.rs — a typo can never weaken the engine.",
     "tau_conf": 0.7,
     "cold_start_support_floor": 3,
     "semantic_similarity_threshold": 0.75,
@@ -65,14 +65,17 @@
 
   "ui": {
     "max_concurrent_bubbles": 3,
+    "$comment_dwell": "Decision #7 (2026-08-16): now WIRED to the bubble's idle countdown (it was a compile-time constant) and editable from the Dashboard's Advanced tab. Clamped to 3-600 s by the overlay; a set_settings write applies to the next bubble, no restart.",
     "bubble_dwell_sec": 20,
     "max_glass_surfaces": 2,
-    "$comment_glass": "ADR-039: at most 2 glass surfaces; the 3rd visible bubble renders in the opaque fallback class. Blur ceiling 12 px (doc 14 §2)."
+    "$comment_glass": "ADR-039: at most 2 glass surfaces; the 3rd visible bubble renders in the opaque fallback class. Blur ceiling 12 px (doc 14 §2).",
+    "$comment_freshness": "Decision #5 (2026-08-16): half-life of the freshness factor in the bubble slot-admission score (score = confidence x 0.5^(age/half_life)), so a stale-but-confident queued bubble cannot block a fresher one forever. Settings-only on purpose — it tunes queue ordering, not anything visible. Clamped to 10-86400 s.",
+    "bubble_freshness_half_life_sec": 600
   },
 
   "reasoning": {
     "transport_order": ["claude-desktop-mcp", "claude-cli", "messages-api"],
-    "$comment_transport": "MCP-primary (ADR-025): Desktop MCP -> Claude CLI -> Messages API.",
+    "$comment_transport": "MCP-primary (ADR-025): Desktop MCP -> Claude CLI -> Messages API. Decision #39 (2026-08-16) keeps this default but makes switching trivial: the Dashboard's Advanced tab moves the preferred PUSH transport (CLI / Messages API) to the front, and set_settings REBUILDS the gateway in place, so the change is live on the next Send with no restart. MCP stays in the list either way — it is the pull route Claude Desktop uses and is never what a Send picks. If the default itself is ever flipped, amend ADR-025 (doc 19) + doc 09.",
     "payload_size_warn_kb": 50,
     "per_send_approval": true,
     "$comment_scoped_allow": "ADR-026 scoped always-allow was never implemented in v1 — the dead scoped_allow_* keys were removed (2026-08-15 review) so settings only advertise built behavior. Scoped allow returns with v2's per-task approval (Doc 22 §4.1).",

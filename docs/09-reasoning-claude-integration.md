@@ -64,3 +64,14 @@ Full session detail: `docs/handoff/session-bridge-2026-07-08-m6-m8.md`.
 ## Implementation status (2026-08-13) — gateway wired into the shell
 
 `main::build_gateway` composes the settings-ordered transports (MCP → CLI → API; model id + endpoint + headers all from settings, NG8) with the DB-backed `AuditLog` via `Gateway::with_audit`. The preview commands are real, with a content-bound gate hardened by the 2026-08-13 review: `preview_set_approved` syncs the panel's edits into the core-owned session, re-runs redaction (refusing approval when it changes anything the user hasn't seen), and records a SHA-256 over the canonical bytes; `preview_send` takes only the payload id, re-verifies the hash, ships the CORE object, and restores the session on transport failure so Send is retryable. `preview_cancel` drops the session (zero residue). Deferred: the MCP stdio server + `aperture_get_context` gate; the gated `aperture_search_history` UX decision. Full detail: `docs/handoff/session-bridge-2026-08-13-v1-wiring.md`.
+
+## Implementation status (2026-08-19) — the transport order is switchable at runtime (decision #39)
+
+ADR-025's **MCP-primary default is unchanged**; what changed is that it is no longer a decision you have to relaunch to revise. The order was read once, when `build_gateway` composed the transport list at process start, so `reasoning.transport_order` was effectively a boot flag.
+
+- `AppState` now holds a `GatewaySlot { gateway, push_target }` behind an `RwLock`, and `set_settings` rebuilds it whenever the patch touches `reasoning`. Both halves move together because they are two readings of one setting — the gateway walks the order to pick a healthy **push** transport, and `push_target` is the intended-transport line the preview shows before approval; stored apart, they could disagree about what a Send would do.
+- Reads clone the `Arc<Gateway>` out of the lock immediately, so no guard is ever held across an `await` and an in-flight Send finishes on the transport it started with.
+- The Dashboard's **Advanced** tab offers the push transports (Claude CLI / Messages API) as a radio with live per-transport health, and moves the choice to the front of the order. MCP keeps its place in the list either way — it is the pull route Claude Desktop uses and `pick_healthy_transport` already skips it, so removing it would only unregister a path the switch was never about.
+- **If the shipped default is ever flipped away from MCP-primary, amend ADR-025 (doc 19) and this doc** — making the switch easy is deliberately not the same as changing the default.
+
+Full session detail: `docs/handoff/session-bridge-2026-08-19-doc24-batch4.md`.

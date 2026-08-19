@@ -1054,7 +1054,7 @@ mod tests {
             (tok.resource_class.as_deref() == Some("youtube")).then(youtube_state)
         };
         // One SC2 repetition (ide focus → youtube nav → slack focus).
-        let mut rep = |engine: &mut PatternEngine, ts: &mut i64| -> Vec<SuggestionCandidate> {
+        let rep = |engine: &mut PatternEngine, ts: &mut i64| -> Vec<SuggestionCandidate> {
             *ts += 12 * MIN;
             let ctx = EngineContext { connector_lookup: &lookup, now_ms: *ts };
             let got = engine.on_event(&focus_event(*ts, "code.exe"), &ctx);

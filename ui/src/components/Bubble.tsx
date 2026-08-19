@@ -1,7 +1,8 @@
 //! A single Bubble (doc 11 §3 anatomy, doc 14 §3/§4 recipe + states).
 //
 //  Anatomy: glyph · title · sublabel · Resume (primary) · dismiss (×) · overflow
-//  (⋯ → "Ask Claude about this" / "Mute this pattern" / "Exclude this app").
+//  (⋯ → "Ask Claude about this" / "Mute this pattern" / "Stop capturing X" /
+//  "Exclusions…").
 //
 //  Lifecycle (doc 11 §3): queued ─► entering(180ms) ─► idle(dwell 20s, hover
 //  pauses) ─► clicked/dismissed/expired ─► exit. Hover PAUSES the dwell; this
@@ -15,8 +16,38 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
-import { openPrivacy, type BubbleLifecycleState } from "../lib/ipc";
+import {
+  addExclusion,
+  listExclusions,
+  openPrivacy,
+  setExclusion,
+  type BubbleLifecycleState,
+  type ExclusionOffer,
+} from "../lib/ipc";
 import { DEFAULTS, DwellTimer, type BubbleInstance } from "../state/bubbleLifecycle";
+
+/** Connector-type token → the mark rendered in the 28 px glyph chip.
+ *
+ *  `BubbleSpec.glyph` carries a SEMANTIC token ("video", "globe", …), which the
+ *  suggestion generator also persists into the `suggestions` row — so the token
+ *  is a stored value and the mark must be chosen here, at render, or a restored
+ *  row would forever show whatever the mark was on the day it was written.
+ *  (It was previously rendered verbatim, i.e. the literal word "video" inside a
+ *  28 px box.) An unknown token falls back to the neutral mark rather than
+ *  printing itself — v2 connectors (doc 15 §3) render without a UI change.
+ *  [VERIFY — final set lands with the M8 design-token pass, doc 14.] */
+const GLYPH_MARKS: Record<string, string> = {
+  video: "▶",
+  globe: "🌐",
+  doc: "📄",
+  code: "⌨",
+  switch: "⇄",
+  spark: "✦",
+};
+
+export function glyphMark(token: string): string {
+  return GLYPH_MARKS[token] ?? GLYPH_MARKS.spark;
+}
 
 interface Props {
   instance: BubbleInstance;
@@ -26,6 +57,14 @@ interface Props {
   onMute: () => void;
   /** The explicit "useful?" thumbs — the SC7 signal (doc 11 §3, Q81). */
   onRate: (kind: "up" | "down") => void;
+  /** The rating recorded for this suggestion, from the container's shared map.
+   *  It lives there rather than here so a thumb pressed on one monitor lights
+   *  on all of them (decision #10) and survives this component remounting. */
+  rated?: "up" | "down" | null;
+  /** Idle dwell for THIS bubble, from `ui.bubble_dwell_sec` (decision #7).
+   *  Captured when the bubble enters `idle`: changing the setting must not
+   *  restart a countdown the user is already watching. */
+  dwellMs?: number;
   /** Fired after the exit animation completes — container drops the bubble. */
   onExited: () => void;
   /** Report a self-driven transition (e.g. entering->idle, expired). */
@@ -48,12 +87,22 @@ export function Bubble({
   onExited,
   onLifecycle,
   onAskClaude,
+  rated = null,
+  dwellMs = DEFAULTS.dwellMs,
   opaque = false,
 }: Props) {
   const { spec, state } = instance;
   const [overflowOpen, setOverflowOpen] = useState(false);
-  // Local echo of the "useful?" rating so the pressed thumb stays visibly set.
-  const [rated, setRated] = useState<"up" | "down" | null>(null);
+  // Decision #8: the applied rule, so the menu can confirm it and offer Undo.
+  // `id` is the durable `exclusion_list` row id `add_exclusion` returned;
+  // `prior` records what that row was BEFORE the click, which is what Undo has
+  // to restore (see `applyExclusion`).
+  const [excluded, setExcluded] = useState<{
+    label: string;
+    id: number;
+    prior: "absent" | "disabled" | "enabled";
+  } | null>(null);
+  const [excludeError, setExcludeError] = useState<string | null>(null);
   // The overflow menu is PORTALLED to <body>: `.bubble` sets `contain: strict`
   // (bound rasterization, doc 14 §3), which clips any absolutely-positioned
   // descendant — so an in-tree menu never paints. We render it fixed-positioned
@@ -83,10 +132,12 @@ export function Bubble({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state]);
 
-  // idle: run the 12s dwell; expiry -> mild-decay exit (doc 11 §3).
+  // idle: run the configured dwell; expiry -> mild-decay exit (doc 11 §3).
+  // `dwellMs` is intentionally NOT in the dep list: a settings change mid-dwell
+  // would otherwise restart the countdown of a bubble already on screen.
   useEffect(() => {
     if (state !== "idle") return;
-    const timer = new DwellTimer(() => onLifecycle("expired"), DEFAULTS.dwellMs);
+    const timer = new DwellTimer(() => onLifecycle("expired"), dwellMs);
     dwellRef.current = timer;
     timer.start();
     return () => {
@@ -112,9 +163,66 @@ export function Bubble({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state]);
 
-  // Hover pauses the dwell countdown (doc 11 §3).
-  const onMouseEnter = () => dwellRef.current?.pause();
-  const onMouseLeave = () => dwellRef.current?.resume();
+  // Hover pauses the dwell countdown (doc 11 §3). The ⋯ menu pauses it too:
+  // it is PORTALLED to <body>, so opening it and moving the cursor onto it
+  // fires this bubble's mouseleave — the dwell resumed and could expire the
+  // bubble (unmounting the menu) mid-decision. That matters much more now that
+  // the menu holds a real, consequential action (decision #8).
+  const hoveringRef = useRef(false);
+  const onMouseEnter = () => {
+    hoveringRef.current = true;
+    dwellRef.current?.pause();
+  };
+  const onMouseLeave = () => {
+    hoveringRef.current = false;
+    if (!overflowOpen) dwellRef.current?.resume();
+  };
+  useEffect(() => {
+    if (overflowOpen) dwellRef.current?.pause();
+    // Closing the menu must not out-vote an active hover (doc 11 §3).
+    else if (!hoveringRef.current) dwellRef.current?.resume();
+  }, [overflowOpen]);
+
+  /** Apply one offer (decision #8). The bubble deliberately STAYS: excluding an
+   *  app is a capture decision, not a judgment on this suggestion, and the menu
+   *  has to remain mounted to offer Undo.
+   *
+   *  The pre-read is what makes Undo safe. `add_exclusion` is idempotent on
+   *  `(match_kind, pattern)` and **re-enables** a matching row rather than
+   *  inserting a second one — so without knowing the row's prior state, "Undo"
+   *  would delete a rule the user had set up earlier and merely switched off,
+   *  or switch off one that was already protecting them. */
+  async function applyExclusion(offer: ExclusionOffer) {
+    setExcludeError(null);
+    try {
+      const match = (await listExclusions()).find(
+        (r) => r.match_kind === offer.match_kind && r.pattern === offer.pattern,
+      );
+      if (match?.enabled) {
+        // Nothing to do and nothing to undo — say so instead of pretending the
+        // click changed something.
+        setExcluded({ label: offer.label, id: match.id, prior: "enabled" });
+        return;
+      }
+      const id = await addExclusion(offer.match_kind, offer.pattern);
+      setExcluded({ label: offer.label, id, prior: match ? "disabled" : "absent" });
+    } catch (e) {
+      // Surfaced in the menu, never swallowed: a silent failure here would let
+      // the user believe capture had stopped when it had not.
+      setExcludeError(String(e));
+    }
+  }
+
+  /** Put the rule back exactly as it was: delete only what this click created. */
+  async function undoExclusion() {
+    if (!excluded || excluded.prior === "enabled") return;
+    try {
+      await setExclusion(excluded.id, excluded.prior === "disabled" ? false : null);
+      setExcluded(null);
+    } catch (e) {
+      setExcludeError(String(e));
+    }
+  }
 
   // Map lifecycle state -> the doc 14 §4 visual class.
   const stateClass =
@@ -135,7 +243,7 @@ export function Bubble({
       onMouseLeave={onMouseLeave}
     >
       <div className="bubble__glyph" aria-hidden>
-        {spec.glyph}
+        {glyphMark(spec.glyph)}
       </div>
 
       <div className="bubble__title" title={spec.title}>
@@ -155,10 +263,7 @@ export function Bubble({
           className={`btn btn--icon bubble__thumb ${rated === "up" ? "bubble__thumb--set" : ""}`}
           aria-label="Useful"
           aria-pressed={rated === "up"}
-          onClick={() => {
-            setRated("up");
-            onRate("up");
-          }}
+          onClick={() => onRate("up")}
         >
           👍
         </button>
@@ -166,10 +271,7 @@ export function Bubble({
           className={`btn btn--icon bubble__thumb ${rated === "down" ? "bubble__thumb--set" : ""}`}
           aria-label="Not useful"
           aria-pressed={rated === "down"}
-          onClick={() => {
-            setRated("down");
-            onRate("down");
-          }}
+          onClick={() => onRate("down")}
         >
           👎
         </button>
@@ -219,13 +321,43 @@ export function Bubble({
             >
               Mute this pattern
             </button>
+            {/* Decision #8: the real "stop capturing this". The core derived
+                these from the bubble's own connector state and pre-escaped the
+                pattern, so one click is a durable, hot-reloaded rule — the same
+                machinery the Privacy panel writes (doc 13 §4). */}
+            {!excluded &&
+              (spec.exclusion_offers ?? []).map((offer) => (
+                <button
+                  key={`${offer.match_kind}:${offer.pattern}`}
+                  role="menuitem"
+                  onClick={() => void applyExclusion(offer)}
+                >
+                  Stop capturing {offer.label}
+                </button>
+              ))}
+            {excluded && (
+              <div className="bubble__overflow-note" role="status">
+                {excluded.prior === "enabled"
+                  ? `${excluded.label} was already excluded.`
+                  : `Not capturing ${excluded.label} anymore.`}
+                {excluded.prior !== "enabled" && (
+                  <button role="menuitem" onClick={() => void undoExclusion()}>
+                    Undo
+                  </button>
+                )}
+              </div>
+            )}
+            {excludeError && (
+              <div className="bubble__overflow-error" role="alert">
+                Could not add the rule: {excludeError}
+              </div>
+            )}
             <button
               role="menuitem"
               onClick={() => {
                 setOverflowOpen(false);
-                // Opens the exclusion manager on THIS monitor (decision #13)
-                // — the bubble doesn't know its source process, so the user
-                // picks the app there (doc 13 §4). The bubble stays.
+                // The manager, for everything the offers above cannot express
+                // (opened on THIS monitor — decision #13). The bubble stays.
                 void openPrivacy().catch(() => {});
               }}
             >

@@ -404,6 +404,7 @@ name = "aperture-suggestion-generator"
 version = "0.1.0"
 dependencies = [
  "aperture-contracts",
+ "regex",
  "serde_json",
  "tracing",
 ]

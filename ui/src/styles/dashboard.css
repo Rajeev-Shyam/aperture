@@ -327,6 +327,20 @@
 }
 
 /* Slider variant (decision #27: the voice confirm-floor control). */
+/* Advanced tab (decisions #7/#17/#39): section headings between knob groups. */
+.dash__subhead {
+  margin: 22px 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--ink-primary);
+}
+/* The live transport health beside each radio — muted, so it reads as a fact
+ * about the option rather than part of its name. */
+.dash__health {
+  color: var(--ink-secondary);
+  font-weight: 400;
+}
 .dash__setting--slider input[type="range"] {
   width: 150px;
   flex-shrink: 0;

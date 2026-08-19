@@ -13,6 +13,7 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/0001_init.sql")),
     (2, include_str!("../migrations/0002_pattern_mute_persist.sql")),
     (3, include_str!("../migrations/0003_agent_tasks.sql")),
+    (4, include_str!("../migrations/0004_suggestion_created_ts.sql")),
 ];
 
 /// Apply every migration whose version is newer than `schema_migrations.MAX(version)`.
