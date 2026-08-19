@@ -69,3 +69,15 @@ Idle (capture ON, user idle): < 2 % average. Event burst (focus storm): < 15 % f
 
 ---
 > **R2 amendments applied** (see docs/19–21): ADR-024 (faster-whisper GPU / whisper.cpp CPU split, ~2 GB STT figure), ADR-030 (7.2→**7.0 GB** cap, co-resident-weights in the projection, conditional L1 co-residency, degrade-ladder reorder, FIX 4.1 honest framing), ADR-032 (adaptive 768/1024 px image, 60 s idle-unload), Q36 (warm-keep ≥2 PTT/5 min).
+
+## Implementation status (2026-08-19) — the 7.0 GB figure is now the FALLBACK, not the constant (owner decision #43)
+
+ADR-030's cap was written for one machine's 8 GB card and hard-coded as `7.0`. Owner decision #43 (Doc 24, 2026-08-16) reversed that: the ceiling is **derived from the installed GPU at startup** by `orchestration::startup_projection_ceiling_gb()` — one `nvidia-smi --query-gpu=memory.total` call (OnceLock, `CREATE_NO_WINDOW`), ceiling = **total − 1.0 GB headroom**, clamped to **[2.0, 31.0] GB**, falling back to **7.0** when the query fails or no NVIDIA GPU answers.
+
+What this does and does not change:
+- **The 1.0 GB safety margin and the R1 projection formula are unchanged.** Only the number the formula is compared against moves, and only upward on a larger card.
+- **On the 8 GB dev machine the behavior is identical** — 8 − 1 = 7.0, the same value ADR-030 locked. Every measured figure in this doc still stands there.
+- The clamp is what keeps this honest on the edges: a 2 GB card cannot produce a ceiling that admits nothing, and a 32 GB card cannot produce one that treats VRAM as free.
+- **The M5 load-times gate still asserts the constant** rather than `BudgetEnforcer::ceiling_gb()`. That is a known gap, not a decision — switching it is listed in the handoff leftovers.
+
+ADR-030 keeps its ⚠️ INVARIANT status: the ceiling is still a hard admission bound that no load or job may exceed. What decision #43 changed is that it is now the *right* bound for the machine it is running on.

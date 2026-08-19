@@ -72,6 +72,7 @@ fn main() {
     // land in the encrypted `settings` table once, on an empty table only — a
     // user's edited settings are never overwritten.
     seed_settings_if_empty(&db);
+    backfill_new_settings_keys(&db);
 
     // Consent (doc 13 §8) — the source of truth for whether capture may run.
     // Loaded before capture is composed so a fresh install starts OFF.
@@ -254,6 +255,110 @@ fn seed_settings_if_empty(db: &aperture_db::Db) {
         }
     }
     tracing::info!("settings seeded from config/settings.default.json (doc 13 §6)");
+}
+
+/// Add settings keys that exist in the shipped seed but not in this install's
+/// stored settings — **without ever overwriting a stored value**.
+///
+/// [`seed_settings_if_empty`] runs once, keyed on the `reasoning` row, so an
+/// install created before a key existed never receives it: `loadout.vlm_download`
+/// (decision #30) and `ui.bubble_freshness_half_life_sec` (decision #5) both
+/// landed this way. Code defaults mirror the seed everywhere it matters, so
+/// behavior was already correct — but a Dashboard control cannot show, or let
+/// the user move, a value that is not in the store. That is the real cost: a
+/// setting the app honors and the settings UI cannot see.
+///
+/// Runs at every launch (a handful of small rows). The merge is
+/// **additive-only and recursive**: a key present in the stored section is left
+/// exactly as it is, at any depth, so a user's edits and a deliberately
+/// different value both survive. Sections whose stored value is not an object
+/// (or is unparseable) are skipped rather than repaired — guessing at a shape
+/// we did not write is how a config gets silently reset.
+///
+/// A failure anywhere is logged and skipped: missing keys are a UI-visibility
+/// problem, never a reason to fail startup.
+fn backfill_new_settings_keys(db: &aperture_db::Db) {
+    let seed: serde_json::Value =
+        match serde_json::from_str(include_str!("../../config/settings.default.json")) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(%e, "settings.default.json failed to parse; skipping backfill");
+                return;
+            }
+        };
+    let Some(sections) = seed.as_object() else { return };
+
+    let mut added_total = 0usize;
+    for (key, seed_section) in sections {
+        if key.starts_with('$') {
+            continue; // $comment keys are documentation, not settings
+        }
+        let stored_raw = match db.get_setting(key) {
+            Ok(Some(raw)) => raw,
+            // Absent entirely: a whole section added in a later version. The
+            // first-run seed already covers fresh installs; this covers upgrades.
+            Ok(None) => {
+                if let Err(e) = db.set_setting(key, &seed_section.to_string()) {
+                    tracing::error!(%e, key, "settings backfill write failed");
+                } else {
+                    added_total += 1;
+                    tracing::info!(key, "settings: added missing section from the seed");
+                }
+                continue;
+            }
+            Err(e) => {
+                tracing::error!(%e, key, "settings read failed; skipping backfill for this key");
+                continue;
+            }
+        };
+        let Ok(mut stored) = serde_json::from_str::<serde_json::Value>(&stored_raw) else {
+            continue; // not JSON we wrote; leave it alone
+        };
+        let added = backfill_missing(&mut stored, seed_section);
+        if added > 0 {
+            match db.set_setting(key, &stored.to_string()) {
+                Ok(()) => {
+                    added_total += added;
+                    tracing::info!(key, added, "settings: backfilled new keys from the seed");
+                }
+                Err(e) => tracing::error!(%e, key, "settings backfill write failed"),
+            }
+        }
+    }
+    if added_total > 0 {
+        tracing::info!(added = added_total, "settings backfill complete (upgraded install)");
+    }
+}
+
+/// Recursively copy keys present in `seed` but absent from `stored`. Returns how
+/// many were added. Never replaces an existing key at any depth; `$comment`
+/// keys are documentation and are skipped. Pure, so the additive-only rule is
+/// testable without a DB.
+fn backfill_missing(stored: &mut serde_json::Value, seed: &serde_json::Value) -> usize {
+    let (Some(stored_map), Some(seed_map)) = (stored.as_object_mut(), seed.as_object()) else {
+        return 0;
+    };
+    let mut added = 0;
+    for (k, v) in seed_map {
+        if k.starts_with('$') {
+            continue;
+        }
+        match stored_map.get_mut(k) {
+            // Present: recurse only where BOTH sides are objects, so a scalar
+            // the user changed is never touched and a type change never merges
+            // two unrelated shapes.
+            Some(existing) => {
+                if existing.is_object() && v.is_object() {
+                    added += backfill_missing(existing, v);
+                }
+            }
+            None => {
+                stored_map.insert(k.clone(), v.clone());
+                added += 1;
+            }
+        }
+    }
+    added
 }
 
 /// Read one top-level settings section as JSON (missing/unparseable ⇒ `{}` —
@@ -1029,4 +1134,89 @@ fn run_tauri(
         })
         .run(tauri::generate_context!())
         .expect("error while running the Aperture overlay shell");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole point of the backfill: a key added to the seed after this
+    /// install was created must appear, so the settings UI can show it.
+    #[test]
+    fn a_new_seed_key_is_added() {
+        let mut stored = serde_json::json!({ "bubble_dwell_sec": 20 });
+        let seed = serde_json::json!({
+            "bubble_dwell_sec": 20,
+            "bubble_freshness_half_life_sec": 600
+        });
+        assert_eq!(backfill_missing(&mut stored, &seed), 1);
+        assert_eq!(stored["bubble_freshness_half_life_sec"], 600);
+    }
+
+    /// The non-negotiable half: a stored value is NEVER replaced, including
+    /// when the user deliberately set something other than the default.
+    #[test]
+    fn a_stored_value_is_never_overwritten() {
+        let mut stored = serde_json::json!({ "bubble_dwell_sec": 45, "unknown_key": 1 });
+        let seed = serde_json::json!({ "bubble_dwell_sec": 20 });
+        assert_eq!(backfill_missing(&mut stored, &seed), 0);
+        assert_eq!(stored["bubble_dwell_sec"], 45, "the user's value survives");
+        assert_eq!(stored["unknown_key"], 1, "keys we no longer ship are left alone");
+    }
+
+    /// Nested blocks are where the real gaps are (`loadout.vlm_download`), and
+    /// they must merge key-by-key rather than wholesale.
+    #[test]
+    fn nested_blocks_merge_key_by_key() {
+        let mut stored = serde_json::json!({
+            "vlm_download": { "model": { "url": "mine", "bytes": 1 } }
+        });
+        let seed = serde_json::json!({
+            "vlm_download": {
+                "model": { "url": "shipped", "bytes": 2 },
+                "mmproj": { "url": "shipped-mm", "bytes": 3 }
+            }
+        });
+        assert_eq!(backfill_missing(&mut stored, &seed), 1, "only mmproj is missing");
+        assert_eq!(stored["vlm_download"]["model"]["url"], "mine", "not clobbered");
+        assert_eq!(stored["vlm_download"]["mmproj"]["url"], "shipped-mm");
+    }
+
+    /// A type change means the two shapes are unrelated — merging them would
+    /// produce a config neither side wrote.
+    #[test]
+    fn a_type_mismatch_is_left_alone_rather_than_merged() {
+        let mut stored = serde_json::json!({ "retention_days": 90 });
+        let seed = serde_json::json!({ "retention_days": { "events": 90 } });
+        assert_eq!(backfill_missing(&mut stored, &seed), 0);
+        assert_eq!(stored["retention_days"], 90);
+    }
+
+    #[test]
+    fn comment_keys_are_documentation_not_settings() {
+        let mut stored = serde_json::json!({});
+        let seed = serde_json::json!({ "$comment": "explaining", "real": 1 });
+        assert_eq!(backfill_missing(&mut stored, &seed), 1);
+        assert!(stored.get("$comment").is_none());
+    }
+
+    /// Every section the shipped seed defines must survive a round-trip through
+    /// the backfill unchanged when it is already fully present — i.e. a normal
+    /// launch on a current install writes nothing.
+    #[test]
+    fn a_current_install_is_a_no_op() {
+        let seed: serde_json::Value =
+            serde_json::from_str(include_str!("../../config/settings.default.json")).unwrap();
+        for (key, section) in seed.as_object().unwrap() {
+            if key.starts_with('$') {
+                continue;
+            }
+            let mut stored = section.clone();
+            assert_eq!(
+                backfill_missing(&mut stored, section),
+                0,
+                "section `{key}` should need no backfill against itself"
+            );
+        }
+    }
 }
