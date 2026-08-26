@@ -3,9 +3,10 @@
 //  overflow (lowest score dropped first), and the bottom-right stack layout.
 //
 //  Data in: the `bubble_spec` event stream + `suggestion_lifecycle` (the core
-//  may drive expiry server-side, e.g. on staleness — doc 08 §5). On mount it
-//  also pulls `list_suggestions` so a WebView2 respawn restores the queue from
-//  SQLite (doc 11 §7).
+//  may drive expiry server-side, e.g. on staleness — doc 08 §5). On mount —
+//  and again on `suggestions_refresh`, when a snooze lifts (ADR-040/Q95) — it
+//  pulls `list_suggestions` so a WebView2 respawn restores the queue from
+//  SQLite (doc 11 §7) and rows queued while snoozed actually surface.
 //
 //  Each visible bubble renders entering -> idle (20 s dwell, hover pauses) and
 //  records user-driven transitions (dismiss / expiry / click) through the
@@ -33,6 +34,7 @@ import {
   onSettingsChanged,
   onSuggestionLifecycle,
   onSuggestionRated,
+  onSuggestionsRefresh,
   recordFeedback,
   type BubbleLifecycleState,
   type UnlistenFn,
@@ -80,29 +82,44 @@ export function BubbleContainer({ onAskClaude }: Props) {
         });
     void readTuning();
 
-    // Restore any queued suggestions surviving in SQLite (doc 11 §7). Reversed:
-    // `list_suggestions` returns newest-first, and the stack is column-reverse,
-    // so admitting oldest-first puts the newest visually on top — the same
-    // order a live session produces.
-    void listSuggestions().then((specs) => {
-      if (cancelled) return;
-      const now = Date.now();
-      setBubbles((cur) =>
-        [...specs]
-          .reverse()
-          .reduce(
-            (acc, e) =>
-              admit(
-                acc,
-                { id: e.id, spec: e.spec },
-                tuningRef.current.maxVisible,
-                now,
-                tuningRef.current.freshnessHalfLifeMs,
+    // Pull the queued/shown rows surviving in SQLite and admit the ones not
+    // already held (doc 11 §7). Reversed: `list_suggestions` returns
+    // newest-first, and the stack is column-reverse, so admitting oldest-first
+    // puts the newest visually on top — the same order a live session
+    // produces. Rows already on screen are skipped rather than re-admitted:
+    // `admit` resets a known id to `queued`, which would restart a visible
+    // bubble's enter + dwell under the user's cursor.
+    const restore = () =>
+      listSuggestions()
+        .then((specs) => {
+          if (cancelled) return;
+          const now = Date.now();
+          setBubbles((cur) =>
+            [...specs]
+              .reverse()
+              .filter((e) => !cur.some((b) => b.id === e.id))
+              .reduce(
+                (acc, e) =>
+                  admit(
+                    acc,
+                    { id: e.id, spec: e.spec },
+                    tuningRef.current.maxVisible,
+                    now,
+                    tuningRef.current.freshnessHalfLifeMs,
+                  ),
+                cur,
               ),
-            cur,
-          ),
-      );
-    });
+          );
+        })
+        .catch((e) => console.error("list_suggestions failed:", e));
+    // Mount: a WebView2 respawn restores the queue.
+    void restore();
+    // The snooze lifted (ADR-040/Q95; SDLC review 2026-08-19 finding 2): the
+    // rows queued while it was on were never emitted as `bubble_spec` — only
+    // EMISSION was silenced — so they surface only if someone re-pulls them.
+    void onSuggestionsRefresh(() => void restore()).then((u) =>
+      cancelled ? u() : unlisteners.push(u),
+    );
 
     // New suggestions arriving from the pipeline (doc 08 §6 -> doc 11 §3).
     void onBubbleSpec((e) => {
@@ -170,21 +187,34 @@ export function BubbleContainer({ onAskClaude }: Props) {
     );
   }
 
+  /** Swap one bubble to its fallback copy (doc 10 §6): it stays on screen,
+   *  the dwell keeps running, and Dismiss still records `dismissed`. */
+  function setFallback(id: string, fallback: string) {
+    setBubbles((cur) => cur.map((b) => (b.id === id ? { ...b, fallback } : b)));
+  }
+
   function onResume(b: BubbleInstance) {
     // Core resolves action_ref -> connector -> open (Critical Path B, M4).
-    // The durable clicked-state + engine reinforcement go through
-    // record_feedback (bubble_click owns only the outcome column).
-    // TODO(M4-followup): swap to fallback copy in-bubble on a Failed outcome
-    // (doc 10 §6) instead of logging — lands with the thumbs/drag UI pass.
+    // The OUTCOME decides what is recorded (doc 10 §6; SDLC review 2026-08-19
+    // finding 3b). `Resumed`, or `Degraded` (it did open, with limits), is a
+    // click: the durable clicked-state + engine reinforcement go through
+    // record_feedback (bubble_click owns only the outcome column). `Failed`,
+    // or a rejected call (e.g. an empty action_ref after the nightly prune
+    // detached the connector state), is NOT a click — recording one would
+    // teach the engine that this suggestion worked. The bubble swaps to
+    // fallback copy instead; doc 08 §5's posture is that a stale bubble is
+    // prevented, not apologized for, and the core's restore floor (3a) is the
+    // prevention — this is the honest last line.
     bubbleClick(b.id, b.spec.action_ref)
       .then((outcome) => {
-        if (outcome !== "Resumed") {
-          console.warn("resume degraded/failed (doc 10 §6):", outcome);
+        if (outcome === "Resumed" || "Degraded" in outcome) {
+          void recordFeedback(b.id, "clicked");
+          applyLifecycle(b.id, "clicked");
+          return;
         }
+        setFallback(b.id, `Couldn't resume — ${outcome.Failed.reason}`);
       })
-      .catch((e) => console.error("bubble_click failed:", e));
-    void recordFeedback(b.id, "clicked");
-    applyLifecycle(b.id, "clicked");
+      .catch((e) => setFallback(b.id, `Couldn't resume — ${String(e)}`));
   }
 
   // Only render visible (non-queued) bubbles; the stack is bottom-right,

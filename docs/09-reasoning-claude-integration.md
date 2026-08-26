@@ -75,3 +75,9 @@ ADR-025's **MCP-primary default is unchanged**; what changed is that it is no lo
 - **If the shipped default is ever flipped away from MCP-primary, amend ADR-025 (doc 19) and this doc** — making the switch easy is deliberately not the same as changing the default.
 
 Full session detail: `docs/handoff/session-bridge-2026-08-19-doc24-batch4.md`.
+
+## Implementation status (2026-08-22) — the push Send is bound to the transport the preview named; agent tools on the MCP pipe
+
+- **§3 transport selection (2026-08-19 review finding 1, HIGH).** `Gateway::send_with_preview` no longer walks the order for the first healthy push transport: it sends over the transport whose target equals `payload.transport_target` **only if it is `Ready`**, else returns `GatewayError::TransportMismatch { named, available }` and sends nothing — the same binding the MCP release path already had. `preview_send` surfaces that as `PreviewSendResult::TransportMismatch`; the panel offers "Send via {available} instead", which calls the new `preview_retarget` (drops the approval, so the user re-approves the re-stamped payload). A payload staged for MCP can never be retargeted to a push transport. ADR-025's order is still the *preference*; it just never silently becomes a *substitute* any more.
+- **§3 MCP tool surface (Doc 22, v2):** two more tools on the same `aperture-mcp` pipe — `aperture_agent_start(task?)` and `aperture_agent_step(task_id, instruction?)`. Every step's screen payload is released only after a `cloud_send` audit row is written (fail-closed, identical to `aperture_get_context`), capped by the decision-#42 1 MiB rule on text + image together, and carries the redacted screenshot as an MCP image content block. The agent loop is MCP-only today; no push-driven loop exists.
+Full detail: `docs/handoff/session-bridge-2026-08-22-v2-wiring.md`.

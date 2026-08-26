@@ -43,10 +43,48 @@ impl ScriptedEventPlayer {
 /// Golden Context Payloads, including redaction fixtures (doc 13 §5).
 pub mod golden {
     use super::*;
-    /// TODO(M7): return a fixture payload whose redactions list is asserted by the
-    /// preview-panel and SC5 tests (preview bytes == wire bytes).
+    use crate::context_payload::{Intent, PayloadItem, TransportTarget};
+
+    /// The two e-mail addresses and the one secret the fixture carries, so a
+    /// test can assert they are gone from whatever left the preview.
+    pub const FIXTURE_EMAILS: [&str; 2] = ["alice@example.com", "bob@example.org"];
+    /// Assembled at runtime (`format!`) so the literal never sits in the
+    /// source tree as a token-shaped string (GitHub push protection scans
+    /// test fixtures — 2026-08-16 note).
+    pub fn fixture_secret() -> String {
+        format!("{}-{}", "sk", "abcdefghijklmnop1234")
+    }
+
+    /// The RAW (unredacted) golden payload: two e-mails + one secret key across
+    /// an OCR item and a user addition, `redactions` empty, not approved. The
+    /// privacy crate's `Redactor` must turn it into exactly
+    /// `email × 2, secret_key × 1` — asserted by SC5 (preview == wire) and the
+    /// M0 fakes gate. Contracts cannot depend on privacy, so the fixture is
+    /// the input, never the output.
     pub fn redaction_fixture() -> ContextPayload {
-        todo!("M7: golden payload with email x2 / secret_key x1 redactions")
+        let secret = fixture_secret();
+        ContextPayload {
+            payload_id: uuid::Uuid::from_u128(0x5c5_0000_0000_0000_0000_0000_0000_0001),
+            created_ts: 1_700_000_000_000,
+            intent: Intent::SummarizeCurrent,
+            items: vec![
+                PayloadItem::OcrText {
+                    source_event_id: 1,
+                    text: format!(
+                        "Contact {} for the contract; the deploy token {secret} is on screen.",
+                        FIXTURE_EMAILS[0]
+                    ),
+                    redacted: false,
+                },
+                PayloadItem::UserAddition {
+                    text: format!("summarise what {} asked for", FIXTURE_EMAILS[1]),
+                },
+            ],
+            redactions: Vec::new(),
+            enrichment_offered: false,
+            transport_target: TransportTarget::MessagesApi,
+            user_approved: false,
+        }
     }
 }
 

@@ -81,3 +81,9 @@ What this does and does not change:
 - **The M5 load-times gate still asserts the constant** rather than `BudgetEnforcer::ceiling_gb()`. That is a known gap, not a decision — switching it is listed in the handoff leftovers.
 
 ADR-030 keeps its ⚠️ INVARIANT status: the ceiling is still a hard admission bound that no load or job may exceed. What decision #43 changed is that it is now the *right* bound for the machine it is running on.
+
+## Implementation status (2026-08-22) — idle wakeups trimmed (2026-08-19 review finding 6)
+
+- **§8 idle budget.** The overlay's 10 Hz hit-test re-measure interval now runs only while at least one interactive rect is published (`useHitTestRects`: a measurement that publishes `[]` clears it; the MutationObserver / motion listeners re-arm it) — with nothing on screen, zero JS timer wakeups per WebView. The Rust cursor poller drops from 60 Hz to **30 Hz when no window has rects or a modal** (`hit_test::IDLE_POLL_INTERVAL`), since with zero rects the reconcile answer cannot change. **SC3 is still unmeasured** — the < 2 % figure remains an assumption; this only removes cost that was provably doing nothing.
+- **VLM weights (decision #30, settings `loadout.vlm_download`)** now carry a `sha256` beside `bytes`; the fetcher hashes while streaming (a resumed `.part` is hashed from its prefix first) and refuses to install on mismatch; the URLs are pinned to HF revision `5037fcf…` instead of `main` (review finding 5). `is_present` stays size-only by design (no multi-GB hash on every status poll); content is verified once, at download.
+Full detail: `docs/handoff/session-bridge-2026-08-22-v2-wiring.md`.

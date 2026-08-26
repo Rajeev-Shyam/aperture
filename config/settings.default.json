@@ -17,15 +17,17 @@
     "active": "L1",
     "$comment": "L1 = Qwen2.5-VL-3B + faster-whisper small, co-residency CONDITIONAL on the 7.0 GB projection (ADR-030 — STT is the swap victim when it doesn't fit). L2 = Qwen2.5-VL-7B exclusive (opt-in, doc 04 §3).",
     "vlm_model": "qwen2.5-vl-3b",
-    "$comment_vlm_download": "Decision #30: the VLM weights are too big for the installer (NSIS 2 GB cap), so the Dashboard offers an explicit, user-click-only download (never automatic — no surprise network activity). URLs + byte sizes are settings, never code (NG8); the destination file names come from SidecarConfig. Verified byte-exact against the ggml-org HF repo on 2026-08-16 (matches the dev machine's files).",
+    "$comment_vlm_download": "Decision #30: the VLM weights are too big for the installer (NSIS 2 GB cap), so the Dashboard offers an explicit, user-click-only download (never automatic — no surprise network activity). URLs + byte sizes + sha256 are settings, never code (NG8); the destination file names come from SidecarConfig. SDLC review 2026-08-19 finding 5: the URLs are pinned to HF repo revision 5037fcf163dd95d1e41d1974465f0898ed108ca2 (resolve/main is a moving reference — a resumed .part against a re-uploaded file would pass the size check), and each artifact's sha256 (lowercase hex) is verified over the whole file once at download time before it is renamed into place. Size + sha256 verified against the ggml-org HF repo and the dev machine's files on 2026-08-22.",
     "vlm_download": {
       "model": {
-        "url": "https://huggingface.co/ggml-org/Qwen2.5-VL-3B-Instruct-GGUF/resolve/main/Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf",
-        "bytes": 1929901056
+        "url": "https://huggingface.co/ggml-org/Qwen2.5-VL-3B-Instruct-GGUF/resolve/5037fcf163dd95d1e41d1974465f0898ed108ca2/Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf",
+        "bytes": 1929901056,
+        "sha256": "d02fe9b69ad8cadbbd228e387667af66612c44bed29ffc8eb1e7caf9ac486c12"
       },
       "mmproj": {
-        "url": "https://huggingface.co/ggml-org/Qwen2.5-VL-3B-Instruct-GGUF/resolve/main/mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf",
-        "bytes": 1338428128
+        "url": "https://huggingface.co/ggml-org/Qwen2.5-VL-3B-Instruct-GGUF/resolve/5037fcf163dd95d1e41d1974465f0898ed108ca2/mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf",
+        "bytes": 1338428128,
+        "sha256": "b9160fe9d814d1fadf68395677468534778b39ac33c2e7561b7b218626e60d5e"
       }
     },
     "stt_model": "whisper-base.en",
@@ -63,6 +65,12 @@
     "half_life_sequence_days": 14
   },
 
+  "agent": {
+    "$comment": "v2 agent execution layer (Doc 22, wired 2026-08-22). step_cap = Q-V2-04's default (50, [PROVISIONAL] — owner to confirm), clamped 1-500; error_threshold = consecutive failed actions before the task fails (Doc 22 §3.3, clamped 1-20); confirm_low_confidence = pause for the user when Claude reports confidence:low (Doc 22 §5). Consequential-looking actions ALWAYS pause regardless (decisions #47/#51). Read at task start.",
+    "step_cap": 50,
+    "error_threshold": 3,
+    "confirm_low_confidence": true
+  },
   "ui": {
     "max_concurrent_bubbles": 3,
     "$comment_dwell": "Decision #7 (2026-08-16): now WIRED to the bubble's idle countdown (it was a compile-time constant) and editable from the Dashboard's Advanced tab. Clamped to 3-600 s by the overlay; a set_settings write applies to the next bubble, no restart.",

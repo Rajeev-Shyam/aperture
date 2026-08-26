@@ -57,6 +57,12 @@ pub enum CaptureError {
     /// force-released and the breach is surfaced once.
     #[error("toggle OFF exceeded 3s SLA")]
     ToggleSlaBreach,
+    /// An on-demand observation ([`CaptureSubsystem::observe_now`]) hit the
+    /// exclusion gate: the foreground window matches the user's exclusion list
+    /// (label carried). No frame was pulled. The v2 agent loop pauses and
+    /// notifies on this (Doc 22 §4.3, owner decision #49).
+    #[error("foreground window is excluded: {0}")]
+    Excluded(String),
 }
 
 /// Configuration for the capture subsystem. Durations are the doc 05 §4 values
@@ -350,6 +356,23 @@ impl CaptureSubsystem {
     /// The bridge state (diagnostics + tests: forwarding gate, URL cache).
     pub fn nm_bridge(&self) -> &Arc<nm_bridge::NmBridge> {
         &self.nm_bridge
+    }
+
+    /// One on-demand observation of the foreground for the v2 agent loop
+    /// (Doc 22 §2 "take screenshot + run OCR"). Runs the SAME gates as a
+    /// scheduled sample — capture must be ON, the exclusion gate fires before
+    /// any frame is pulled (doc 05 §4, doc 13 §4) — but there is no debounce
+    /// and no pHash gate, and the ephemeral frame is RETURNED to the caller
+    /// (the serializer) instead of going to the OCR sink. The frame is still
+    /// never persisted: the caller redacts, downscales, encodes and drops it.
+    ///
+    /// The browser URL rides along only when the hook-tracked foreground is
+    /// the window actually in front right now (same TOCTOU rule as
+    /// `Sampler::sample_once`); otherwise `url` is `None` and only the
+    /// process/class/title rules gate the frame.
+    pub fn observe_now(&self) -> Result<sampler::Observation, CaptureError> {
+        let fg = self.foreground.lock().expect("identity lock").clone();
+        self.sampler.observe_now(fg)
     }
 
     /// pHash-gate + delivery counters (M2 tuning telemetry).

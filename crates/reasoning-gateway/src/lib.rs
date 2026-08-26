@@ -42,6 +42,7 @@ use std::sync::Arc;
 
 use aperture_contracts::{
     ContextPayload, Health, ReasoningTransport, StructuredSuggestions, TransportError, TransportId,
+    TransportTarget,
 };
 
 /// Errors raised by the gateway itself (distinct from a single transport's
@@ -49,13 +50,30 @@ use aperture_contracts::{
 #[derive(Debug, thiserror::Error)]
 pub enum GatewayError {
     /// No transport in the ordered list reported [`Health::Ready`]; the local
-    /// answer stands and nothing is queued (doc 09 §6).
+    /// answer stands and nothing is queued (doc 09 §6). Raised by callers of
+    /// [`Gateway::pick_healthy_transport`]; `send_with_preview` reports the same
+    /// situation as [`GatewayError::TransportMismatch`] with `available: None`,
+    /// because the user's consent named a transport and THAT is what is missing.
     #[error("no healthy transport; local answer stands")]
     NoHealthyTransport,
     /// `send_with_preview` was called with `user_approved == false`. The gateway
     /// refuses to emit — only [`preview`] may flip the flag (doc 13 §2/§3).
     #[error("refusing to send: payload not user-approved (two-emitter rule, doc 13 §2)")]
     NotApproved,
+    /// The transport the preview NAMED (`payload.transport_target` — the footer
+    /// line the user read before pressing Send) is not configured or not
+    /// [`Health::Ready`], so nothing was sent (SDLC review 2026-08-19, finding 1).
+    /// The approval is bound to that transport the way the MCP release gate
+    /// binds its payloads: a Send never falls through to a transport the user
+    /// did not consent to — in the shipped default order that "next one" is the
+    /// metered Messages API key (ADR-010). `available` is the first Ready push
+    /// transport in settings order, if any, so the shell can OFFER it as an
+    /// explicit retarget + re-approve; it is never used silently.
+    #[error("named transport {named:?} is not ready; nothing sent (available: {available:?})")]
+    TransportMismatch {
+        named: TransportTarget,
+        available: Option<TransportTarget>,
+    },
     /// The chosen transport failed; see the wrapped error.
     #[error(transparent)]
     Transport(#[from] TransportError),
@@ -154,6 +172,48 @@ impl Gateway {
         None
     }
 
+    /// The push transport the approval was GIVEN for (SDLC review 2026-08-19,
+    /// finding 1): the Ready, push-capable transport whose target equals
+    /// `named` — `payload.transport_target`, the line the preview footer showed.
+    ///
+    /// Mirrors the MCP release gate's binding (`mcp_bridge`): consent names one
+    /// transport, and a Send may use that one or none. When it is absent or not
+    /// Ready, the error carries the first Ready push transport in settings
+    /// order as `available`, so the shell can offer an explicit retarget — the
+    /// fall-through is a user decision, never the gateway's.
+    async fn pick_named_transport(
+        &self,
+        named: TransportTarget,
+    ) -> Result<&dyn ReasoningTransport, GatewayError> {
+        let mut available = None;
+        for transport in &self.transports {
+            if !transport.supports_push() {
+                tracing::debug!(transport = ?transport.id(), "skipping pull-only transport on the push Send path (doc 09 §3)");
+                continue;
+            }
+            let target = target_of(transport.id());
+            match transport.health().await {
+                Health::Ready if target == named => return Ok(transport.as_ref()),
+                Health::Ready => {
+                    if available.is_none() {
+                        available = Some(target);
+                    }
+                }
+                other => tracing::info!(
+                    transport = ?transport.id(),
+                    status = ?other,
+                    "transport not ready (doc 09 §6)"
+                ),
+            }
+        }
+        tracing::warn!(
+            ?named,
+            ?available,
+            "the transport the preview named is not ready; refusing to fall through (review finding 1)"
+        );
+        Err(GatewayError::TransportMismatch { named, available })
+    }
+
     /// The single egress chokepoint (doc 13 §2/§3).
     ///
     /// **Emits ONLY when `user_approved == true`.** This is the runtime backstop
@@ -162,11 +222,14 @@ impl Gateway {
     /// machine. `user_approved == false` -> [`GatewayError::NotApproved`], no
     /// socket opened, no CLI spawned.
     ///
-    /// On Send: picks the first healthy transport, transmits the approved
-    /// payload, and records the `cloud_send` audit row with the SHA-256 of the
-    /// wire bytes (doc 13 §3) via [`payload_builder`]. Returns the source-agnostic
-    /// [`StructuredSuggestions`] (doc 09 §4); on transport failure the caller
-    /// retains the local answer (doc 09 §6).
+    /// On Send: uses the transport the preview NAMED (`payload.transport_target`)
+    /// and only that one — a transport the user did not see is never used, even
+    /// if it is the only Ready one ([`GatewayError::TransportMismatch`], review
+    /// finding 1). It transmits the approved payload and records the
+    /// `cloud_send` audit row with the SHA-256 of the wire bytes (doc 13 §3) via
+    /// [`payload_builder`]. Returns the source-agnostic [`StructuredSuggestions`]
+    /// (doc 09 §4); on transport failure the caller retains the local answer
+    /// (doc 09 §6).
     pub async fn send_with_preview(
         &self,
         payload: &ContextPayload,
@@ -177,12 +240,10 @@ impl Gateway {
         if !user_approved || !payload.user_approved {
             return Err(GatewayError::NotApproved);
         }
-        // 1. First healthy PUSH transport, or keep the local answer (nothing
-        //    queued, doc 09 §6). Pull transports (MCP) are skipped here.
-        let transport = self
-            .pick_healthy_transport()
-            .await
-            .ok_or(GatewayError::NoHealthyTransport)?;
+        // 1. The NAMED push transport, Ready — or nothing (review finding 1).
+        //    Pull transports (MCP) are skipped here; a not-ready named
+        //    transport is a typed refusal, not a fall-through.
+        let transport = self.pick_named_transport(payload.transport_target).await?;
         let used_target = target_of(transport.id());
 
         // 2. Per-transport HARD cap (decision #42), checked on the transport's
@@ -312,9 +373,117 @@ mod tests {
             Health::NeedsSetup("log in".into()),
             StructuredSuggestions { suggestions: vec![], answer_text: None },
         )]);
+        // Review finding 1: the refusal names the transport the user consented
+        // to, with nothing to offer instead.
         assert!(matches!(
             g.send_with_preview(&approved_payload(), true).await,
-            Err(GatewayError::NoHealthyTransport)
+            Err(GatewayError::TransportMismatch {
+                named: TransportTarget::MessagesApi,
+                available: None
+            })
+        ));
+    }
+
+    // --- Review finding 1 (2026-08-19): the push Send is bound to the named
+    // transport. `FakeTransport` always reports `MessagesApi`, so these use a
+    // transport whose id is configurable and which records whether it sent.
+
+    struct IdTransport {
+        id: TransportId,
+        health: Health,
+        sent: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    #[async_trait::async_trait]
+    impl ReasoningTransport for IdTransport {
+        fn id(&self) -> TransportId {
+            self.id
+        }
+        async fn health(&self) -> Health {
+            self.health.clone()
+        }
+        async fn send(&self, _p: &Payload) -> Result<StructuredSuggestions, TransportError> {
+            self.sent.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(StructuredSuggestions { suggestions: vec![], answer_text: Some(format!("{:?}", self.id)) })
+        }
+    }
+
+    fn id_transport(
+        id: TransportId,
+        health: Health,
+    ) -> (Box<dyn ReasoningTransport>, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (Box::new(IdTransport { id, health, sent: std::sync::Arc::clone(&sent) }), sent)
+    }
+
+    /// A recording audit sink: finding 1's refusal must leave NO `cloud_send` row.
+    #[derive(Default)]
+    struct AuditSpy(std::sync::Mutex<usize>);
+    impl aperture_privacy::audit_log::AuditSink for AuditSpy {
+        fn record_cloud_send(
+            &self,
+            _rec: aperture_privacy::audit_log::CloudSendRecord,
+        ) -> Result<(), aperture_privacy::PrivacyError> {
+            *self.0.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    /// (a) The named transport is Ready ⇒ the Send uses it — even though another
+    /// push transport is Ready too, and even though the named one is not first.
+    #[tokio::test]
+    async fn f1_send_uses_the_transport_the_preview_named() {
+        use std::sync::atomic::Ordering;
+        let (api, api_sent) = id_transport(TransportId::MessagesApi, Health::Ready);
+        let (cli, cli_sent) = id_transport(TransportId::ClaudeCli, Health::Ready);
+        let g = gateway(vec![api, cli]);
+        let mut p = approved_payload();
+        p.transport_target = TransportTarget::ClaudeCli;
+        let out = g.send_with_preview(&p, true).await.unwrap();
+        assert_eq!(out.suggestions.answer_text.as_deref(), Some("ClaudeCli"));
+        assert!(cli_sent.load(Ordering::SeqCst), "sent over the named transport");
+        assert!(!api_sent.load(Ordering::SeqCst), "the un-named transport was never touched");
+    }
+
+    /// (b) The named transport is NeedsSetup while another push transport is
+    /// Ready ⇒ a typed refusal that OFFERS the other one; nothing sent, no
+    /// audit row. This is the ADR-010 failure: `claude` off PATH must not
+    /// silently bill the Messages API key.
+    #[tokio::test]
+    async fn f1_a_not_ready_named_transport_refuses_instead_of_falling_through() {
+        use std::sync::atomic::Ordering;
+        let (cli, cli_sent) = id_transport(TransportId::ClaudeCli, Health::NeedsSetup("not on PATH".into()));
+        let (api, api_sent) = id_transport(TransportId::MessagesApi, Health::Ready);
+        let spy = std::sync::Arc::new(AuditSpy::default());
+        let g = gateway(vec![cli, api])
+            .with_audit(std::sync::Arc::clone(&spy) as std::sync::Arc<dyn aperture_privacy::audit_log::AuditSink>);
+        let mut p = approved_payload();
+        p.transport_target = TransportTarget::ClaudeCli;
+        let err = g.send_with_preview(&p, true).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                GatewayError::TransportMismatch {
+                    named: TransportTarget::ClaudeCli,
+                    available: Some(TransportTarget::MessagesApi)
+                }
+            ),
+            "got {err:?}"
+        );
+        assert!(!cli_sent.load(Ordering::SeqCst) && !api_sent.load(Ordering::SeqCst), "NOTHING sent");
+        assert_eq!(*spy.0.lock().unwrap(), 0, "no audit row for a refused Send");
+    }
+
+    /// (c) Nothing Ready ⇒ the refusal has nothing to offer (`available: None`).
+    #[tokio::test]
+    async fn f1_nothing_ready_reports_no_alternative() {
+        let (cli, _) = id_transport(TransportId::ClaudeCli, Health::NeedsSetup("x".into()));
+        let (api, _) = id_transport(TransportId::MessagesApi, Health::Unavailable("offline".into()));
+        let g = gateway(vec![cli, api]);
+        let mut p = approved_payload();
+        p.transport_target = TransportTarget::ClaudeCli;
+        assert!(matches!(
+            g.send_with_preview(&p, true).await,
+            Err(GatewayError::TransportMismatch { named: TransportTarget::ClaudeCli, available: None })
         ));
     }
 

@@ -18,12 +18,34 @@
 use std::sync::Arc;
 
 use aperture_contracts::suggestions::SuggestionSource;
-use aperture_contracts::{BubbleSpec, ContextPayload, Intent, OpenOutcome, StructuredSuggestions};
+use aperture_contracts::{
+    BubbleSpec, ContextPayload, Intent, OpenOutcome, StructuredSuggestions, TransportTarget,
+};
+use serde::Serialize;
 use tauri::State;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
 use crate::events::{self, BubbleSpecEnvelope, CaptureIndicator};
+
+/// Run a DB-heavy closure off the async executor (SDLC review 2026-08-19,
+/// finding 4). `Db::with_conn` locks the one global connection mutex and runs
+/// inline, so a command that did that directly parked a tokio worker for the
+/// whole query — and the Tier-0 capture writes queue behind the same mutex. The
+/// multi-table reads (History search's `LIKE` over OCR text, the eight-aggregate
+/// stats, Purge All) now run on the blocking pool, the same leg `bubble_click`
+/// already uses for `ShellExecuteW`. Single-row reads stay inline: the hop costs
+/// more than the query. A JoinError (the pool task panicked or was cancelled)
+/// surfaces as the command's `Err`, never as a hang.
+pub(crate) async fn blocking<T, F>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("blocking task failed: {e}"))?
+}
 
 /// Toggle capture ON/OFF (doc 02 §7, doc 12 §2, §6).
 ///
@@ -229,10 +251,9 @@ pub async fn list_audit(
     limit: Option<u32>,
     state: State<'_, AppState>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let rows = state
-        .db
-        .recent_audit_events(limit.unwrap_or(200))
-        .map_err(|e| e.to_string())?;
+    let db = Arc::clone(&state.db);
+    let limit = limit.unwrap_or(200);
+    let rows = blocking(move || db.recent_audit_events(limit).map_err(|e| e.to_string())).await?;
     Ok(rows
         .into_iter()
         .map(|e| {
@@ -254,17 +275,20 @@ pub async fn list_audit(
 /// survive — see `Db::purge_all` for why.
 #[tauri::command]
 pub async fn purge_all(state: State<'_, AppState>) -> Result<usize, String> {
-    let policy = aperture_db::retention::RetentionPolicy::default();
-    state
-        .db
-        .purge_all(crate::pipeline::epoch_ms(), &policy)
-        .map_err(|e| e.to_string())
+    let db = Arc::clone(&state.db);
+    blocking(move || {
+        let policy = aperture_db::retention::RetentionPolicy::default();
+        db.purge_all(crate::pipeline::epoch_ms(), &policy)
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// The user's exclusion rules, for the Activity & Privacy view (doc 13 §4).
 #[tauri::command]
 pub async fn list_exclusions(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
-    let rows = state.db.read_exclusion_list().map_err(|e| e.to_string())?;
+    let db = Arc::clone(&state.db);
+    let rows = blocking(move || db.read_exclusion_list().map_err(|e| e.to_string())).await?;
     Ok(rows
         .into_iter()
         .map(|(id, match_kind, pattern, enabled)| {
@@ -365,9 +389,9 @@ pub async fn suggest_exclusions(
 /// Aggregate counts + storage facts for the dashboard's Overview tab.
 #[tauri::command]
 pub async fn dashboard_stats(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let counts = state
-        .db
-        .with_conn(|c| {
+    let db = Arc::clone(&state.db);
+    let counts = blocking(move || {
+        db.with_conn(|c| {
             let count = |sql: &str| -> rusqlite::Result<i64> { c.query_row(sql, [], |r| r.get(0)) };
             Ok(serde_json::json!({
                 "events": count("SELECT COUNT(*) FROM events")?,
@@ -382,7 +406,9 @@ pub async fn dashboard_stats(state: State<'_, AppState>) -> Result<serde_json::V
                 "last_event_ts": c.query_row("SELECT MAX(ts) FROM events", [], |r| r.get::<_, Option<i64>>(0))?,
             }))
         })
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())
+    })
+    .await?;
     let db_bytes = std::fs::metadata(aperture_db::default_db_path())
         .map(|m| m.len())
         .unwrap_or(0);
@@ -412,9 +438,9 @@ pub async fn list_events(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .map(|s| format!("%{s}%"));
-    state
-        .db
-        .with_conn(|c| {
+    let db = Arc::clone(&state.db);
+    blocking(move || {
+        db.with_conn(|c| {
             let mut sql = String::from(
                 "SELECT e.id, e.ts, e.type, e.app, e.process, e.window_title, e.session_id, \
                         e.redaction_flags, e.payload, \
@@ -461,6 +487,8 @@ pub async fn list_events(
             rows.collect::<Result<Vec<_>, _>>()
         })
         .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// The Patterns tab: what the engine has mined (doc 08).
@@ -470,9 +498,9 @@ pub async fn list_patterns(
     state: State<'_, AppState>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let limit = limit.unwrap_or(100).min(500);
-    state
-        .db
-        .with_conn(|c| {
+    let db = Arc::clone(&state.db);
+    blocking(move || {
+        db.with_conn(|c| {
             let mut stmt = c.prepare(
                 "SELECT id, signature, n, support, confidence, last_seen, dismiss_decay, muted_until \
                  FROM patterns ORDER BY confidence DESC, support DESC LIMIT ?",
@@ -492,6 +520,8 @@ pub async fn list_patterns(
             rows.collect::<Result<Vec<_>, _>>()
         })
         .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// The Suggestions tab: every suggestion ever surfaced, newest first, with its
@@ -502,9 +532,9 @@ pub async fn list_suggestion_history(
     state: State<'_, AppState>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let limit = limit.unwrap_or(100).min(500);
-    state
-        .db
-        .with_conn(|c| {
+    let db = Arc::clone(&state.db);
+    blocking(move || {
+        db.with_conn(|c| {
             let mut stmt = c.prepare(
                 "SELECT id, title, glyph, confidence, state, shown_ts, resolved_ts, outcome, \
                         useful_rating, source \
@@ -527,6 +557,8 @@ pub async fn list_suggestion_history(
             rows.collect::<Result<Vec<_>, _>>()
         })
         .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -761,7 +793,11 @@ pub async fn record_feedback(
         other => return Err(format!("unknown feedback kind: {other}")),
     };
     let resolved_state = terminal_state(&kind);
-    let (applied, pattern_id) = record_feedback_row(&state.db, row_id, &kind, now)?;
+    let (applied, pattern_id) = {
+        let db = Arc::clone(&state.db);
+        let kind = kind.clone();
+        blocking(move || record_feedback_row(&db, row_id, &kind, now)).await?
+    };
 
     if !applied {
         tracing::debug!(
@@ -798,8 +834,24 @@ pub async fn record_feedback(
 /// Global bubble snooze (ADR-040/Q95, doc 11 §6, doc 13 §8): silences bubble
 /// EMISSION while capture + learning continue — distinct from the capture
 /// toggle. `mode`: "off" | "15m" | "1h" | "forever" (until re-enabled).
+///
+/// The second half of the Q95 contract — "rows queue and surface when the
+/// snooze lifts" — is driven from here (SDLC review 2026-08-19, finding 2).
+/// `list_suggestions` returns `[]` while snoozed and the queued rows once it is
+/// not, but nothing asked the overlay to call it again: queued suggestions
+/// stayed invisible until the next WebView remount. So a lift is announced:
+/// `off` broadcasts `suggestions_refresh("snooze_off")` at once; a timed snooze
+/// arms a one-shot that, at the deadline, clears the snooze and broadcasts
+/// `"snooze_expired"` — but only if the deadline is still the one it armed for,
+/// so a later `set_snooze` (re-snooze, `forever`, `off`) makes the stale timer
+/// a no-op instead of an early un-snooze. `forever` announces nothing.
 #[tauri::command]
-pub async fn set_snooze(mode: String, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn set_snooze(
+    mode: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
     let now = crate::pipeline::epoch_ms();
     let until = match mode.as_str() {
         "off" => 0,
@@ -808,9 +860,31 @@ pub async fn set_snooze(mode: String, state: State<'_, AppState>) -> Result<(), 
         "forever" => i64::MAX,
         other => return Err(format!("unknown snooze mode: {other}")),
     };
-    state
-        .snooze_until
-        .store(until, std::sync::atomic::Ordering::SeqCst);
+    state.snooze_until.store(until, Ordering::SeqCst);
+    match until {
+        0 => {
+            if let Err(e) = events::emit_suggestions_refresh(&app, "snooze_off") {
+                tracing::warn!(%e, "snooze lifted but the refresh notification did not emit");
+            }
+        }
+        i64::MAX => {}
+        deadline => {
+            let snooze_until = Arc::clone(&state.snooze_until);
+            tauri::async_runtime::spawn(async move {
+                let wait = (deadline - crate::pipeline::epoch_ms()).max(0) as u64;
+                tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                // Unchanged since we armed ⇒ this snooze is the one expiring.
+                if snooze_until
+                    .compare_exchange(deadline, 0, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    if let Err(e) = events::emit_suggestions_refresh(&app, "snooze_expired") {
+                        tracing::warn!(%e, "snooze expired but the refresh notification did not emit");
+                    }
+                }
+            });
+        }
+    }
     Ok(())
 }
 
@@ -831,23 +905,34 @@ pub async fn list_suggestions(
     state: State<'_, AppState>,
 ) -> Result<Vec<BubbleSpecEnvelope>, String> {
     // ADR-040/Q95: while snoozed the overlay renders nothing; queued rows
-    // surface here once the snooze lifts.
-    let snoozed = state
-        .snooze_until
-        .load(std::sync::atomic::Ordering::SeqCst)
-        > crate::pipeline::epoch_ms();
+    // surface here once the snooze lifts (the lift is announced by
+    // `set_snooze` via `suggestions_refresh`, review finding 2).
+    let now = crate::pipeline::epoch_ms();
+    let snoozed = state.snooze_until.load(std::sync::atomic::Ordering::SeqCst) > now;
     if snoozed {
         return Ok(Vec::new());
     }
-    restorable_suggestions(&state.db)
+    let db = Arc::clone(&state.db);
+    blocking(move || restorable_suggestions(&db, now)).await
 }
+
+/// How far back a live (`queued`/`shown`) row may date and still be restored
+/// (SDLC review 2026-08-19, finding 3a). A `shown` row is what a kill mid-dwell
+/// leaves behind; restoring one days later produced a bubble whose Resume could
+/// not work (doc 08 §5: stale bubbles are "prevented, not apologized for"). A
+/// week is the dwell-scale horizon: well past any connector TTL, short enough
+/// that nothing restored is a surprise.
+const RESTORE_HORIZON_MS: i64 = 7 * 86_400_000;
 
 /// The durable half of [`list_suggestions`] — the queue as SQLite holds it,
 /// split out so the respawn path (decisions #5 and #8 both ride it) is testable
-/// without a running Tauri app.
+/// without a running Tauri app. `now` is epoch ms, the reference for the
+/// staleness floor.
 pub(crate) fn restorable_suggestions(
     db: &aperture_db::Db,
+    now: i64,
 ) -> Result<Vec<BubbleSpecEnvelope>, String> {
+    let floor = now - RESTORE_HORIZON_MS;
     db
         .with_conn(|c| {
             // The LEFT JOIN rebuilds what the live `bubble_spec` emit carries in
@@ -857,15 +942,23 @@ pub(crate) fn restorable_suggestions(
             // restore. Ordering falls back to `created_ts` because a snoozed
             // (queued) row has no `shown_ts` at all, so the old ORDER BY put
             // every queued row in an arbitrary NULL block.
+            //
+            // Staleness floor (review finding 3a): rows older than the horizon
+            // are skipped, and so is a LOCAL row whose `connector_id` is NULL —
+            // the nightly prune nulls it when the connector state expires, and
+            // a row with no state left can never be resumed. Claude
+            // informational bubbles legitimately have none and still restore.
             let mut stmt = c.prepare(
                 "SELECT s.id, s.title, s.glyph, s.confidence, s.connector_id, s.source, \
                         s.created_ts, cs.connector_type, cs.reconstruct_payload \
                  FROM suggestions s \
                  LEFT JOIN connector_state cs ON cs.id = s.connector_id \
                  WHERE s.state IN ('queued','shown') \
+                   AND COALESCE(s.created_ts, s.shown_ts, 0) >= ?1 \
+                   AND (s.connector_id IS NOT NULL OR s.source = 'claude') \
                  ORDER BY COALESCE(s.shown_ts, s.created_ts, 0) DESC LIMIT 16",
             )?;
-            let rows = stmt.query_map([], |row| {
+            let rows = stmt.query_map([floor], |row| {
                 let id: i64 = row.get(0)?;
                 let source = match row.get::<_, Option<String>>(5)?.as_deref() {
                     Some("claude") => SuggestionSource::Claude,
@@ -1189,9 +1282,9 @@ pub async fn list_trail_events(
     state: State<'_, AppState>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let floor = crate::pipeline::epoch_ms() - minutes as i64 * 60_000;
-    let trail = state
-        .db
-        .with_conn(|c| {
+    let db = Arc::clone(&state.db);
+    let trail = blocking(move || {
+        db.with_conn(|c| {
             let mut stmt = c.prepare(
                 "SELECT ts, type, app, window_title FROM events \
                  WHERE redaction_flags = 0 AND ts >= ?1 \
@@ -1208,7 +1301,9 @@ pub async fn list_trail_events(
             })?;
             rows.collect::<Result<Vec<_>, _>>()
         })
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())
+    })
+    .await?;
     Ok(trail.into_iter().rev().collect())
 }
 
@@ -1381,6 +1476,60 @@ pub async fn preview_cancel(payload_id: Uuid, state: State<'_, AppState>) -> Res
     Ok(())
 }
 
+/// What [`preview_send`] hands back (matches the UI's `PreviewSendResult`,
+/// tagged on `kind`). `transport_mismatch` is a non-error outcome on purpose:
+/// nothing was sent, the session and approval are intact, and the panel must
+/// render a choice ("Claude CLI isn't available — send via Messages API
+/// instead?") rather than a failure toast.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PreviewSendResult {
+    /// The approved payload left over the transport the preview named.
+    Sent { suggestions: StructuredSuggestions },
+    /// The named transport is not Ready; `available` is the first Ready push
+    /// transport in settings order, offered for an explicit
+    /// [`preview_retarget`] + re-approval. Nothing egressed.
+    TransportMismatch {
+        named: TransportTarget,
+        available: Option<TransportTarget>,
+    },
+}
+
+/// Re-stamp a previewed payload's transport (SDLC review 2026-08-19, finding
+/// 1) — the user's answer to a `transport_mismatch`. Only the push targets are
+/// valid; the MCP handoff path is pull-only and binds its own payloads
+/// (`mcp_bridge`), so a session staged for Claude Desktop cannot be turned
+/// into a push Send here, nor can a push session be pointed at MCP.
+///
+/// Any standing approval is dropped: the approval hash covers the serialized
+/// payload, `transport_target` included, so the user must see the new footer
+/// and approve again before [`preview_send`] will move a byte. Returns the
+/// updated payload for the panel to re-render.
+#[tauri::command]
+pub async fn preview_retarget(
+    payload_id: Uuid,
+    target: TransportTarget,
+    state: State<'_, AppState>,
+) -> Result<ContextPayload, String> {
+    if !matches!(target, TransportTarget::ClaudeCli | TransportTarget::MessagesApi) {
+        return Err(format!("preview_retarget: {target:?} is not a push transport"));
+    }
+    let mut previews = state.previews.lock().await;
+    let session = previews
+        .sessions
+        .get_mut(&payload_id)
+        .ok_or_else(|| format!("preview_retarget: unknown payload {payload_id}"))?;
+    if session.payload().transport_target == TransportTarget::ClaudeDesktopMcp {
+        return Err(format!(
+            "preview_retarget: payload {payload_id} was staged for Claude Desktop (MCP) and stays on that path"
+        ));
+    }
+    session.payload_mut().transport_target = target;
+    let payload = session.payload().clone();
+    previews.approved.remove(&payload_id);
+    Ok(payload)
+}
+
 /// The ONLY call that reaches the network (doc 15 §2(c), doc 13 §2) — via the
 /// gateway, SHA-256 audit-logged as `cloud_send`.
 ///
@@ -1389,12 +1538,19 @@ pub async fn preview_cancel(payload_id: Uuid, state: State<'_, AppState>) -> Res
 /// content after the gate (preview == wire, doc 13 §3). On a transport failure
 /// the session and approval are RESTORED so Send can honestly be retried, and
 /// the error reaches the panel instead of dead-ending.
+///
+/// The Send is bound to the transport the preview footer named (review finding
+/// 1): if that transport is not Ready the gateway refuses rather than falling
+/// through to the next one (the metered API key, in the default order). That
+/// refusal comes back as `Ok(TransportMismatch { .. })` with the session and
+/// approval restored exactly as on a transport failure, so the user can
+/// [`preview_retarget`], re-approve, and Send — or cancel.
 #[tauri::command]
 pub async fn preview_send(
     payload_id: Uuid,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> Result<StructuredSuggestions, String> {
+) -> Result<PreviewSendResult, String> {
     let (session, approved_hash) = {
         let mut previews = state.previews.lock().await;
         let Some(hash) = previews.approved.remove(&payload_id) else {
@@ -1441,16 +1597,29 @@ pub async fn preview_send(
             // bubbles/answer core-side — the panel closes right after Send, so
             // the returned value alone reached no surface (2026-08-15 review).
             crate::pipeline::surface_cloud_suggestions(&app, state.inner(), &result);
-            Ok(result)
+            Ok(PreviewSendResult::Sent { suggestions: result })
         }
         Err(e) => {
+            // Nothing left the machine: restore the session AND the approval so
+            // the user can retry (transport failure) or retarget + re-approve
+            // (mismatch, finding 1) against the same reviewed content.
             let mut previews = state.previews.lock().await;
             previews.sessions.insert(
                 payload_id,
                 aperture_reasoning_gateway::preview::PreviewSession::new(backup),
             );
             previews.approved.insert(payload_id, approved_hash);
-            Err(e.to_string())
+            match e {
+                aperture_reasoning_gateway::GatewayError::TransportMismatch { named, available } => {
+                    tracing::info!(
+                        ?named,
+                        ?available,
+                        "preview_send refused: the named transport is not ready (review finding 1)"
+                    );
+                    Ok(PreviewSendResult::TransportMismatch { named, available })
+                }
+                other => Err(other.to_string()),
+            }
         }
     }
 }
@@ -1579,9 +1748,9 @@ async fn require_voice_consent(state: &State<'_, AppState>) -> Result<(), String
 /// `config/settings.default.json` + the encrypted store land at M9.)
 #[tauri::command]
 pub async fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    state
-        .db
-        .with_conn(|c| {
+    let db = Arc::clone(&state.db);
+    blocking(move || {
+        db.with_conn(|c| {
             let mut stmt = c.prepare("SELECT key, value FROM settings")?;
             let mut obj = serde_json::Map::new();
             let rows = stmt.query_map([], |row| {
@@ -1595,6 +1764,8 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Valu
             Ok(serde_json::Value::Object(obj))
         })
         .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// Persist settings (doc 13 §6): each top-level key of `patch` upserts one
@@ -1630,9 +1801,10 @@ pub async fn set_settings(
     let serde_json::Value::Object(map) = patch else {
         return Err("set_settings expects a JSON object".into());
     };
-    state
-        .db
-        .with_conn(|c| {
+    let sections: Vec<String> = map.keys().cloned().collect();
+    let db = Arc::clone(&state.db);
+    blocking(move || {
+        db.with_conn(|c| {
             for (k, v) in &map {
                 c.execute(
                     "INSERT INTO settings (key, value) VALUES (?1, ?2) \
@@ -1642,9 +1814,9 @@ pub async fn set_settings(
             }
             Ok(())
         })
-        .map_err(|e| e.to_string())?;
-
-    let sections: Vec<String> = map.keys().cloned().collect();
+        .map_err(|e| e.to_string())
+    })
+    .await?;
 
     // Decision #39: the transport order is read when the gateway is COMPOSED, so
     // a rebuild is what makes the switch take effect. Cheap (health is probed
@@ -1728,6 +1900,150 @@ pub fn persist_autostart(db: &aperture_db::Db, on: bool) -> Result<(), String> {
         .map(|_| ())
     })
     .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// v2 agent commands (Doc 22 §9, owner decisions #47–#54) — the user side of
+// the loop. Claude's side is the MCP bridge (`aperture_agent_*`); the policy
+// is `crate::agent`. Every one of these is a user gesture on the overlay.
+// ---------------------------------------------------------------------------
+
+/// The current task view (`None` = no task; the surface unmounts).
+#[tauri::command]
+pub async fn agent_status(
+    state: State<'_, AppState>,
+) -> Result<Option<crate::agent::TaskView>, String> {
+    Ok(state.agent.lock().await.view())
+}
+
+/// The user typed a task into Aperture (Doc 22 §9.1) — created + approved.
+#[tauri::command]
+pub async fn agent_start_task(
+    description: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::agent::TaskView, String> {
+    crate::agent::user_start_task(&app, state.inner(), &description).await
+}
+
+/// approve | deny | confirm | skip | resume | stop (locked decision 5: `stop`
+/// is always honoured; it flags the executor before anything else).
+#[tauri::command]
+pub async fn agent_decide(
+    task_id: String,
+    decision: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::agent::TaskView, String> {
+    crate::agent::user_decide(&app, state.inner(), &task_id, &decision).await
+}
+
+/// Answer Claude's `need_clarification` question.
+#[tauri::command]
+pub async fn agent_answer(
+    task_id: String,
+    answer: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::agent::TaskView, String> {
+    crate::agent::user_answer(&app, state.inner(), &task_id, &answer).await
+}
+
+/// Decision #54: close the windows the task opened that are still open.
+#[tauri::command]
+pub async fn agent_undo_close_windows(
+    task_id: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    crate::agent::user_undo_close_windows(&app, state.inner(), &task_id).await
+}
+
+/// Clear a finished task from the overlay (the durable row stays).
+#[tauri::command]
+pub async fn agent_dismiss(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    {
+        let mut rt = state.agent.lock().await;
+        rt.dismiss_if_terminal()?;
+    }
+    crate::agent::emit_view(&app, state.inner()).await;
+    Ok(())
+}
+
+/// Task history (V2-M6), newest first.
+#[tauri::command]
+pub async fn agent_list_tasks(
+    limit: Option<u32>,
+    state: State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let tasks = Arc::clone(state.agent.lock().await.tasks());
+    blocking(move || {
+        let rows = tasks.list_tasks(limit.unwrap_or(50)).map_err(|e| e.to_string())?;
+        Ok(rows
+            .into_iter()
+            .map(|t| {
+                serde_json::json!({
+                    "id": t.id.to_string(),
+                    "description": t.description,
+                    "status": t.status.as_str(),
+                    "created_at": t.created_at,
+                    "completed_at": t.completed_at,
+                    "step_count": t.step_count,
+                    "outcome_summary": t.outcome_summary,
+                })
+            })
+            .collect())
+    })
+    .await
+}
+
+/// One task's audited steps (payload hash + action + result), oldest first.
+#[tauri::command]
+pub async fn agent_task_steps(
+    task_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    let tasks = Arc::clone(state.agent.lock().await.tasks());
+    blocking(move || {
+        let rows = tasks.steps(id).map_err(|e| e.to_string())?;
+        Ok(rows
+            .into_iter()
+            .map(|s| {
+                serde_json::json!({
+                    "step_number": s.step_number,
+                    "screen_payload_hash": s.screen_payload_hash,
+                    "action_type": s.action_type,
+                    "action_target": s.action_target,
+                    "action_value": s.action_value,
+                    "result": s.result.map(|r| r.as_str()),
+                    "claude_reasoning": s.claude_reasoning,
+                    "timestamp": s.timestamp,
+                })
+            })
+            .collect())
+    })
+    .await
+}
+
+/// "Purge task history" for one task (Doc 22 §8) — steps cascade.
+#[tauri::command]
+pub async fn agent_purge_task(
+    task_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    {
+        let rt = state.agent.lock().await;
+        if rt.is_current_live(id) {
+            return Err("stop the task before purging it".into());
+        }
+    }
+    let tasks = Arc::clone(state.agent.lock().await.tasks());
+    blocking(move || tasks.purge_task(id).map_err(|e| e.to_string())).await
 }
 
 #[cfg(test)]
@@ -1857,7 +2173,7 @@ mod tests {
         })
         .unwrap();
 
-        let rows = restorable_suggestions(&db).unwrap();
+        let rows = restorable_suggestions(&db, 1000).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].spec.created_ts, Some(900), "age survives the respawn");
         let offers = &rows[0].spec.exclusion_offers;
@@ -1881,10 +2197,55 @@ mod tests {
         })
         .unwrap();
 
-        let rows = restorable_suggestions(&db).unwrap();
+        let rows = restorable_suggestions(&db, 1000).unwrap();
         assert_eq!(rows.len(), 1, "queued rows survive; the LEFT JOIN keeps them");
         assert!(rows[0].spec.exclusion_offers.is_empty());
         assert_eq!(rows[0].spec.created_ts, Some(700), "queued rows have no shown_ts to fall back on");
+    }
+
+    /// Review finding 3a: the restore has a staleness floor. A `shown` row from
+    /// eight days ago (a kill mid-dwell, long past any connector TTL) and a
+    /// local row whose connector the nightly prune detached are NOT restored —
+    /// both would be bubbles whose Resume cannot work. A fresh, attached row is.
+    #[test]
+    fn restore_skips_stale_rows_and_detached_local_rows() {
+        let db = Db::open_in_memory().unwrap();
+        let now = 1_700_000_000_000 + 30 * 86_400_000;
+        let st = aperture_contracts::ConnectorState {
+            id: "conn-live".into(),
+            connector_type: "browser".into(),
+            reconstruct_payload: serde_json::json!({"url": "https://docs.rs/tokio"}),
+            payload_version: 1,
+            captured_ts: now - 1000,
+            stale_after_ts: None,
+        };
+        db.insert_connector_state(&st).unwrap();
+        db.with_conn(|c| {
+            // Fresh + attached: restores.
+            c.execute(
+                "INSERT INTO suggestions (connector_id, source, title, state, shown_ts, created_ts) \
+                 VALUES ('conn-live', 'local', 'fresh', 'shown', ?1, ?1)",
+                [now - 60_000],
+            )?;
+            // Eight days old, still attached: past the horizon.
+            c.execute(
+                "INSERT INTO suggestions (connector_id, source, title, state, shown_ts, created_ts) \
+                 VALUES ('conn-live', 'local', 'stale', 'shown', ?1, ?1)",
+                [now - 8 * 86_400_000],
+            )?;
+            // Fresh, but the nightly FK-detach nulled its connector: unresumable.
+            c.execute(
+                "INSERT INTO suggestions (connector_id, source, title, state, created_ts) \
+                 VALUES (NULL, 'local', 'detached', 'queued', ?1)",
+                [now - 60_000],
+            )
+            .map(|_| ())
+        })
+        .unwrap();
+
+        let rows = restorable_suggestions(&db, now).unwrap();
+        let titles: Vec<&str> = rows.iter().map(|r| r.spec.title.as_str()).collect();
+        assert_eq!(titles, vec!["fresh"], "only the fresh, attached row restores");
     }
 
     fn insert_screen(db: &Db, ts: i64, text: &str, redaction_flags: u32) -> i64 {

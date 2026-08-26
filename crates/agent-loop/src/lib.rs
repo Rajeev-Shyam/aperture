@@ -5,18 +5,26 @@
 //! as pure logic — the part every later milestone leans on and the part that
 //! must be right before a single click ever happens.
 //!
-//! What is deliberately ABSENT until the grilling (Doc 22 §12):
-//! - the live loop driver (V2-M2) — it composes `screen-serializer` →
-//!   the MCP gate (`agent_step` as a 5th tool on the EXISTING `aperture-mcp`
-//!   plumbing, per the v2 kickoff) → `action-executor`;
-//! - scoped allow (V2-M3) — extends v1's `previews.approved` content-bound
-//!   store, not new machinery;
-//! - error recovery shape (Q-V2-07) and the step-cap default's final value
-//!   (Q-V2-04 — 50 is the [ASSUMPTION] encoded here).
+//! Since 2026-08-22 (V2-M2/M3/M5) the live driver lives in [`driver`]: it
+//! composes this machine with `task-manager` (audit rows), `action-executor`
+//! (the hands) and the owner's v2 decisions (Doc 24 §K — confirm risky
+//! actions, once-per-task approval, pause-and-notify on exclusions/elevation,
+//! undo bookkeeping). The shell drives it from the MCP gate (`agent_step` as a
+//! 5th tool on the EXISTING `aperture-mcp` plumbing, per the v2 kickoff) and
+//! owns all I/O; the driver is pure policy and fully tested offline.
+//!
+//! Still [PROVISIONAL] (Doc 22 §12, owner to confirm): the step-cap default
+//! (Q-V2-04, 50 — now a setting), and error recovery (Q-V2-07: the executor's
+//! error text is echoed to Claude as `last_action.result`; the 3-consecutive
+//! threshold bounds retries).
 //!
 //! Invariants (Doc 22 §11): the hard stop can never be disabled and always
 //! wins; every step is audited via `task-manager` regardless of scoped allow;
 //! the loop never acts without a user-initiated task.
+
+pub mod driver;
+
+pub use driver::{AgentDriver, Disposition, DriverError, LoopConfig, PauseReason, StepLogEntry};
 
 use aperture_contracts::agent::{ActionInstruction, AgentStatus, TaskState};
 
@@ -26,7 +34,8 @@ pub const DEFAULT_STEP_CAP: u32 = 50;
 pub const DEFAULT_ERROR_THRESHOLD: u32 = 3;
 
 /// Why the loop stopped — surfaced to the user + written to the task row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StopReason {
     /// Claude returned `task_complete`.
     Complete,
@@ -41,6 +50,20 @@ pub enum StopReason {
     /// VRAM pressure forced a sidecar unload mid-task — graceful pause,
     /// resumable (Doc 22 §3.3), not a failure.
     VramPause,
+}
+
+impl StopReason {
+    /// User-facing one-liner for the status bar / completion bubble.
+    pub fn describe(&self) -> String {
+        match self {
+            StopReason::Complete => "task complete".into(),
+            StopReason::HardStop => "stopped by you".into(),
+            StopReason::ErrorThreshold => "stopped: three actions in a row failed".into(),
+            StopReason::StepCap => "stopped: step cap reached".into(),
+            StopReason::CannotProceed(why) => format!("Claude cannot proceed: {why}"),
+            StopReason::VramPause => "paused: GPU memory pressure".into(),
+        }
+    }
 }
 
 /// The pure per-task state machine (Doc 22 §3.3). The driver feeds it events;

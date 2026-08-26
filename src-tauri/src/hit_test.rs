@@ -8,9 +8,10 @@
 //!    publishes the rects via the `set_hit_test_rects` command (physical px,
 //!    window-relative).
 //! 2. A lightweight poller compares the global cursor position against those
-//!    rects (~30 Hz) and clears `WS_EX_TRANSPARENT` only while the cursor is
-//!    inside one — hover and click reach the WebView, everything else falls
-//!    through to the apps beneath.
+//!    rects (60 Hz while any rect or modal exists, 30 Hz otherwise) and clears
+//!    `WS_EX_TRANSPARENT` only while the cursor is inside one — hover and
+//!    click reach the WebView, everything else falls through to the apps
+//!    beneath.
 //! 3. A modal surface (`set_overlay_interactive`) overrides the poller: while a
 //!    modal is up the window stays interactive regardless of the cursor.
 //!
@@ -44,6 +45,17 @@ const RECT_PAD: i32 = 8;
 /// (a `WM_NCHITTEST` subclass returning HTTRANSPARENT outside the rects)
 /// rather than more poll rate.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// Idle cadence — 30 Hz, used whenever NO window has a published rect or a live
+/// modal (doc 04 §8; SDLC review 2026-08-19, finding 6). Doc 04 budgets < 2 %
+/// average CPU at idle for an always-on app, and a 60 Hz timer that wakes
+/// forever against an empty rect set spends that budget on nothing: with zero
+/// rects and no modal `reconcile` can only answer "click-through", so the
+/// answer cannot change between ticks. Halving the idle rate loses nothing —
+/// rect and modal arrivals reconcile immediately on their own (`set_rects`,
+/// `set_modal`), and the NEXT tick after one lands runs at [`POLL_INTERVAL`]
+/// again. Active hover feel (decision #11) is untouched.
+pub const IDLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
 
 /// What was last applied to the window, so the poller only touches styles on
 /// transitions. Tracks the MECHANISM, not just the boolean: hover-interactive
@@ -113,6 +125,16 @@ impl HitTestState {
         self.reconcile(app);
     }
 
+    /// Is there anything for the poller to decide — ANY window with a published
+    /// rect or a live modal? When not, the next tick's answer is fixed
+    /// ("click-through"), so the poller backs off to [`IDLE_POLL_INTERVAL`]
+    /// (review finding 6).
+    pub fn has_work(&self) -> bool {
+        lock(&self.windows)
+            .values()
+            .any(|hit| hit.modal > 0 || !hit.rects.is_empty())
+    }
+
     /// One poller tick: for every tracked window, decide `interactive` from
     /// (modal || cursor-in-rect) and apply it only on change.
     pub fn reconcile(&self, app: &tauri::AppHandle) {
@@ -152,16 +174,21 @@ impl HitTestState {
 }
 
 /// Spawn the cursor poller. Idles cheaply: with no rects and no modal anywhere it
-/// does two map lookups and goes back to sleep.
+/// does one map walk and sleeps [`IDLE_POLL_INTERVAL`]; once anything is
+/// published it ticks at [`POLL_INTERVAL`] (review finding 6, doc 04 §8). A
+/// plain sleep-after-work loop rather than `interval`: the cadence is chosen per
+/// tick, and a tick that overran simply starts the next sleep late — the
+/// skip-missed-ticks semantics the interval had are moot.
 pub fn spawn_poller(app: tauri::AppHandle) {
     tokio::spawn(async move {
         use tauri::Manager;
-        let mut tick = tokio::time::interval(POLL_INTERVAL);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            tick.tick().await;
-            let state = app.state::<HitTestState>();
-            state.reconcile(&app);
+            let cadence = {
+                let state = app.state::<HitTestState>();
+                state.reconcile(&app);
+                if state.has_work() { POLL_INTERVAL } else { IDLE_POLL_INTERVAL }
+            };
+            tokio::time::sleep(cadence).await;
         }
     });
 }
@@ -243,5 +270,26 @@ mod tests {
         assert!(cursor_in_rects(&rects, 505, 505));
         assert!(cursor_in_rects(&rects, 5, 5));
         assert!(!cursor_in_rects(&rects, 250, 250));
+    }
+
+    /// Review finding 6: the poller backs off only when EVERY window is empty
+    /// (no rects, no modal) — one live surface anywhere keeps the active rate.
+    #[test]
+    fn has_work_is_false_only_when_every_window_is_empty() {
+        let state = HitTestState::default();
+        assert!(!state.has_work(), "nothing tracked ⇒ idle");
+        lock(&state.windows).insert("overlay".into(), WindowHit::default());
+        lock(&state.windows).insert("overlay-2".into(), WindowHit::default());
+        assert!(!state.has_work(), "tracked but empty ⇒ idle");
+
+        lock(&state.windows).get_mut("overlay-2").unwrap().rects = vec![rect(0, 0, 10, 10)];
+        assert!(state.has_work(), "a rect on any monitor ⇒ active");
+
+        lock(&state.windows).get_mut("overlay-2").unwrap().rects.clear();
+        lock(&state.windows).get_mut("overlay").unwrap().modal = 1;
+        assert!(state.has_work(), "a modal on any monitor ⇒ active");
+
+        lock(&state.windows).get_mut("overlay").unwrap().modal = 0;
+        assert!(!state.has_work(), "all clear again ⇒ idle");
     }
 }

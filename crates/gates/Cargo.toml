@@ -43,6 +43,19 @@ uuid = { workspace = true }
 # not a network crate — the two-emitter rule is untouched.
 tokio = { workspace = true }
 
+# SC5 real harness (2026-08-22, owner decision #1): the real pattern engine over a
+# scripted stream, the real payload builder + redactor, the real Gateway with
+# its Messages-API transport pointed at a loopback origin the test owns. The
+# gateway is the ONE sanctioned emitter (doc 13 §2); depending on it here adds
+# no new network crate to the workspace.
+aperture-pattern-engine = { workspace = true }
+aperture-reasoning-gateway = { workspace = true }
+
+# V2-M0 gate (v2m0_uia_executor): the real UiaExecutor driven against a live
+# Notepad window (Doc 22 §10). The gate spawns Notepad itself — this crate is
+# lint-exempt; the executor never spawns anything (Doc 24 #52).
+aperture-action-executor = { workspace = true }
+
 [features]
 default = []
 # Forwards to aperture-db's SQLCipher build so `m9_db_is_unreadable_without_the_key`

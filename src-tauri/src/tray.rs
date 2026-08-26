@@ -37,12 +37,19 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         commands::autostart_enabled(app),
         None::<&str>,
     )?;
+    // v2 (Doc 22 §3.3, locked decision 5): the hard stop must reach the loop
+    // even if the overlay is wedged — the tray runs on its own thread. Always
+    // enabled: a stop with no task is a harmless no-op, and a greyed item
+    // that lags the real state is worse than a click that does nothing.
+    let stop_agent = MenuItem::with_id(app, "stop_agent", "Stop agent task", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit Aperture", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
         &[
             &dashboard,
             &capture,
+            &PredefinedMenuItem::separator(app)?,
+            &stop_agent,
             &PredefinedMenuItem::separator(app)?,
             &autostart,
             &PredefinedMenuItem::separator(app)?,
@@ -94,6 +101,15 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
                         // truthful eager state; the indicator listener stays
                         // authoritative when the next event lands.
                         let _ = item.set_checked(false);
+                    }
+                });
+            }
+            "stop_agent" => {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = app.state::<AppState>();
+                    if crate::agent::hard_stop_current(&app, state.inner()).await.is_none() {
+                        tracing::info!("tray: stop agent task — no task running");
                     }
                 });
             }

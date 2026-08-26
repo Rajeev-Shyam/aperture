@@ -3,7 +3,7 @@
 A local-first, multimodal, proactive desktop assistant for Windows 11. It learns how the user works by toggleably watching the screen, surfaces proactive shortcut suggestions as floating glass bubbles, and clicking a bubble **resumes a state** (e.g. reopens a YouTube video at the exact timestamp). Push-to-talk voice is both behavioral telemetry and a query channel answered with text. Pattern detection is fully local; Claude is invoked **only on explicit user action** through a swappable transport, and every cloud payload is previewed and user-approved first.
 
 ## How to read this set
-The documents are dependency-ordered, bottom-up. Foundations (01–04) define what the system is and what it may cost. Component specs (05–12) each define one subsystem's inputs, outputs, internal logic, failure modes, and resource cost. Cross-cutting docs (13–17) bind them. 18 is the mandatory coherence review. **19–21 are the R2 refinement pass** (ADRs, doc amendments, re-run coherence) and are **the most current authority** where they touch 00–18. **22 is the v2 agent-execution-layer draft** — additive, not part of locked v1 scope, to be grilled before build.
+The documents are dependency-ordered, bottom-up. Foundations (01–04) define what the system is and what it may cost. Component specs (05–12) each define one subsystem's inputs, outputs, internal logic, failure modes, and resource cost. Cross-cutting docs (13–17) bind them. 18 is the mandatory coherence review. **19–21 are the R2 refinement pass** (ADRs, doc amendments, re-run coherence) and are **the most current authority** where they touch 00–18. **22 is the v2 agent-execution layer** — additive on top of v1; **built and wired 2026-08-22** (its §12 answers marked [PROVISIONAL] await the owner). **23–24 are the owner interrogation and the decisions log** (Doc 24 carries per-decision status lines).
 
 > **R2 status.** Docs 00–18 have had the Doc 20 amendments applied **inline**, so the living docs already read as R2. Docs 19 (ADRs) and 21 (coherence re-run) remain the authoritative record of *why*; Doc 20 is the applied changelog. Every amended value keeps its `[VERIFY]`/`[ASSUMPTION]` tag until its owning M-gate measures it.
 
@@ -30,14 +30,17 @@ The documents are dependency-ordered, bottom-up. Foundations (01–04) define wh
 | 19 | Refinement ADRs (Pass R2) | Refinement | all |
 | 20 | Document Amendments (Pass R2) | Refinement | 19 |
 | 21 | Coherence & Connection Review (Pass R2) | Review | 00–20 |
-| 22 | v2 — Agent Execution Layer (Draft) | v2 (additive) | 00–21 |
+| 22 | v2 — Agent Execution Layer (built 2026-08-22; [PROVISIONAL] answers pending owner) | v2 (additive) | 00–21 |
+| 23 | Owner interrogation + audit findings (2026-08-16) | process | 00–22 |
+| 24 | Owner decisions — Claude Code implementation brief (statuses inline) | process | 23 |
 
-> Doc 18 is the R1 coherence review; **Doc 21 supersedes it** for the R2-amended set. Doc 22 (v2) sits *on top of* the whole v1 set and is not yet locked.
+> Doc 18 is the R1 coherence review; **Doc 21 supersedes it** for the R2-amended set. Doc 22 (v2) sits *on top of* the whole v1 set; its owner decisions live in Doc 24 §K and its remaining open questions are answered [PROVISIONAL] in its §12 (the code runs with those defaults until the owner confirms or overturns them).
 
 ## Conventions
 - **[VERIFY]** — a figure or API detail that must be confirmed at build time on the real target (RTX 5060 / 16 GB / Ryzen) or against current vendor docs. Do not treat as settled.
 - **[ASSUMPTION]** — a choice made to proceed, with stated reasoning; revisit if evidence contradicts it.
-- **[OPEN]** — an unresolved decision that blocks implementation (used mainly in Doc 22 / v2); must be closed before the dependent milestone starts.
+- **[OPEN]** — an unresolved decision that blocks implementation; must be closed before the dependent milestone starts.
+- **[PROVISIONAL]** — (Doc 22 §12, since 2026-08-22) an implemented default chosen by the building session in the owner's absence, with its reasoning; the owner confirms or overturns it, and the code carries it as a setting where one makes sense.
 - **Grounding note.** The set was produced against an attached 2026 local-stack research report plus independent verification. Where any figure here contradicts that report, the report wins and the figure must be re-confirmed.
 
 ## Locked decisions (do not relitigate)

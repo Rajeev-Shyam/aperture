@@ -251,12 +251,23 @@ export function Bubble({
         {spec.source === "claude" && <span className="bubble__source-tag">via Claude</span>}
       </div>
 
-      {spec.sublabel && <div className="bubble__sublabel">{spec.sublabel}</div>}
+      {/* A Resume that did not open swaps the sublabel for fallback copy and
+          withdraws the button (doc 10 §6): the bubble stays, Dismiss and the
+          thumbs still work, and nothing pretends the click succeeded. */}
+      {instance.fallback ? (
+        <div className="bubble__sublabel bubble__sublabel--fallback" role="alert">
+          {instance.fallback}
+        </div>
+      ) : (
+        spec.sublabel && <div className="bubble__sublabel">{spec.sublabel}</div>
+      )}
 
       <div className="bubble__actions">
-        <button className="btn btn--primary" onClick={onResume}>
-          Resume
-        </button>
+        {!instance.fallback && (
+          <button className="btn btn--primary" onClick={onResume}>
+            Resume
+          </button>
+        )}
         {/* The explicit "useful?" thumbs — SC7's data source (doc 11 §3, Q81).
             Rating does not dismiss: the user judged it, the bubble stays. */}
         <button

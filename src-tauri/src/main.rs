@@ -25,6 +25,7 @@
 // Hide the console window on Windows release builds (overlay app, no terminal).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agent;
 mod app_state;
 mod commands;
 mod events;
@@ -189,6 +190,7 @@ fn main() {
 
     // The capture driver + pattern task spawn inside Tauri's setup — both need
     // the AppHandle (indicator events / bubble_spec events).
+    let db_for_agent = Arc::clone(&db);
     let state = AppState::new(
         bus,
         db,
@@ -201,9 +203,11 @@ fn main() {
         gateway,
         push_target,
         voice_handle,
-        exclusions,
+        exclusions.clone(),
         vlm_fetch,
         settings_reload_tx,
+        // v2 agent runtime (Doc 22): shares the DB + the live exclusion handle.
+        agent::build_runtime(Arc::clone(&db_for_agent), exclusions),
     );
     run_tauri(
         state,
@@ -994,6 +998,16 @@ fn run_tauri(
             commands::preview_set_approved,
             commands::preview_cancel,
             commands::preview_send,
+            commands::preview_retarget,
+            commands::agent_status,
+            commands::agent_start_task,
+            commands::agent_decide,
+            commands::agent_answer,
+            commands::agent_undo_close_windows,
+            commands::agent_dismiss,
+            commands::agent_list_tasks,
+            commands::agent_task_steps,
+            commands::agent_purge_task,
             commands::voice_ptt_down,
             commands::voice_ptt_up,
             commands::voice_run_transcript,

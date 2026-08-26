@@ -199,6 +199,20 @@ impl TaskManager {
             .map_err(|e| TaskError::Db(e.to_string()))
     }
 
+    /// Recent tasks, newest first (the V2-M6 history view, Dashboard Agent tab).
+    pub fn list_tasks(&self, limit: u32) -> Result<Vec<Task>, TaskError> {
+        self.db
+            .with_conn(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT id, description, status, created_at, completed_at, step_count, \
+                            outcome_summary FROM tasks ORDER BY created_at DESC LIMIT ?1",
+                )?;
+                let rows = stmt.query_map([limit.max(1)], row_to_task)?;
+                rows.collect()
+            })
+            .map_err(|e| TaskError::Db(e.to_string()))
+    }
+
     /// A task's steps, oldest first (the V2-M6 history/audit view reads this).
     pub fn steps(&self, task_id: uuid::Uuid) -> Result<Vec<StepRecord>, TaskError> {
         self.db
@@ -360,6 +374,17 @@ mod tests {
         m.purge_task(t.id).expect("purge");
         assert!(matches!(m.get_task(t.id), Err(TaskError::UnknownTask(_))));
         assert!(m.steps(t.id).unwrap().is_empty(), "steps cascade with the task");
+    }
+
+    #[test]
+    fn list_tasks_is_newest_first_and_bounded() {
+        let m = mgr();
+        for (i, d) in ["a", "b", "c"].iter().enumerate() {
+            m.create_task(d, i as i64 * 10).unwrap();
+        }
+        let all = m.list_tasks(10).unwrap();
+        assert_eq!(all.iter().map(|t| t.description.as_str()).collect::<Vec<_>>(), ["c", "b", "a"]);
+        assert_eq!(m.list_tasks(2).unwrap().len(), 2);
     }
 
     #[test]

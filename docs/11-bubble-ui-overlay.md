@@ -88,3 +88,11 @@ Full detail: `docs/handoff/session-bridge-2026-08-13-v1-wiring.md`.
 - **Dashboard → Advanced** also exposes the (already-live) `pattern_engine` knobs — certainty, repeats-before-a-habit, quiet time, suggestions/hour — and the push-transport preference (decision #39; see doc 09). A settings write now pings the pattern task directly, so an edit applies at once instead of on the next 24-hour maintenance tick.
 
 Full session detail: `docs/handoff/session-bridge-2026-08-19-doc24-batch4.md`.
+
+## Implementation status (2026-08-22) — snooze lifts surface queued bubbles; failed Resume is honest; the agent surface
+
+- **§6 snooze (ADR-040/Q95, review finding 2):** `set_snooze` broadcasts `suggestions_refresh { reason }` on `off`, and a core one-shot fires it at a timed snooze's deadline (CAS on `snooze_until`, so a newer snooze wins); `BubbleContainer` re-runs `list_suggestions` on it and admits rows it does not already hold. Queued rows also prune by `created_ts` now (finding 8).
+- **§3 restore (finding 3):** `restorable_suggestions` drops rows older than 7 days and local rows whose connector was FK-detached by the nightly prune; a `Failed` open renders fallback copy in the bubble ("Couldn't resume — …", Resume hidden, Dismiss live) and records **no** `clicked` feedback.
+- **New surface — `AgentSurface` (Doc 22 §9, decision #53):** bottom-centre, opaque, primary-overlay-only: state pill · task · step N/cap · **Stop** (always visible while live) · live step log, plus the pause cards (task approval, consequential-action chip, Claude's question, excluded / elevated window). The HUD gained a ✦ button that opens the task composer (Doc 22 §9.1). `z-index` 35 (above bubbles/HUD, below panels). Dashboard gained an **Agent** tab (task history + audited steps + purge).
+- Vitest is in (`npm --prefix ui run test`, 19 tests): the admission-cap / queue-drain regressions from 2026-08-19 are now real tests (finding 7).
+Full detail: `docs/handoff/session-bridge-2026-08-22-v2-wiring.md`.

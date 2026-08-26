@@ -9,6 +9,8 @@
 //!
 //! - [`redaction`] — the ordered, deterministic redaction pipeline that runs at
 //!   payload assembly, **before** preview (doc 13 §5).
+//! - [`image_redaction`] — the screenshot gate (doc 24 decision #3): OCR word
+//!   boxes in, the same text rules decide, hits are painted solid black.
 //! - [`detect_suggest`] — the first-run local scan that *suggests* exclusions the
 //!   user confirms (doc 13 §4, §8; ADR-029/ADR-040).
 //! - [`audit_log`] — the local-only `capture_toggle` / `cloud_send` audit trail;
@@ -38,6 +40,7 @@
 pub mod audit_log;
 pub mod consent;
 pub mod detect_suggest;
+pub mod image_redaction;
 pub mod key_manager;
 pub mod redaction;
 

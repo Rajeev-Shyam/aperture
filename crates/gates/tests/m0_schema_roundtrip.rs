@@ -153,7 +153,15 @@ fn m0_contracts_fakes_compile_and_instantiate() {
         }),
     };
 
-    // TODO(M7:): once `fakes::golden::redaction_fixture()` is implemented (it is a
-    // `todo!()` today), assert here that its `redactions` list matches the SC5
-    // preview/wire fixture — this is the shared fixture sc5_network_monitor.rs uses.
+    // The golden redaction fixture (doc 15 §7) is RAW by design: it carries
+    // two e-mails and one secret, and nothing is redacted until the privacy
+    // crate runs (SC5 asserts `email × 2, secret_key × 1` on the wire).
+    let golden = aperture_contracts::fakes::golden::redaction_fixture();
+    assert!(!golden.user_approved, "a fixture is never pre-approved");
+    assert!(golden.redactions.is_empty(), "raw fixture: redaction happens in privacy");
+    let wire = serde_json::to_string(&golden).expect("fixture serializes");
+    for email in aperture_contracts::fakes::golden::FIXTURE_EMAILS {
+        assert!(wire.contains(email), "raw fixture carries {email}");
+    }
+    assert!(wire.contains(&aperture_contracts::fakes::golden::fixture_secret()));
 }

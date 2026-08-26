@@ -1,0 +1,207 @@
+/* ==========================================================================
+ * Agent surface (Doc 22 §9, decision #53) — persistent status bar + live step
+ * log + pause cards. Opaque by design (doc 14 §5: a long-lived surface must
+ * not spend a glass slot). Tokens only (design-tokens.css loads first).
+ * Anchored bottom-centre: clear of the HUD corners and the bubble stack's
+ * right edge, always in the user's eyeline while the agent drives.
+ * ======================================================================== */
+
+.agent {
+  position: fixed;
+  left: 50%;
+  bottom: var(--edge-inset);
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(560px, calc(100vw - 2 * var(--edge-inset)));
+  z-index: 35; /* above bubbles and the HUD (30); below the panels (40) */
+}
+
+.agent__bar,
+.agent__composer {
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-16);
+  box-shadow: var(--shadow-elev);
+  color: var(--ink-primary);
+  padding: 10px 12px;
+  font-size: 0.85rem;
+  line-height: 1.4;
+}
+
+.agent__bar {
+  border-color: var(--accent);
+}
+
+.agent__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.agent__state {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: var(--lift-1);
+  color: var(--ink-secondary);
+  white-space: nowrap;
+}
+.agent__state[data-state="running"] {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+.agent__state[data-state="paused"] {
+  background: var(--health-setup);
+  color: var(--accent-ink);
+}
+.agent__state[data-state="failed"],
+.agent__state[data-state="cancelled"] {
+  background: var(--health-down);
+  color: var(--ink-primary);
+}
+
+.agent__title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent__step {
+  color: var(--ink-faint);
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.agent__stop {
+  border-color: var(--health-down);
+  color: var(--ink-primary);
+}
+.agent__stop:hover {
+  background: var(--health-down);
+  color: var(--ink-primary);
+}
+
+.agent__card {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius-12);
+  background: var(--lift-1);
+  border: 1px solid var(--border-hairline);
+}
+
+.agent__card-lead {
+  margin: 0 0 4px;
+  color: var(--ink-primary);
+}
+
+.agent__quote {
+  margin: 0 0 6px;
+  padding-left: 8px;
+  border-left: 2px solid var(--accent);
+  color: var(--ink-primary);
+  overflow-wrap: anywhere;
+}
+
+.agent__muted {
+  margin: 0;
+  color: var(--ink-secondary);
+  font-size: 0.78rem;
+}
+
+.agent__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.agent__input {
+  flex: 1;
+  min-width: 160px;
+  padding: 6px 8px;
+  border-radius: var(--radius-12);
+  border: 1px solid var(--border-hairline);
+  background: var(--glass-1);
+  color: var(--ink-primary);
+  font: inherit;
+}
+.agent__input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.agent__textarea {
+  width: 100%;
+  margin-top: 6px;
+  resize: vertical;
+}
+
+.agent__log {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  max-height: 132px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 0.78rem;
+}
+
+.agent__log-row {
+  display: grid;
+  grid-template-columns: 2ch 1fr auto auto;
+  gap: 8px;
+  align-items: baseline;
+  padding: 2px 4px;
+  border-radius: 6px;
+}
+.agent__log-row[data-result="failure"] {
+  background: color-mix(in oklch, var(--health-down) 18%, transparent);
+}
+.agent__log-row[data-result="skipped"] {
+  color: var(--ink-faint);
+}
+
+.agent__log-n {
+  color: var(--ink-faint);
+  text-align: right;
+}
+.agent__log-summary {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent__log-result {
+  color: var(--ink-secondary);
+  font-size: 0.72rem;
+}
+.agent__log-rev {
+  color: var(--ink-faint);
+}
+
+.agent__error {
+  margin: 6px 0 0;
+  color: var(--health-down);
+  font-size: 0.78rem;
+}
+
+/* Dashboard → Agent tab */
+.dash__steps {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0 0 0 8px;
+  border-left: 1px solid var(--border-hairline);
+  font-size: 0.78rem;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.dash__steps code {
+  color: var(--ink-faint);
+  font-size: 0.7rem;
+}

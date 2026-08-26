@@ -321,6 +321,14 @@ export interface AuditAlertEvent {
   message: string;
 }
 
+/** `"suggestions_refresh"` — the snooze lifted (ADR-040/Q95; SDLC review
+ *  2026-08-19 finding 2): rows queued while it was on are now surfaceable, so
+ *  the container re-runs `list_suggestions`. Emitted by `set_snooze` when the
+ *  user turns it off and by the core's one-shot timer at a timed deadline. */
+export interface SuggestionsRefreshEvent {
+  reason: "snooze_off" | "snooze_expired";
+}
+
 /** `"dashboard_open"` / `"privacy_open"` / `"preview_claimed"` — a control
  *  surface belongs to the window labeled `target` (decision #13). Broadcast:
  *  the target window opens/keeps the surface, every other window closes its
@@ -457,11 +465,36 @@ export function previewSetApproved(payload: ContextPayload): Promise<ApprovalRes
   return invoke<ApprovalResult>("preview_set_approved", { payload });
 }
 
+/** Mirror of the `preview_send` result (internally tagged by `kind`). The push
+ *  path is BOUND to the transport the preview named (SDLC review 2026-08-19
+ *  finding 1, copying the MCP release gate): when `named` is not ready the
+ *  core sends NOTHING and reports the mismatch instead of silently egressing
+ *  over the next transport in the order — which may be the metered API key.
+ *  `available` is the transport the core would pick instead, or null when no
+ *  push transport is ready at all. */
+export type PreviewSendResult =
+  | { kind: "sent"; suggestions: StructuredSuggestions }
+  | { kind: "transport_mismatch"; named: TransportTarget; available: TransportTarget | null };
+
 /** Transmit the approved payload (doc 11 §4, doc 03 §4 — SHA-256 of the wire
  *  bytes is audit-logged as `cloud_send`). Takes only the id: the bytes that
- *  ship are the core-owned object bound at approval — preview == wire. */
-export function previewSend(payloadId: string): Promise<StructuredSuggestions> {
-  return invoke<StructuredSuggestions>("preview_send", { payloadId });
+ *  ship are the core-owned object bound at approval — preview == wire. On
+ *  `transport_mismatch` the approval stays held core-side; see
+ *  `previewRetarget`. */
+export function previewSend(payloadId: string): Promise<PreviewSendResult> {
+  return invoke<PreviewSendResult>("preview_send", { payloadId });
+}
+
+/** Re-stamp a previewed payload's `transport_target` after a
+ *  `transport_mismatch` (finding 1). The core DROPS the approval: the user
+ *  must press Send again, and that press re-approves — the explicit second
+ *  confirmation the footer's changed transport label now backs. Returns the
+ *  updated payload, which the panel swaps in through `onChange`. */
+export function previewRetarget(
+  payloadId: string,
+  target: TransportTarget,
+): Promise<ContextPayload> {
+  return invoke<ContextPayload>("preview_retarget", { payloadId, target });
 }
 
 /** Reset this window's interactivity to click-through. The UI root calls this
@@ -784,6 +817,11 @@ export const onSettingsChanged = (h: (e: SettingsChangedEvent) => void) =>
 export const onAuditAlert = (h: (e: AuditAlertEvent) => void) =>
   on<AuditAlertEvent>("audit_alert", h);
 
+/** `"suggestions_refresh"` — the snooze lifted; re-pull `list_suggestions` so
+ *  the rows queued while it was on actually surface (finding 2). */
+export const onSuggestionsRefresh = (h: (e: SuggestionsRefreshEvent) => void) =>
+  on<SuggestionsRefreshEvent>("suggestions_refresh", h);
+
 /** `"vlm_fetch"` — VLM weight download progress (decision #30); the Dashboard
  *  Overview renders the progress bar + terminal state. */
 export const onVlmFetch = (h: (e: VlmFetchEvent) => void) =>
@@ -814,5 +852,98 @@ export const onPreviewClaimed = (h: (target: string) => void) =>
  *  leaves. */
 export const onPreviewRequest = (h: (p: ContextPayload) => void) =>
   on<ContextPayload>("preview_request", h);
+
+// ---------------------------------------------------------------------------
+// v2 agent execution layer (Doc 22 §9, owner decisions #47–#54) — 2026-08-22.
+// The loop itself rides the MCP gate (Claude Desktop ↔ aperture_agent_step);
+// these are the USER's controls and the live view the status bar renders.
+// ---------------------------------------------------------------------------
+
+export type AgentActionType =
+  | "click" | "type" | "key" | "launch" | "switch_window" | "scroll" | "wait" | "none";
+
+export interface AgentAction {
+  type: AgentActionType;
+  target?: string | null;
+  value?: string | null;
+  direction?: "up" | "down" | "left" | "right" | null;
+  amount?: number | null;
+}
+
+/** Why the loop is waiting on the user (mirrors `agent_loop::PauseReason`). */
+export type AgentPause =
+  | { kind: "approval" }
+  | { kind: "confirm"; reason: string; action: AgentAction }
+  | { kind: "clarification"; question: string }
+  | { kind: "excluded"; label: string }
+  | { kind: "elevated"; window: string }
+  | { kind: "vram" };
+
+export interface AgentStepLogEntry {
+  step_number: number;
+  summary: string;
+  result: "success" | "failure" | "skipped" | string;
+  reversibility: "reversible" | "irreversible" | "unknown" | string;
+  ts: number;
+}
+
+export type AgentTaskState = "idle" | "running" | "paused" | "complete" | "failed" | "cancelled";
+
+/** The `agent_task` event payload; `null` = no task (surface unmounts). */
+export interface AgentTaskView {
+  task_id: string;
+  description: string;
+  source: "claude" | "user";
+  state: AgentTaskState;
+  step: number;
+  step_cap: number;
+  pause: AgentPause | null;
+  log: AgentStepLogEntry[];
+  outcome: string | null;
+  stop_reason: string | null;
+  undoable_windows: { hwnd: number; title: string }[];
+  in_flight: boolean;
+}
+
+export type AgentDecision = "approve" | "deny" | "confirm" | "skip" | "resume" | "stop";
+
+export const agentStatus = () => invoke<AgentTaskView | null>("agent_status");
+export const agentStartTask = (description: string) =>
+  invoke<AgentTaskView>("agent_start_task", { description });
+export const agentDecide = (taskId: string, decision: AgentDecision) =>
+  invoke<AgentTaskView>("agent_decide", { taskId, decision });
+export const agentAnswer = (taskId: string, answer: string) =>
+  invoke<AgentTaskView>("agent_answer", { taskId, answer });
+export const agentUndoCloseWindows = (taskId: string) =>
+  invoke<number>("agent_undo_close_windows", { taskId });
+export const agentDismiss = () => invoke<void>("agent_dismiss");
+
+export interface AgentTaskRow {
+  id: string;
+  description: string;
+  status: AgentTaskState;
+  created_at: number;
+  completed_at: number | null;
+  step_count: number;
+  outcome_summary: string | null;
+}
+export interface AgentStepRow {
+  step_number: number;
+  screen_payload_hash: string | null;
+  action_type: string | null;
+  action_target: string | null;
+  action_value: string | null;
+  result: string | null;
+  claude_reasoning: string | null;
+  timestamp: number;
+}
+export const agentListTasks = (limit?: number) =>
+  invoke<AgentTaskRow[]>("agent_list_tasks", { limit: limit ?? null });
+export const agentTaskSteps = (taskId: string) =>
+  invoke<AgentStepRow[]>("agent_task_steps", { taskId });
+export const agentPurgeTask = (taskId: string) => invoke<void>("agent_purge_task", { taskId });
+
+export const onAgentTask = (h: (view: AgentTaskView | null) => void) =>
+  on<AgentTaskView | null>("agent_task", h);
 
 export type { UnlistenFn };

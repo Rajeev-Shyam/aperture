@@ -71,3 +71,9 @@ Full session detail: `docs/handoff/session-bridge-2026-07-08-m6-m8.md`.
 
 ---
 > **R2 amendments applied** (see docs/19–21): ADR-031 (four-tier priorities: STT 100 > user-VLM 80 > enrichment-VLM 70 > pattern-VLM 50; deadlines measured at M5/M6), ADR-030 (7.0 GB cap + co_resident_weights in the projection; STT swap victim; warm-kept-STT protection rule), ADR-036/Q89 (diagnostics via the gateway only, opt-in/aggregate/audited), ADR-040/Q93 (reduced-mode notice + health in the Activity & Privacy view), ADR-027/FIX 2.1 (toggle-OFF halts extension forwarding). Min-residency 20 s unchanged (Q37).
+
+## Implementation status (2026-08-22) — VLM weight verification; the agent loop and the GPU
+
+- **`model_fetch` (decision #30):** `FetchItem.sha256: Option<String>`; the stream is hashed as it is written (a resumed `.part` is hashed from its existing prefix before the `Range` request), a mismatch deletes the `.part` and reports `FetchError::HashMismatch` — never renamed into place. Seed URLs pinned to revision `5037fcf…`; upgraded installs get the `sha256` key backfilled while keeping their stored URL (today `main` == that revision, so it still verifies).
+- **The v2 agent loop uses no VRAM by default** (Doc 22 §7, Q-V2-05/Q-V2-10 [PROVISIONAL]): no agent priority tier was added to the table; `PauseReason::Vram` exists in the driver but nothing raises it yet.
+Full detail: `docs/handoff/session-bridge-2026-08-22-v2-wiring.md`.

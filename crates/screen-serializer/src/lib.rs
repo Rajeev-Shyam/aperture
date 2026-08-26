@@ -7,14 +7,21 @@
 //! payload through this crate.
 //!
 //! What is REAL here: the schema, the redaction pass, the payload hash (the
-//! audit datum locked decision 6 requires), and the serialization contract.
-//! What is V2-M1: wiring the live capture/OCR feed and the 768 px screenshot
-//! downscale (v1's `vision-ocr` `prepare_image` path composes in); Q-V2-02
-//! (does a base64 768 px screenshot fit MCP payload limits?) is answered by
-//! measurement there, not assumed.
+//! audit datum locked decision 6 requires), the serialization contract, and —
+//! since V2-M1 (2026-08-22) — the screenshot leg in [`screenshot`]: OCR with
+//! word boxes → image redaction at OCR scale → 768 px JPEG → base64. Q-V2-02
+//! (does a base64 768 px screenshot fit the MCP result cap?) is measured by
+//! `screenshot::tests::q_v2_02_…` against the 1 MiB cap, not assumed.
+//!
+//! The live capture feed is `aperture_capture::CaptureSubsystem::observe_now`
+//! (same exclusion gate as a scheduled sample); the shell composes the two.
+
+pub mod screenshot;
 
 use aperture_privacy::redaction::Redactor;
 use serde::{Deserialize, Serialize};
+
+pub use screenshot::{observe_frame, ObservedScreen, RedactedScreenshot, ScreenshotError};
 
 /// The focused window's identity (Doc 22 §3.2). `url` only for browsers with
 /// the extension feed live; None otherwise.
@@ -42,8 +49,9 @@ pub struct StepPayload {
     /// The user's stated task, verbatim.
     pub task: String,
     pub step_number: u32,
-    /// 768 px-downscaled JPEG, base64 — None until V2-M1 wires capture
-    /// (Q-V2-02 measures whether it fits the transport).
+    /// 768 px-downscaled, REDACTED JPEG, base64 (Doc 22 §3.2; the redaction
+    /// gate is `screenshot::observe_frame`). `None` when the observation
+    /// carried no frame (capture off / event-only context).
     #[serde(default)]
     pub screenshot_b64: Option<String>,
     /// Redacted OCR text of the screen.
@@ -60,13 +68,19 @@ pub struct StepPayload {
     pub prior_steps_summary: Option<String>,
 }
 
-/// Raw observation handed in by the capture side — UNREDACTED. Only this
+/// Raw observation handed in by the capture side — text UNREDACTED. Only this
 /// crate turns it into a [`StepPayload`], and only through the redactor.
+///
+/// `screenshot` is the exception that proves the rule: it can only be built
+/// by [`screenshot::observe_frame`], which has already painted over every
+/// word the text rules matched — there is no constructor for an unredacted
+/// payload screenshot in this crate.
 #[derive(Debug, Clone)]
 pub struct RawObservation {
     pub ocr_text: String,
     pub focused_window: FocusedWindow,
     pub open_windows: Vec<String>,
+    pub screenshot: Option<RedactedScreenshot>,
 }
 
 /// Build one step's payload: redact every text surface, then assemble.
@@ -88,7 +102,10 @@ pub fn build_step_payload(
     let payload = StepPayload {
         task: task.to_string(),
         step_number,
-        screenshot_b64: None, // V2-M1: capture + 768 px downscale + Q-V2-02
+        screenshot_b64: observation
+            .screenshot
+            .as_ref()
+            .map(|s| screenshot::to_base64(&s.jpeg)),
         ocr_text,
         focused_window: FocusedWindow {
             app: observation.focused_window.app,
@@ -136,6 +153,7 @@ mod tests {
                     url: None,
                 },
                 open_windows: vec!["Chrome".into(), "VSCode".into()],
+                screenshot: None,
             },
             None,
             None,
@@ -154,6 +172,7 @@ mod tests {
             ocr_text: "hello".into(),
             focused_window: FocusedWindow { app: "a".into(), title: "t".into(), url: None },
             open_windows: vec![],
+            screenshot: None,
         };
         let (_, h1) = build_step_payload("task", 1, obs(), None, None, &redactor());
         let (_, h2) = build_step_payload("task", 1, obs(), None, None, &redactor());
@@ -172,6 +191,7 @@ mod tests {
                 ocr_text: "x".into(),
                 focused_window: FocusedWindow::default(),
                 open_windows: vec![],
+                screenshot: None,
             },
             Some(LastAction {
                 action_type: "click".into(),

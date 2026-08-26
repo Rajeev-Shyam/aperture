@@ -31,7 +31,7 @@ use crate::PrivacyError;
 /// The fixed taxonomy of redaction rule kinds (doc 13 §5). Ordering of the
 /// variants matches the pipeline order; [`RuleKind::ORDERED`] is the source of
 /// truth for execution order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuleKind {
     /// 1 — secrets/keys: AWS access keys, `sk-…` tokens, GitHub PATs, Slack
     /// tokens, `Authorization: Bearer` headers, PEM/OPENSSH key bodies, JWTs.
@@ -83,6 +83,20 @@ impl RuleKind {
             RuleKind::UserDefined => "term",
         }
     }
+}
+
+/// One byte range of an input string that a redaction rule would replace
+/// (doc 24 decision #3). Produced by [`Redactor::find_spans`]; consumed by the
+/// image-redaction gate ([`crate::image_redaction`]) to decide which OCR word
+/// boxes to paint over, so the screenshot path reuses the text rules verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedactionSpan {
+    /// The rule that claimed the range (earlier [`RuleKind::ORDERED`] rules win).
+    pub rule: RuleKind,
+    /// Start byte offset into the input (inclusive).
+    pub start: usize,
+    /// End byte offset into the input (exclusive).
+    pub end: usize,
 }
 
 /// A user-defined redaction term (doc 13 §5 rule 6, from settings).
@@ -274,6 +288,51 @@ impl Redactor {
         (text, out)
     }
 
+    /// Locate, without rewriting, the byte ranges of `input` that
+    /// [`Redactor::redact_text`] would replace (doc 24 decision #3).
+    ///
+    /// Applies the same rules with the same gates — every secret pattern, Luhn
+    /// for cards, the formatted-only phone gate, IBAN, email, user terms — in
+    /// [`RuleKind::ORDERED`] order. Spans never overlap: a later rule's match
+    /// that touches bytes an earlier rule already claimed is dropped (earlier
+    /// rules win, mirroring the placeholder having replaced those bytes before
+    /// the later rule ran). Zero-length matches are skipped (nothing to cover).
+    /// The result is sorted by `start`.
+    ///
+    /// Known, accepted divergence from `redact_text`: that function re-scans the
+    /// *rewritten* text, so a `\b` created next to a placeholder could in
+    /// principle let a later rule match bytes that are not word-bounded in the
+    /// original; for the image gate that only ever means a box is left unpainted
+    /// next to one that is painted, and the human preview remains the last
+    /// redactor (doc 13 §5).
+    pub fn find_spans(&self, input: &str) -> Vec<RedactionSpan> {
+        let mut spans: Vec<RedactionSpan> = Vec::new();
+        for kind in RuleKind::ORDERED {
+            match kind {
+                RuleKind::SecretKey => {
+                    for re in &self.secret {
+                        collect_spans(&mut spans, kind, re, input, |_| true);
+                    }
+                }
+                RuleKind::PaymentCard => {
+                    collect_spans(&mut spans, kind, &self.card, input, luhn_valid)
+                }
+                RuleKind::Iban => collect_spans(&mut spans, kind, &self.iban, input, |_| true),
+                RuleKind::Email => collect_spans(&mut spans, kind, &self.email, input, |_| true),
+                RuleKind::Phone => collect_spans(&mut spans, kind, &self.phone, input, |m| {
+                    m.contains(['+', ' ', '(', ')', '-', '.'])
+                }),
+                RuleKind::UserDefined => {
+                    for re in &self.user_terms {
+                        collect_spans(&mut spans, kind, re, input, |_| true);
+                    }
+                }
+            }
+        }
+        spans.sort_by_key(|s| s.start);
+        spans
+    }
+
     /// Recursively redact every JSON string value in place (the stringly fields of
     /// `EventTrail` / `Connector` items), accumulating per-rule counts.
     fn redact_value(&self, value: &mut serde_json::Value, counts: &mut HashMap<&'static str, u32>) {
@@ -325,6 +384,27 @@ fn apply_rule(
         }
     })
     .into_owned()
+}
+
+/// Span-finding twin of [`apply_rule`]: push every non-empty match of `re` in
+/// `text` that passes `keep` **and** does not overlap a span already claimed by
+/// an earlier rule/pattern (doc 24 decision #3).
+fn collect_spans(
+    spans: &mut Vec<RedactionSpan>,
+    kind: RuleKind,
+    re: &Regex,
+    text: &str,
+    mut keep: impl FnMut(&str) -> bool,
+) {
+    for m in re.find_iter(text) {
+        if m.start() == m.end() || !keep(m.as_str()) {
+            continue;
+        }
+        if spans.iter().any(|s| s.start < m.end() && m.start() < s.end) {
+            continue;
+        }
+        spans.push(RedactionSpan { rule: kind, start: m.start(), end: m.end() });
+    }
 }
 
 /// Fold a string's per-rule hit counts into the running accumulator, keyed by the
@@ -608,6 +688,76 @@ mod tests {
             ),
             "an invalid user regex is rejected at construction"
         );
+    }
+
+    /// Derive, by diffing `input` against `redact_text`'s `output`, which input
+    /// bytes were replaced by a placeholder: the literal pieces between
+    /// placeholders must survive in order, and everything between them was
+    /// redacted. (Inputs are chosen so no literal piece recurs inside a hit.)
+    fn replaced_bytes(input: &str, output: &str) -> Vec<bool> {
+        let ph = Regex::new(r"⟨[a-z]+#\d+⟩").unwrap();
+        let pieces: Vec<&str> = ph.split(output).collect();
+        let mut covered = vec![false; input.len()];
+        assert!(input.starts_with(pieces[0]), "prefix survives: {input:?} -> {output:?}");
+        let mut ip = pieces[0].len();
+        for (k, piece) in pieces.iter().enumerate().skip(1) {
+            let at = if k == pieces.len() - 1 {
+                assert!(input.ends_with(piece), "suffix survives: {input:?} -> {output:?}");
+                input.len() - piece.len()
+            } else {
+                ip + input[ip..].find(piece).expect("literal piece survives in order")
+            };
+            assert!(at >= ip);
+            covered[ip..at].iter_mut().for_each(|b| *b = true);
+            ip = at + piece.len();
+        }
+        covered
+    }
+
+    #[test]
+    fn find_spans_covers_exactly_the_bytes_redact_text_replaces() {
+        let r = Redactor::new(&[UserTerm { pattern: "ProjectNimbus".into(), is_regex: false }]).unwrap();
+        let inputs = [
+            "mail me at a@b.com or c@d.org",
+            "key sk-ABCDEFGHIJKLMNOPQRSTUV live, card 4111 1111 1111 1111, call +1 (555) 123-4567 now",
+            "pay DE89370400440532013000 to bob@corp.com re: ProjectNimbus",
+            "before\n-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA7x9z\n-----END RSA PRIVATE KEY-----\nafter",
+            // Gates: a non-Luhn run and a bare digit run are NOT hits for either path.
+            "order 1234567890123 ref 5551234567 ok",
+            "just a normal sentence about rust",
+            "",
+        ];
+        for input in inputs {
+            let (output, hits) = r.redact_text(input);
+            let spans = r.find_spans(input);
+            // Byte coverage is identical.
+            let mut from_spans = vec![false; input.len()];
+            for s in &spans {
+                assert!(s.start < s.end && s.end <= input.len(), "well-formed span {s:?}");
+                from_spans[s.start..s.end].iter_mut().for_each(|b| *b = true);
+            }
+            assert_eq!(from_spans, replaced_bytes(input, &output), "coverage for {input:?}");
+            // Spans are sorted and disjoint.
+            for w in spans.windows(2) {
+                assert!(w[0].end <= w[1].start, "disjoint + sorted: {spans:?}");
+            }
+            // Per-rule attribution matches redact_text's counts.
+            for kind in RuleKind::ORDERED {
+                let n_spans = spans.iter().filter(|s| s.rule == kind).count() as u32;
+                let n_hits = hits.iter().find(|h| h.rule == kind.label()).map_or(0, |h| h.count);
+                assert_eq!(n_spans, n_hits, "{} count for {input:?}", kind.label());
+            }
+        }
+    }
+
+    #[test]
+    fn find_spans_lets_earlier_rules_win_overlaps() {
+        // The PEM body regex claims the whole key; the header-only fallback
+        // (same rule, later pattern) and any later rule must not re-claim inside it.
+        let text = "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIB 4111 1111 1111 1111\n-----END EC PRIVATE KEY-----";
+        let spans = redactor().find_spans(text);
+        assert_eq!(spans.len(), 1, "one span: {spans:?}");
+        assert_eq!(spans[0], RedactionSpan { rule: RuleKind::SecretKey, start: 0, end: text.len() });
     }
 
     #[test]

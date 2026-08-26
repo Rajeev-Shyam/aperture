@@ -6,6 +6,8 @@ Every finding below was verified against the code at the cited line, and each st
 
 Status legend: **[FIXED]** = closed in this session's tree · **[OPEN]** = for a future session.
 
+> **Update 2026-08-22:** all eight open findings below were closed in the v2-wiring session — see `docs/handoff/session-bridge-2026-08-22-v2-wiring.md` §2 for what each fix is. The per-finding text is left as written (it is the record of what was found); the summary table carries the new status.
+
 Severity is about user consequence, not effort.
 
 ---
@@ -14,14 +16,14 @@ Severity is about user consequence, not effort.
 
 | # | Sev | Dimension | Finding | Status |
 |---|-----|-----------|---------|--------|
-| 1 | HIGH | privacy / cost | A push Send can egress via a transport the preview never named — including the metered API key | OPEN |
-| 2 | MED | correctness | Suggestions queued during a snooze never surface when the snooze lifts | OPEN |
-| 3 | MED | correctness / UX | A restored bubble can be un-actionable, and a failed Resume is silent | OPEN |
-| 4 | MED | performance | Every DB read in a command blocks a tokio worker while holding the one global connection mutex | OPEN |
-| 5 | MED | supply chain | VLM weights are verified by byte size only — no content hash | OPEN |
-| 6 | MED | performance | Idle wakeup cost has grown and has never been measured against doc 04 §8's <2 % target | OPEN |
-| 7 | MED | process / testing | No JS test runner — two of the three bugs found this session were in pure, untested TS | OPEN |
-| 8 | LOW-MED | correctness | Suggestions that were queued but never shown can never be pruned | OPEN |
+| 1 | HIGH | privacy / cost | A push Send can egress via a transport the preview never named — including the metered API key | **FIXED 2026-08-22** — `send_with_preview` binds to `payload.transport_target`; `TransportMismatch` + `preview_retarget` |
+| 2 | MED | correctness | Suggestions queued during a snooze never surface when the snooze lifts | **FIXED 2026-08-22** — `suggestions_refresh` event + core one-shot at the deadline |
+| 3 | MED | correctness / UX | A restored bubble can be un-actionable, and a failed Resume is silent | **FIXED 2026-08-22** — 7-day restore horizon + detached-row filter; `Failed` renders fallback copy, no `clicked` |
+| 4 | MED | performance | Every DB read in a command blocks a tokio worker while holding the one global connection mutex | **FIXED 2026-08-22** — `commands::blocking()` (spawn_blocking) on the 12 heavy commands |
+| 5 | MED | supply chain | VLM weights are verified by byte size only — no content hash | **FIXED 2026-08-22** — `sha256` in settings, verified while streaming (resume prefix included), URLs pinned to revision `5037fcf` |
+| 6 | MED | performance | Idle wakeup cost has grown and has never been measured against doc 04 §8's <2 % target | **FIXED (cost) 2026-08-22** — JS interval only while rects exist; Rust poller 30 Hz when idle. SC3 still unmeasured. |
+| 7 | MED | process / testing | No JS test runner — two of the three bugs found this session were in pure, untested TS | **FIXED 2026-08-22** — vitest 2.1.9, 19 tests (the 16 scratch assertions + glassBudget), `npm --prefix ui run test` |
+| 8 | LOW-MED | correctness | Suggestions that were queued but never shown can never be pruned | **FIXED 2026-08-22** — `COALESCE(resolved_ts, shown_ts, created_ts)` in both clauses |
 | 9 | MED | correctness | The Advanced tab merged into a settings snapshot cached at mount, silently reverting the HUD's anchor | **FIXED** |
 | 10 | LOW | performance | One settings write, one broadcast and one engine reconfigure per slider *pixel* | **FIXED** |
 
@@ -167,7 +169,7 @@ Introduced by batch 4 and fixed in the same session. `set_settings` replaces a w
 
 A range input fires `onChange` for every step of a drag. Each of those was a `set_settings` call = a DB row write + a `settings_changed` broadcast + a `getSettings` round-trip in *every* overlay window + a pattern-engine reconfigure. Dragging "quiet time" across its 5→180 range produced ~35 of them.
 
-**Fix applied.** Slider edits are debounced (300 ms) into one batched write per gesture; the transport radio still writes straight through, since a click is not a drag and the gateway rebuild should not wait behind a debounce the user cannot see. **`VoiceTab`'s confirm-floor slider still has the original behaviour** — same class, one writer, left alone deliberately rather than touched outside this batch's scope.
+**Fix applied.** Slider edits are debounced (300 ms) into one batched write per gesture; the transport radio still writes straight through, since a click is not a drag and the gateway rebuild should not wait behind a debounce the user cannot see. **`VoiceTab`'s confirm-floor slider still has the original behaviour** — same class, one writer, left alone deliberately rather than touched outside this batch's scope. *(Debounced on 2026-08-22.)*
 
 ---
 

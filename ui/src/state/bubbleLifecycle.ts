@@ -80,6 +80,11 @@ export interface BubbleInstance {
   state: BubbleLifecycleState;
   /** Score used to drop the lowest when >3 are visible (doc 11 §3). */
   score: number;
+  /** Fallback copy after a Resume that did not open (doc 10 §6, SDLC review
+   *  2026-08-19 finding 3b): rendered in place of the sublabel, with Resume
+   *  withdrawn. The bubble stays — its dwell keeps running and Dismiss still
+   *  records `dismissed`; only `clicked` is never recorded for it. */
+  fallback?: string;
 }
 
 /** Maps a resolution to its lifecycle state (and, by the container, to the

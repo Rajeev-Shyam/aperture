@@ -149,6 +149,15 @@ pub struct AppState {
     /// listeners will grow; a lagged/absent receiver is never an error here —
     /// the daily re-read still covers it.
     pub settings_reload_tx: tokio::sync::broadcast::Sender<Vec<String>>,
+
+    /// The v2 agent runtime (Doc 22, 2026-08-22): one task at a time, driven
+    /// from the MCP gate (`aperture_agent_step`) and the overlay's agent
+    /// surface. A tokio Mutex; an executing action moves the driver OUT so
+    /// the lock is never held across UIA/SendInput (see `crate::agent`).
+    pub agent: Arc<tokio::sync::Mutex<crate::agent::AgentRuntime>>,
+    /// Wakes an `aperture_agent_step` call that is waiting on a user decision
+    /// (approve / confirm / answer / resume / stop).
+    pub agent_notify: Arc<tokio::sync::Notify>,
 }
 
 impl AppState {
@@ -173,6 +182,7 @@ impl AppState {
         exclusions: ExclusionList,
         vlm_fetch: Arc<crate::vlm_fetch::VlmFetchState>,
         settings_reload_tx: tokio::sync::broadcast::Sender<Vec<String>>,
+        agent: crate::agent::AgentRuntime,
     ) -> Self {
         Self {
             bus,
@@ -192,6 +202,8 @@ impl AppState {
             exclusions,
             vlm_fetch,
             settings_reload_tx,
+            agent: Arc::new(tokio::sync::Mutex::new(agent)),
+            agent_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 

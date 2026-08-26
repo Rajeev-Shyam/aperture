@@ -37,6 +37,7 @@ import {
 import { startGpuBusyWatch } from "./state/gpuBusy";
 import { useHitTestRects } from "./state/useHitTestRects";
 
+import { AgentSurface } from "./components/AgentSurface";
 import { BubbleContainer } from "./components/BubbleContainer";
 import { CaptureIndicator } from "./components/CaptureIndicator";
 import { ContextPreviewPanel } from "./components/ContextPreviewPanel";
@@ -90,6 +91,8 @@ export default function App() {
   const [consent, setConsent] = useState<ConsentState | null>(null);
   const [privacyOpen, setPrivacyOpen] = useState(false);
   const [dashboardOpen, setDashboardOpen] = useState(false);
+  // v2 (Doc 22 §9.1): the "New agent task" composer, opened from the HUD.
+  const [agentComposing, setAgentComposing] = useState(false);
 
   // Publish interactive-surface rects so the click-through overlay accepts
   // input over bubbles/indicator/voice chips (doc 11 §2). Modal surfaces keep
@@ -296,6 +299,10 @@ export default function App() {
           ))}
         </div>
       )}
+      {/* v2 agent surface (Doc 22 §9, decision #53): status bar + live log
+          while a task exists, and the pause cards. Primary-only — one task
+          at a time, one place to stop it. */}
+      <AgentSurface composing={agentComposing} onCloseComposer={() => setAgentComposing(false)} />
       {/* The HUD cluster: capture indicator + dashboard + privacy, draggable
           to any corner or edge (persisted in ui.hud_anchor). */}
       <Hud>
@@ -319,6 +326,15 @@ export default function App() {
             }}
           >
             ◎
+          </button>
+          <button
+            className="privacy-open"
+            aria-label={agentComposing ? "Close the agent task composer" : "New agent task"}
+            aria-pressed={agentComposing}
+            title="New agent task — Claude drives this PC, step by step, with you in control"
+            onClick={() => setAgentComposing((v) => !v)}
+          >
+            ✦
           </button>
           <button
             className="privacy-open"
