@@ -150,7 +150,7 @@ mod tests {
     struct FakeOcr(&'static str);
     impl OcrEngine for FakeOcr {
         fn process_frame(&self, _f: &[u8], _w: u32, _h: u32) -> Result<OcrOutput, VisionError> {
-            Ok(OcrOutput { text: self.0.to_string(), mean_confidence: 0.9 })
+            Ok(OcrOutput { text: self.0.to_string(), mean_confidence: 0.9, ..Default::default() })
         }
         fn engine_id(&self) -> &'static str {
             "fake"

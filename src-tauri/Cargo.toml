@@ -30,10 +30,18 @@ aperture-orchestration = { workspace = true }
 aperture-reasoning-gateway = { workspace = true }
 aperture-privacy = { workspace = true }
 aperture-voice = { workspace = true }
+# --- v2 agent execution layer (Doc 22, wired 2026-08-22): the executor is NOT
+# an emitter (UI-only action surface, decision #52); the loop rides the MCP gate.
+aperture-action-executor = { workspace = true }
+aperture-agent-loop = { workspace = true }
+aperture-screen-serializer = { workspace = true }
+aperture-task-manager = { workspace = true }
 
 # --- shared third-party (versions resolved at the workspace root) ---
 serde = { workspace = true }
 serde_json = { workspace = true }
+# MCP image content blocks for the agent's redacted screenshots (already in the lockfile).
+base64 = "0.22"
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

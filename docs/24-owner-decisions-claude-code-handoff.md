@@ -21,6 +21,7 @@ Rajeev's own priority call (decision #4 below): **harden v1 before touching v2's
 
 **#1 — SC5 zero-egress proof test.** `gates/tests/sc5_network_monitor.rs` is 100% `todo!()`-stubbed and `#[ignore]`'d — nothing automatically proves "zero bytes leave until an approved Send," Aperture's core privacy claim, at the integration level.
 **Decision:** No scheduling call made — Rajeev wants this documented, not decided on live. Treat as an open, unprioritized backlog item; use the sequencing note above (step 3) as the default unless told otherwise.
+**Status [2026-08-22]: DONE.** Real harness, not `#[ignore]`, runs on every `cargo test --workspace`: a loopback origin stands in for the API (byte counter + body capture), `netstat` proves zero non-loopback connections from the test process and a CIM query proves zero child spawns through the whole proactive path; the approved Send's body SHA-256 == preview hash == the `cloud_send` audit row; an unapproved payload never opens the socket. The golden redaction fixture (`fakes::golden::redaction_fixture`, `todo!()` since M0) is real too.
 **Where to look:** `gates/tests/sc5_network_monitor.rs` (all helpers `todo!()`); `reasoning-gateway/src/lib.rs` (TODO on the CI lint that should statically block sockets/spawns outside this crate).
 
 **#2 — Re-verify Aug-14 fixes on the installed app.**
@@ -30,9 +31,11 @@ Rajeev's own priority call (decision #4 below): **harden v1 before touching v2's
 **#3 — Screenshot redaction.** Text payloads get a 6-rule redaction pass; screenshots (opt-in enrichment) get none at all — `crates/privacy/src/redaction.rs:167-197`, `redact_payload` explicitly skips `PayloadItem::Screenshot`.
 **Decision: Build image redaction before it ships wider.**
 **What to build:** automated scrubbing for screenshot payloads before they're previewable/sendable — options include blurring likely-sensitive regions, or an OCR-then-redact-then-recompose pass reusing the existing text-redaction rules. Land this before promoting screenshot enrichment out of its current disabled/"(v2)" state in `ContextPreviewPanel.tsx`.
+**Status [2026-08-22]: BUILT (OCR-then-redact-then-recompose, solid block not blur).** `vision-ocr` now keeps word bounding boxes (`OcrOutput.lines`); `privacy::image_redaction::redact_bgra` paints an opaque block over every word the text rules cover, in the same coordinate space the OCR ran in; `screen-serializer::observe_frame` is the only producer of a payload screenshot and runs the gate before the JPEG exists. **Consumer today: the v2 agent loop only.** The v1 "Add screenshot (v2)" enrichment button in `ContextPreviewPanel.tsx` is still disabled — wiring it needs the push transports to carry an image (the API body has no image block yet; the CLI cannot take one) and is a separate, small item.
 
 **#4 — v1 vs. v2 focus.**
 **Decision: Harden v1 first.** See Sequencing above. Category K's decisions are still valuable as a locked-in spec for *when* v2 work starts — just don't start it yet.
+**Status [2026-08-22]:** sequencing honoured — batches 1–4, the 2026-08-19 review's 8 open findings, #3 and #1 all landed before the executor was wired. v2 is now built per §K (see each item's status below and Doc 22's implementation-status section).
 
 ---
 
@@ -274,43 +277,52 @@ Rajeev's own priority call (decision #4 below): **harden v1 before touching v2's
 **Decision: Confirm only risky-looking actions** — routine actions (click/type/scroll/wait on non-flagged targets) run without asking; anything that looks destructive/consequential (delete/send/pay/purchase/overwrite-type actions) always stops for confirmation regardless of Claude's self-reported confidence.
 **Where:** `crates/contracts/src/agent.rs` (`ActionType`, `AgentConfidence`); `crates/agent-loop` (loop driver, not yet built).
 **Build:** (a) implement the currently-missing confidence-gated pause — `TaskStateMachine::apply_instruction` today ignores `instruction.confidence` entirely (Finding F4 from the audit); (b) add a keyword/heuristic check on the action's target/label for consequential-looking actions, independent of Claude's confidence, per decision #51 below.
+**Status [2026-08-22]: DONE.** `agent-loop::driver::classify` pauses with `PauseReason::Confirm` when `risk::consequential_reason` fires on the label OR Claude reports `confidence: low` (the latter is the `agent.confirm_low_confidence` setting, default on); the surface offers Approve / Skip this step / Stop; a skip is audited as a `skipped` step.
 
 **#48 — v2 transparency model (approve once per task, not a forced preview per step; full payload viewable on demand).**
 **Decision: Acceptable — friction reduction is fine.**
 **Where:** `crates/agent-loop/src/lib.rs` §4.1 design note (reuses v1's `previews.approved` store, once per task).
 **Build:** proceed with the once-per-task approval design as documented — no forced per-step preview needed. Still worth surfacing a persistent "Aperture is active" indicator per decision #53.
+**Status [2026-08-22]: DONE.** One approval card per task (`PauseReason::Approval`) stating what leaves per step; a task typed into Aperture is approved by construction (locked decision 4). Every step is still audited and the step log is live on the status bar (#53).
 
 **#49 — Exclusion-list hit mid-task.**
 **Decision: Pause and notify.**
 **Where:** `crates/action-executor/src/lib.rs` — currently `ActionExecutor::execute()` has no `ExclusionList` parameter at all (Finding F3 from the audit — documented as a guardrail, not wired into the trait).
 **Build:** add the exclusion-list check into the executor (or the loop driver immediately before dispatching to the executor), and implement pause-and-notify as the behavior when the active window matches an exclusion rule.
+**Status [2026-08-22]: DONE.** The executor asks an `ExclusionProbe` (src-tauri implements it over the live `ExclusionList`) about the foreground window before EVERY action → `ActionError::Excluded`; `CaptureSubsystem::observe_now` refuses to even look (`CaptureError::Excluded`). Both pause the task and the surface shows the rule label with Resume / Stop.
 
 **#50 — UAC-elevated windows.**
 **Decision: Offer a run-as-admin prompt** (not a hard block) — accepting the added privilege/risk this implies.
 **Where:** `crates/contracts/src/agent.rs` (`ActionError::Elevated` exists as a variant but is never produced); `crates/action-executor` (`UiaExecutor` stub never reaches elevation detection).
 **Build:** implement UAC/elevation detection in the executor, and a flow that explicitly surfaces a "this needs admin — allow?" prompt to the user rather than silently failing or silently elevating.
+**Status [2026-08-22]: PARTIAL.** Detection built (token elevation of the foreground process; access-denied counts as elevated) → `ActionError::Elevated` → pause with a card that explains UIPI blocks input from an unelevated Aperture and offers Resume after the user handles that step. **Not built:** a "restart Aperture as administrator" affordance — that is the privilege change this decision accepted; left for the owner to confirm the exact shape (relaunch elevated vs. a one-off elevated helper).
 
 **#51 — Click risk tolerance for consequential actions.**
 **Decision: Yes, add a stricter check for risky-looking actions**, on top of Claude's own confidence signal.
 **Where:** `crates/action-executor` (fuzzy UIA label matching, Levenshtein ≤2, with a pixel-coordinate fallback — the primary grounding mechanism today).
 **Build:** an allow-list/keyword-style secondary check (e.g. flag targets whose label matches delete/send/pay/purchase/confirm-style patterns) that forces the confirmation path from decision #47, independent of what Claude reports.
+**Status [2026-08-22]: DONE** — `action-executor::risk::consequential_reason` (delete/remove/send/submit/pay/purchase/buy/checkout/order/confirm/transfer/sign/agree/accept/install/uninstall/format/erase/discard/publish/post/unsubscribe/reply/shut down/restart/log out/sign out/empty/permanently on the normalised label), independent of Claude's confidence; feeds #47.
 
 **#52 — Agent action scope (UI-only vs. filesystem/shell/network access).**
 **Decision: Screen and keyboard only, forever** — a hard line, not a v2.0 starting point to expand later.
 **Where:** `crates/action-executor/src/lib.rs` (already documents "no filesystem writes, no registry, no network, no shell" as the intended invariant — this decision confirms it as permanent, not provisional).
 **Build implication:** resolves Finding F12 from the audit (the `ActionType::Launch` ambiguity) — `Launch` must be implemented as a simulated UI interaction (e.g. clicking a Start-menu tile via UIA), never as a direct process-spawn call, to stay consistent with this hard line. Code the "no shell" invariant as an actual impossibility (e.g. no process-spawn API reachable from `action-executor` at all), not just a documented policy someone could accidentally violate later.
+**Status [2026-08-22]: DONE.** `launch` = Win key → type the name → Enter over `SendInput`; `action-executor` has no spawn/shell/fs/registry API and `lint-emitters` scans it as a non-emitter. `close_windows` (the #54 undo) uses the same simulated means (switch + Alt+F4).
 
 **#53 — In-progress agent UI.**
 **Decision: Persistent status bar + live step-by-step log** (not just a minimal pill).
 **Build:** a new UI surface — likely following the pattern of `ui/src/components/VoiceSurfaces.tsx` — that's always visible while a task runs, showing a scrollable transcript of steps, fed by `crates/task-manager/src/lib.rs`'s `record_step` data. Should make it unambiguous to the user that Aperture is actively driving the mouse/keyboard right now.
+**Status [2026-08-22]: DONE.** `ui/src/components/AgentSurface.tsx` — a bottom-centre opaque status bar (state pill, task, step N/cap, **Stop** always visible while live) with a scrollable live step log (result + reversibility mark per row) fed by the `agent_task` event, plus the pause cards (approval / confirm / clarification / excluded / elevated). Dashboard → **Agent** tab renders the durable `task_steps` audit rows.
 
 **#54 — Agent undo/rollback after hard stop.**
 **Decision: Worth building some undo**, at least for reversible actions.
 **Where:** `crates/action-executor`, `crates/agent-loop` — no rollback mechanism exists today; hard stop currently only prevents further steps.
 **Build:** classify action types by reversibility (e.g. "closed an app it opened" is reversible; "sent a message" is not) and implement rollback for the reversible subset. Don't promise undo for actions that fundamentally can't be undone — be explicit in the UI about which is which.
+**Status [2026-08-22]: DONE for the reversible subset, honest about the rest.** `risk::reversibility` classifies every action (shown per log row); the driver remembers windows that appeared during `launch`; the terminal card offers "Close N windows it opened" (`agent_undo_close_windows` → `close_windows`, same simulated-UI means) and says plainly that typed text and clicks cannot be undone by Aperture.
 
 **Also fold in from the audit, since v2 work is now confirmed as a real future target:**
 - **Finding F2** — `ExecutorTicket::for_task` has no actual capability-token enforcement; any crate that links `action-executor` can mint a valid ticket today. Harmless while `UiaExecutor` is a stub, but must be fixed (real capability/marker type that only `agent-loop` can construct) before the real backend lands.
+  **Status [2026-08-22]: DONE as a lint, not a type.** Rust has no cross-crate `pub(crate)`, so `xtask lint-emitters` (same pass, same CI failure) refuses the literal `ExecutorTicket::for_task(` anywhere under `crates/*/src` or `src-tauri/src` except `crates/agent-loop/src` and `action-executor`'s own tests; `gates` is lint-exempt and mints one deliberately for the on-target V2-M0 gate.
 
 ---
 

@@ -25,6 +25,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   listTrailEvents,
+  previewRetarget,
   previewSend,
   previewSetApproved,
   transportHealth,
@@ -165,6 +166,18 @@ export function ContextPreviewPanel({ payload, onChange, onClose }: Props) {
 
   // ---- Send / Approve (over the EXACT object the panel holds) --------------
   const [sendError, setSendError] = useState<string | null>(null);
+  // The push path is bound to the transport the footer named (SDLC review
+  // 2026-08-19 finding 1): when it is not ready the core sends nothing and
+  // reports what it WOULD have used. The user re-targets explicitly — the
+  // approval is dropped core-side, so the next Send is a fresh, informed one
+  // against a footer that now names the real transport.
+  const [mismatch, setMismatch] = useState<{
+    named: TransportTarget;
+    available: TransportTarget | null;
+  } | null>(null);
+
+  // A const so the narrowing survives into the button's click closure.
+  const alternative: TransportTarget | null = mismatch?.available ?? null;
 
   // MCP is PULL (doc 09 §3): approving releases the payload to Claude Desktop
   // when IT calls `aperture_get_context` — there is no push transmission.
@@ -174,6 +187,7 @@ export function ContextPreviewPanel({ payload, onChange, onClose }: Props) {
     if (sending) return;
     setSending(true);
     setSendError(null);
+    setMismatch(null);
     try {
       // Contract law: ONLY this panel sets approval (doc 15 §2b). The core
       // syncs the edits, re-runs redaction, and binds approval to the bytes.
@@ -199,13 +213,38 @@ export function ContextPreviewPanel({ payload, onChange, onClose }: Props) {
       }
       // Transmit the approved object (hash-bound core-side, doc 03 §4).
       const result = await previewSend(approval.payload.payload_id);
-      onClose(result);
+      if (result.kind === "transport_mismatch") {
+        // Nothing left the machine. Name the gap and offer the real route
+        // (finding 1) — never silently fall through to another transport.
+        setMismatch({ named: result.named, available: result.available });
+        return;
+      }
+      onClose(result.suggestions);
     } catch (e) {
       // A failed transport leaves the approval retryable core-side; say so
       // instead of dead-ending silently.
       setSendError(String(e));
     } finally {
       setSending(false);
+    }
+  }
+
+  /** Re-stamp the payload onto the transport the core said IS available. The
+   *  core drops the approval, so this never sends: the user reviews the
+   *  footer's new transport label and presses Send again (finding 1). */
+  const [retargeting, setRetargeting] = useState(false);
+  async function retarget(target: TransportTarget) {
+    if (retargeting || sending) return;
+    setRetargeting(true); // its own flag: the Send button must not read "Sending…"
+    try {
+      const updated = await previewRetarget(payload.payload_id, target);
+      onChange(updated);
+      setMismatch(null);
+      setSendError(`Now set to ${TRANSPORT_LABELS[target]}. Review and press Send again.`);
+    } catch (e) {
+      setSendError(String(e));
+    } finally {
+      setRetargeting(false);
     }
   }
 
@@ -368,6 +407,24 @@ export function ContextPreviewPanel({ payload, onChange, onClose }: Props) {
         <p className="preview__send-error" role="alert">
           {sendError}
         </p>
+      )}
+      {/* Finding 1: the named transport was not ready, so nothing was sent.
+          The alternative is offered, never taken on the user's behalf. */}
+      {mismatch && (
+        <div className="preview__send-error" role="alert">
+          <span>{TRANSPORT_LABELS[mismatch.named]} isn't available right now. </span>
+          {alternative !== null ? (
+            <button
+              className="btn"
+              onClick={() => void retarget(alternative)}
+              disabled={retargeting || sending}
+            >
+              Send via {TRANSPORT_LABELS[alternative]} instead
+            </button>
+          ) : (
+            <span>No push transport is available — check the Advanced tab.</span>
+          )}
+        </div>
       )}
     </div>
   );

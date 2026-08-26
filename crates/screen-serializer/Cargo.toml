@@ -3,11 +3,16 @@ name = "aperture-screen-serializer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "v2 screen-state serializer (Doc 22 §3.2, SKELETON): composes capture/OCR/redaction into the per-step StepPayload Claude receives. Redaction runs on EVERY payload before it is built (v1 pipeline reused); screenshot downscales to 768 px (ADR-032 path). Payload-size limits are Q-V2-02, measured at V2-M1."
+description = "v2 screen-state serializer (Doc 22 §3.2, V2-M1): composes capture/OCR/redaction into the per-step StepPayload Claude receives. Redaction runs on EVERY payload before it is built (v1 text rules + the image-redaction gate, owner decision #3); the screenshot is OCR-redacted at 1600 px then downscaled to 768 px. Q-V2-02 is measured in tests against the MCP 1 MiB cap."
 
 [dependencies]
 aperture-contracts = { workspace = true }
 aperture-privacy = { workspace = true }
+# V2-M1: OCR-with-boxes + downscale come from Layer A (doc 06 §2); the JPEG
+# encode and base64 are the only image/wire deps (both already in the lockfile).
+aperture-vision-ocr = { workspace = true }
+image = "0.25"
+base64 = "0.22"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

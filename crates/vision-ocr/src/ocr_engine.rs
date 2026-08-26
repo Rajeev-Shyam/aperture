@@ -8,6 +8,39 @@
 
 use crate::VisionError;
 
+/// One recognized word with its bounding box (doc 24 decision #3).
+///
+/// Coordinates are **pixels in the frame passed to
+/// [`OcrEngine::process_frame`]** — i.e. the already-downscaled frame, not the
+/// original capture. The image-redaction gate (`aperture_privacy::image_redaction`)
+/// paints over these boxes, so they must be in the same space as the buffer
+/// that is recomposed.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct OcrWord {
+    /// The word's text as the engine emitted it.
+    pub text: String,
+    /// Left edge, px.
+    pub x: u32,
+    /// Top edge, px.
+    pub y: u32,
+    /// Width, px.
+    pub w: u32,
+    /// Height, px.
+    pub h: u32,
+}
+
+/// One recognized line: the engine's line text plus its words with geometry
+/// (doc 24 decision #3). `text` is the same string that is joined into
+/// [`OcrOutput::text`]; `words` may be empty for engines/paths without
+/// geometry (e.g. [`crate::windows_media_ocr::aggregate_lines`]).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct OcrLine {
+    /// The line text (what the quality filter scored and what `text` joins).
+    pub text: String,
+    /// The line's words with bounding boxes, in reading order.
+    pub words: Vec<OcrWord>,
+}
+
 /// The result of running one frame through an [`OcrEngine`] (doc 06 §2).
 ///
 /// `text` is the concatenated, post-filtered line text (low-quality lines are
@@ -15,12 +48,22 @@ use crate::VisionError;
 /// in-box engine's missing confidence API). `mean_confidence` is the mean
 /// per-line quality over the surviving lines and is what the gate in doc 06 §4
 /// reads to decide whether to wake the VLM.
+///
+/// `lines` is additive (doc 15 §6; doc 24 decision #3): the same surviving
+/// lines, in order, with per-word geometry for the image-redaction gate.
+/// `text` and `mean_confidence` are unaffected by it — `text` feeds embeddings
+/// and pattern signatures and must stay byte-identical for the same input.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OcrOutput {
     /// Concatenated line text, post-quality-filter (doc 06 §2).
     pub text: String,
     /// Mean per-line quality/confidence in `[0.0, 1.0]` over surviving lines.
     pub mean_confidence: f32,
+    /// The surviving lines (post-quality-filter, same order as `text`) with
+    /// word boxes (doc 24 decision #3). Empty when the engine carries no
+    /// geometry; `#[serde(default)]` so older serialized rows still load.
+    #[serde(default)]
+    pub lines: Vec<OcrLine>,
 }
 
 impl OcrOutput {

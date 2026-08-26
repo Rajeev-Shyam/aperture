@@ -11,12 +11,15 @@ behavioral model and can query it (answers render as text). Claude is the
 optional heavy-reasoning tier, invoked **only when you explicitly ask** — and you
 always see and approve the exact bytes that leave the machine.
 
-> This repository is the **architecture-faithful skeleton**. The full design lives
-> in [`docs/`](docs/) (22 dependency-ordered documents: 00–18 v1, **19–21 the R2
-> refinement pass**, 22 the v2 draft; process/handoff notes in
-> [`docs/handoff/`](docs/handoff/)). Start with
-> [`docs/00-README.md`](docs/00-README.md). Docs 00–18 already read as R2 (the
-> Doc 20 amendments are applied inline); Doc 21 supersedes Doc 18.
+> The full design lives in [`docs/`](docs/) (25 dependency-ordered documents:
+> 00–18 v1, **19–21 the R2 refinement pass**, 22 the v2 agent layer, 23–24 the
+> owner interrogation + decisions log; process/handoff notes in
+> [`docs/handoff/`](docs/handoff/) — read the newest `session-bridge-*.md`
+> first). Start with [`docs/00-README.md`](docs/00-README.md). Docs 00–18 read
+> as R2 (the Doc 20 amendments are applied inline); Doc 21 supersedes Doc 18.
+> **State (2026-08-22):** v1 (M0–M9) runs as an installed app; v2 (Doc 22) is
+> built and wired — Claude Desktop can drive the desktop through the MCP tools,
+> with the user approving once per task and able to stop at any moment.
 
 ---
 
@@ -131,8 +134,10 @@ Each milestone has a **measured validation gate** on the real target.
 | M8 | Design-system hardening (glass tokens, degrade-under-load, multi-monitor) | ≤ 2 glass surfaces + opaque 3rd; no overlay frame drops during a VLM job |
 | M9 | Privacy hardening (encryption, retention/purge, consent, audit) | DB unreadable without the key; Purge All verified |
 
-> **This skeleton targets M0.** Subsystem crates beyond M0 are stubbed with faithful
-> signatures and `todo!("M<n>: …")` bodies tied to the milestone above.
+> M0–M9 are built (doc 16 carries the dated status sections). The v2 layer adds
+> `action-executor`, `screen-serializer`, `agent-loop`, `task-manager` and the
+> `aperture_agent_*` MCP tools (doc 22). Remaining hardware-only gates: SC3,
+> SC4, PresentMon, `m5_load_times`.
 
 ---
 
@@ -162,11 +167,13 @@ cargo xtask gate m0
 cargo xtask seed-db
 ```
 
-> **Note:** this skeleton was scaffolded in an environment without a Rust toolchain,
-> so the Rust workspace has **not been compile-verified** here. Expect to resolve
-> dependency versions (all marked `# [VERIFY]`) and stub signatures on first
-> `cargo check`. The `contracts`, `db` schema, `config`, and `docs` are the most
-> settled; the per-subsystem crates are signature-level stubs.
+> **Verification:** `cargo test --workspace` (479 tests, 0 warnings as of
+> 2026-08-22), `npm --prefix ui run test` (vitest), `cargo run -p xtask --
+> lint-emitters` before every commit. On-target gates are `#[ignore]`d and run
+> explicitly (`cargo test -p aperture-gates --test v2m0_uia_executor -- --ignored`
+> opens and closes a real Notepad). Toolchain pinned in `rust-toolchain.toml`;
+> the default features need Strawberry Perl + NASM for SQLCipher (or build with
+> `--no-default-features` for the plaintext dev path).
 
 ## Privacy posture (doc 13)
 

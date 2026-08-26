@@ -67,6 +67,12 @@ pub const SUGGESTION_RATED: &str = "suggestion_rated";
 /// (decisions #7, #17, #39). Carries the top-level section names in the patch,
 /// so a listener can ignore writes it does not care about.
 pub const SETTINGS_CHANGED: &str = "settings_changed";
+/// The live suggestion set may have changed without a `bubble_spec` emit —
+/// a snooze lifted (SDLC review 2026-08-19, finding 2). Rows mined while
+/// snoozed queue in SQLite (ADR-040/Q95: only EMISSION is silenced); this tells
+/// the overlay to re-run `list_suggestions`, which is what actually surfaces
+/// them. Without it a queued row waited for the next WebView remount.
+pub const SUGGESTIONS_REFRESH: &str = "suggestions_refresh";
 
 /// The capture-indicator state the overlay/tray render (doc 12 §6).
 /// `Releasing` covers the <3 s toggle-OFF window (doc 12 §6 step 5). Internal
@@ -268,6 +274,21 @@ pub fn emit_settings_changed(app: &AppHandle, sections: Vec<String>) -> tauri::R
     app.emit(SETTINGS_CHANGED, SettingsChangedPayload { sections })
 }
 
+/// The `suggestions_refresh` wire payload (matches the UI's
+/// `SuggestionsRefreshEvent`). `reason` is `"snooze_off"` (the user turned
+/// snooze off) or `"snooze_expired"` (a timed snooze ran out).
+#[derive(Debug, Clone, Serialize)]
+pub struct SuggestionsRefreshPayload {
+    pub reason: String,
+}
+
+/// Ask every overlay window to re-fetch `list_suggestions` (review finding 2).
+/// Broadcast: each monitor's container re-runs the same read, and the
+/// admission/cap logic converges them exactly as on mount.
+pub fn emit_suggestions_refresh(app: &AppHandle, reason: &str) -> tauri::Result<()> {
+    app.emit(SUGGESTIONS_REFRESH, SuggestionsRefreshPayload { reason: reason.to_string() })
+}
+
 /// Emit a suggestion-lifecycle transition (doc 11 §3). The matching
 /// `suggestion_*` event is written to SQLite by the lifecycle owner, not here.
 pub fn emit_suggestion_lifecycle(
@@ -280,3 +301,12 @@ pub fn emit_suggestion_lifecycle(
 // TODO(M3:) spawn the bus->WebView forwarder task in main.rs setup: subscribe to
 // the orchestration `gpu_busy` broadcast (doc 12) and to suggestion-generator
 // `BubbleSpec` output, fanning each onto the channels above.
+
+/// v2 agent task view (Doc 22 §9, decision #53) — broadcast on every change;
+/// `null` payload means no task exists (the surface unmounts).
+pub const AGENT_TASK: &str = "agent_task";
+
+/// Emit the current agent task view to every window.
+pub fn emit_agent_task(app: &AppHandle, view: Option<&crate::agent::TaskView>) -> tauri::Result<()> {
+    app.emit(AGENT_TASK, view)
+}

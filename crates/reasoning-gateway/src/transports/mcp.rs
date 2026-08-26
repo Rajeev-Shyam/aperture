@@ -39,6 +39,14 @@ pub const TOOL_SUBMIT_SUGGESTIONS: &str = "aperture_submit_suggestions";
 /// Tool name: the **gated** history search (ADR-037): results are staged as a
 /// preview the user approves on screen before anything returns.
 pub const TOOL_SEARCH_HISTORY: &str = "aperture_search_history";
+/// Tool name (v2, Doc 22): open an agent task. The user approves the TASK once
+/// in Aperture (decision #48); nothing observes or acts before that.
+pub const TOOL_AGENT_START: &str = "aperture_agent_start";
+/// Tool name (v2, Doc 22 §2): one observe→act turn of the agent loop — carries
+/// Claude's instruction for the previous screen in, returns the next screen
+/// (redacted OCR + redacted 768 px screenshot) out. The 5th tool on the
+/// existing pipe, per the v2 kickoff; the gate lives app-side.
+pub const TOOL_AGENT_STEP: &str = "aperture_agent_step";
 
 /// The local named pipe bridging the `aperture-mcp` stdio binary (spawned by
 /// Claude Desktop) to the RUNNING app, where the approval gate lives.
@@ -105,6 +113,43 @@ pub fn tool_descriptors() -> serde_json::Value {
                     "suggestions": { "type": "array" },
                     "answer_text": { "type": "string" }
                 }
+            }
+        },
+        {
+            "name": TOOL_AGENT_START,
+            "description": "Start an Aperture agent task on the user's Windows desktop (Aperture v2). \
+                            Pass the task the USER asked for, in their words. Aperture shows the user \
+                            an approval card; until they allow it nothing is observed or executed. \
+                            If the user already typed a task into Aperture, omit `task` to adopt it. \
+                            Returns the task_id to pass to aperture_agent_step.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task": { "type": "string", "description": "The user's task, verbatim. Omit to adopt a task the user typed into Aperture." }
+                }
+            }
+        },
+        {
+            "name": TOOL_AGENT_STEP,
+            "description": "One turn of the Aperture agent loop. Call with no `instruction` first to \
+                            observe the screen; then each call carries your instruction for the \
+                            screen you last saw and returns the next screen. `instruction` is a JSON \
+                            object: {status: continue|task_complete|need_clarification|cannot_proceed, \
+                            reasoning: string, action?: {type: click|type|key|launch|switch_window|scroll|wait|none, \
+                            target?: string (UI element label or window title), value?: string (text to type \
+                            or a key chord like Ctrl+S), direction?: up|down|left|right, amount?: integer}, \
+                            step_summary: string (one sentence covering ALL steps so far), confidence: high|medium|low}. \
+                            Aperture executes ONLY on the user's approved task, pauses for the user on \
+                            consequential-looking actions, low confidence, excluded or elevated windows, \
+                            and the user can stop at any moment. The returned screen is redacted \
+                            (secrets, cards, emails, phones) before it leaves the machine.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" },
+                    "instruction": { "type": "object" }
+                },
+                "required": ["task_id"]
             }
         }
     ])

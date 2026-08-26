@@ -38,7 +38,7 @@ pub mod vlm_layer;
 pub mod windows_media_ocr;
 
 pub use frame_processor::{FrameProcessor, ProcessedFrame};
-pub use ocr_engine::{OcrEngine, OcrOutput};
+pub use ocr_engine::{OcrEngine, OcrLine, OcrOutput, OcrWord};
 pub use screen_context_writer::ScreenContextRow;
 pub use vlm_gating::{should_wake_vlm, WakeReason};
 pub use vlm_layer::{SceneJson, VlmLayer};

@@ -53,6 +53,21 @@ pub struct FrameContext {
     pub event_id: i64,
 }
 
+/// One on-demand observation (v2 agent loop, Doc 22 §2) — the foreground
+/// frame plus the identity it was attributed to. Returned, not sunk: the
+/// caller owns the ephemeral frame and must drop it after serializing.
+/// (Deliberately not `Debug`/`Clone`: the frame must not be printed or
+/// duplicated, same posture as [`EphemeralFrame`] itself.)
+pub struct Observation {
+    pub frame: EphemeralFrame,
+    pub identity: WindowIdentity,
+    /// Browser URL when the hook-tracked foreground is the window in front
+    /// right now; `None` otherwise.
+    pub url: Option<String>,
+    /// epoch ms of the observation.
+    pub ts: i64,
+}
+
 /// Where sampled frames go (M2 wires `aperture-vision-ocr::FrameProcessor` here;
 /// tests wire a collector). The frame is MOVED in and dropped by the consumer —
 /// never stored (doc 05 §2).
@@ -303,6 +318,51 @@ impl Sampler {
         );
     }
 
+    /// On-demand observation for the v2 agent loop (Doc 22 §2). Same gate
+    /// order as [`Sampler::sample_once`] — suspended ⇒ nothing (capture OFF
+    /// means no frames, invariant 3), exclusion BEFORE the frame pull (doc 05
+    /// §4) — but no debounce, no pHash gate, and the frame is returned.
+    ///
+    /// `fg` is the hook-tracked foreground context; its URL is used only when
+    /// that identity is the window actually in front now (TOCTOU rule), so a
+    /// stale URL can never un-gate an excluded page or mislabel a frame.
+    pub fn observe_now(&self, fg: ForegroundContext) -> Result<Observation, CaptureError> {
+        if self.suspended.load(Ordering::SeqCst) {
+            return Err(CaptureError::CaptureUnavailable(
+                "capture is off — turn capture on to let the agent observe the screen".into(),
+            ));
+        }
+        let Some(identity) = capture_time_identity() else {
+            return Err(CaptureError::CaptureUnavailable(
+                "no foreground window to observe".into(),
+            ));
+        };
+        let url = if fg.identity == identity { fg.url } else { None };
+
+        // Exclusion gate — earliest, before any pixel exists (doc 13 §4).
+        if let crate::exclusion::ExclusionVerdict::Excluded { label, .. } = self.exclusion.is_excluded(
+            identity.process.as_deref(),
+            identity.window_class.as_deref(),
+            identity.window_title.as_deref(),
+            url.as_deref(),
+        ) {
+            return Err(CaptureError::Excluded(label));
+        }
+
+        let frame = {
+            let wgc = self.wgc.lock().expect("wgc lock");
+            let Some(monitor) = wgc.primary_monitor() else {
+                return Err(CaptureError::CaptureUnavailable("WGC not acquired".into()));
+            };
+            wgc.pull_foreground(monitor)?
+        };
+        let frame = match foreground_rect() {
+            Some(rect) => frame.crop_to(rect),
+            None => frame,
+        };
+        Ok(Observation { frame, identity, url, ts: epoch_ms() })
+    }
+
     /// Drive the adaptive heartbeat while active; suspend while idle (doc 05 §4,
     /// ADR-032). Runs as a background task; exits when `stop` resolves (the
     /// toggle's STOPPING transition aborts it).
@@ -359,6 +419,11 @@ fn foreground_rect() -> Option<WindowRect> {
 }
 
 #[cfg(not(windows))]
+fn capture_time_identity() -> Option<WindowIdentity> {
+    None
+}
+
+#[cfg(not(windows))]
 fn foreground_rect() -> Option<WindowRect> {
     None
 }
@@ -407,5 +472,25 @@ mod tests {
         sampler.note_activity(1_000_000);
         assert!(sampler.user_is_active(1_030_000), "30 s after input: active");
         assert!(!sampler.user_is_active(1_070_000), "70 s idle: heartbeat suspends");
+    }
+
+    /// Invariant 3 at the v2 seam: capture OFF (sampler suspended) means the
+    /// agent loop cannot observe anything — no frame, no identity, a typed
+    /// refusal. The sampler starts suspended, so no WGC is needed here.
+    #[test]
+    fn observe_now_refuses_while_capture_is_off() {
+        let sampler = Sampler::new(
+            CaptureConfig::default(),
+            WgcSampler::new(),
+            ExclusionList::shipped_defaults(),
+            Arc::new(DropSink),
+        );
+        match sampler.observe_now(ForegroundContext::default()) {
+            Err(CaptureError::CaptureUnavailable(msg)) => {
+                assert!(msg.contains("capture is off"), "{msg}")
+            }
+            Err(other) => panic!("expected CaptureUnavailable, got {other:?}"),
+            Ok(_) => panic!("expected a refusal while suspended"),
+        }
     }
 }

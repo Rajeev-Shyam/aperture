@@ -1,20 +1,23 @@
-# Doc 22 — Aperture v2: Agent Execution Layer Spec (Draft)
+# Doc 22 — Aperture v2: Agent Execution Layer Spec
 
 > **Place in the set.** This is the **v2** layer — an *additive* agent-execution
-> capability on top of the v1 design (Docs 00–21). It is **not part of locked v1
-> scope** and **not in the buildable skeleton**. It is promoted into the doc set
-> here as the working v2 specification, but it must be **grilled** (Open Questions
-> Q-V2-01…Q-V2-10, §12) before any v2 build starts. Do **not** implement v2 crates
-> (`action-executor`, `agent-loop`, `task-manager`, `screen-serializer`) from this
-> draft yet. v1 (M1→M9) ships first. See `docs/handoff/session-bridge.md` for the
-> decision context.
+> capability on top of the v1 design (Docs 00–21). v1 (M1→M9) shipped first;
+> v1 hardening (Doc 24 batches 1–5) landed before the executor was wired
+> (owner decision #4's sequencing).
 
-> **Status:** Draft for review. Not architecture-faithful yet — this is the
-> specification to be grilled, refined, and eventually promoted into the doc
-> set alongside Docs 00–21. Conventions follow the existing set: **[VERIFY]**
-> = must be confirmed at build time; **[ASSUMPTION]** = stated reasoning,
-> revisit if contradicted; **[OPEN]** = unresolved decision blocking
-> implementation.
+> **Status: [AMENDED 2026-08-22] — BUILT AND WIRED (V2-M0 → V2-M6), owner
+> confirmation pending on the [PROVISIONAL] answers in §12.** The four v2
+> crates plus the shell runtime (`src-tauri/src/agent.rs`) and the two MCP
+> tools (`aperture_agent_start`, `aperture_agent_step`) are live on branch
+> `r2-spec-integration`. Owner decisions #47–#54 + F2 (Doc 24 §K) are
+> implemented as written. The remaining open questions were answered
+> provisionally by the implementing session (each marked **[PROVISIONAL]**
+> in §12 with the reasoning and what to change if the owner disagrees) — the
+> grilling never happened live, so none of them is "decided"; they are the
+> defaults the code runs with today. Conventions: **[VERIFY]** = must be
+> confirmed on real target; **[ASSUMPTION]** = stated reasoning, revisit if
+> contradicted; **[PROVISIONAL]** = implemented default awaiting the owner.
+> See `## Implementation status (2026-08-22)` at the end for what exists.
 
 ---
 
@@ -107,7 +110,9 @@ The "hands" of the agent. Wraps Win32/UIA.
   matching is reliable enough; fallback to pixel coords if not — VERIFY M-V2-1]
 - Type text into focused element
 - Press keyboard shortcuts
-- Launch application by name/path
+- Launch application by name **[AMENDED 2026-08-22, decision #52]** — as a
+  *simulated Start-menu search* (Win key → type the name → Enter via
+  `SendInput`), never a process spawn; the crate has no spawn API at all
 - Switch focus to a window
 - Scroll within a region
 - Read current element focus (for verification after action)
@@ -238,8 +243,15 @@ CREATE TABLE task_steps (
 Currently handles one-shot Claude calls (user clicks "Ask Claude", approves
 payload, gets response).
 
-v2 extends it to handle **iterative agent calls**:
-- New method: `agent_step(payload) → ActionInstruction`
+v2 extends it to handle **iterative agent calls** **[AMENDED 2026-08-22]** —
+on the EXISTING MCP plumbing rather than a new gateway method (v2 kickoff §1):
+- `aperture_agent_start(task?)` + `aperture_agent_step(task_id, instruction?)`
+  are the 5th/6th tools on the `aperture-mcp` pipe; Claude Desktop holds the
+  conversation and calls `agent_step` once per turn (instruction for the last
+  screen in, the next screen out). A push-transport-driven loop (Aperture
+  calling the CLI/API itself with `agent_step(payload) → ActionInstruction`)
+  is **not built** — MCP-primary per ADR-025; it is the natural follow-up if
+  the owner wants agent mode without Claude Desktop.
 - Scoped allow applies per-task (not per-step) — user approves the task
   loop once, not every step
 - Cancel window still shown per-step in the overlay (user can cancel
@@ -325,6 +337,10 @@ executor find exactly where that is on screen?
 **Fallback — pixel coordinate from Claude:**
 - If Claude has high confidence about location, it can optionally include
   `"coords": { "x": 423, "y": 891 }` derived from the screenshot
+  **[AMENDED 2026-08-22]**: the executor treats coords as *primary-monitor
+  physical pixels*; scaling from the 768-px screenshot space is not done
+  yet (the system prompt does not advertise coords — UIA grounding is the
+  only path Claude is told about). [VERIFY] before advertising.
 - Used only when UIA match fails [ASSUMPTION: Claude's coordinate
   estimation from a 768px downscaled image is accurate enough — VERIFY M-V2-1]
 
@@ -452,18 +468,22 @@ egress. Leave as a post-v2 option.
 
 ## 12. Open Questions (to resolve during grilling)
 
-| # | Question | Blocking which milestone |
+**[AMENDED 2026-08-22]** — status per question. "Decided" = an owner
+decision in Doc 24; **[PROVISIONAL]** = the default the code runs with,
+chosen by the implementing session, to be confirmed or overturned by the owner.
+
+| # | Question | Status (2026-08-22) |
 |---|---|---|
-| Q-V2-01 | UIA label matching reliability across apps — is fuzzy match sufficient or do we need the coordinate fallback regularly? | V2-M0 |
-| Q-V2-02 | Claude MCP payload size limit with base64 screenshot — does 768px downscale stay within it? | V2-M1 |
-| Q-V2-03 | Behaviour when agent loop visits an excluded app — pause and notify, or skip action and continue? | V2-M5 |
-| Q-V2-04 | Step cap default (50) — is this the right number or does it need to be higher for complex tasks? | V2-M2 |
-| Q-V2-05 | Should the agent loop re-use the VLM for richer screen descriptions or is Claude's own vision sufficient? | V2-M2 |
-| Q-V2-06 | Prior-steps-summary strategy — Claude generates it, but at what step count does the context window become a concern? | V2-M2 |
-| Q-V2-07 | Error recovery — on `ActionError::ElementNotFound`, does Claude get another attempt with the error context, or does the loop pause for user? | V2-M2 |
-| Q-V2-08 | Local-only fallback planning model (Qwen2.5-3B) — in or out of v2 scope? | V2-M3 |
-| Q-V2-09 | UAC-elevated windows (Task Manager, installers) — hard block, or surface a "run as admin" prompt? | V2-M5 |
-| Q-V2-10 | Does the agent loop need its own VRAM priority tier, or does it always defer to v1 VLM priorities? | V2-M0 |
+| Q-V2-01 | UIA label matching reliability — is fuzzy match sufficient? | **Answered by the V2-M0 gate** (`gates/tests/v2m0_uia_executor.rs`, run on the dev box 2026-08-22): exact → contains → Levenshtein ≤ 2 on normalised labels found "File"/"Notepad" first try. Coordinate fallback exists but is not advertised to Claude. [VERIFY] across Electron/Chromium UIs — Notepad is one app. |
+| Q-V2-02 | Does a base64 768 px screenshot fit the MCP result cap? | **Measured**: worst-case noise frame 768×432 q85 = 525 KB JPEG / 700 KB base64 (`screen-serializer` test `q_v2_02_…`), under the 1 MiB cap (decision #42) with headroom; real screens compress far smaller. The cap is enforced on text+image together in `mcp_bridge::agent_step`. |
+| Q-V2-03 | Excluded app in front | **Decided — #49 pause and notify.** Executor refuses (`ActionError::Excluded`) and `observe_now` refuses (`CaptureError::Excluded`); the surface shows Resume/Stop. |
+| Q-V2-04 | Step cap default | **[PROVISIONAL] 50**, now a setting (`agent.step_cap`, clamped 1–500) rather than a constant, so the owner can move it without a rebuild. |
+| Q-V2-05 | VLM in the loop | **[PROVISIONAL] No** — Claude sees the redacted screenshot; the loop is 0-VRAM (§7). The VLM stays available for v1 enrichment. Revisit if grounding quality on dense screens disappoints. |
+| Q-V2-06 | Prior-steps summary | **Dissolved by the MCP pull shape** (v2 kickoff §2): Claude Desktop holds the conversation; `prior_steps_summary` is Claude's own one-sentence rolling summary (§5 `step_summary`) echoed back, plus the user's clarification answers. No local history is sent. |
+| Q-V2-07 | Error recovery on a failed action | **[PROVISIONAL] Claude retries with the error context**: the executor's error text is echoed as `last_action.result` in the next payload; the 3-consecutive-failure threshold (§3.3) bounds the retries; a malformed instruction counts as a failed step. |
+| Q-V2-08 | Local-only planning model | **Out** (locked decision 1 + kickoff recommendation). Nothing built. |
+| Q-V2-09 | UAC-elevated windows | **Decided — #50 prompt, not block.** Executor refuses (`ActionError::Elevated`); the surface explains that Windows UIPI blocks input from an unelevated Aperture and offers Resume after the user handles that step. **Not built:** an actual "restart Aperture as administrator" affordance — that is a privilege change the owner should choose explicitly (see Implementation status). |
+| Q-V2-10 | Own VRAM priority tier | **[PROVISIONAL] None** — the default loop uses no VRAM (§7), so no tier was added; `StopReason::VramPause` / `PauseReason::Vram` exist but nothing raises them yet (no agent-side GPU job exists to be pre-empted). |
 
 ---
 
@@ -497,3 +517,31 @@ These are explicitly out of scope to keep v2 scoped and shippable:
 ---
 
 *End of draft. To be grilled, refined, and promoted to the doc set.*
+
+---
+
+## Implementation status (2026-08-22) — V2-M0 → V2-M6 wired; Doc 24 §K decisions implemented
+
+What exists on `r2-spec-integration` (commit after `108c05c`), mapped to §10:
+
+| Milestone | Status | Where |
+|---|---|---|
+| **V2-M0** executor | **Done, gate passed on-target** | `crates/action-executor` — `UiaExecutor` (UIA tree walk, `grounding` exact→contains→Levenshtein≤2, `SendInput` click/type/key/scroll, simulated-Start `launch` per #52, `switch_window` with foreground retry + settle), elevation detection (#50), `ExclusionProbe` (#49), hard-stop flag (locked 5), `risk` keywords (#47/#51), `reversibility` (#54). Gate: `gates/tests/v2m0_uia_executor.rs` drove a real Notepad: switch → type (verified by UIA read-back) → click "File" → Esc → Ctrl+A → Backspace → Alt+F4. Three WinUI input quirks fixed by that gate: keys must be *held* until the target pumps (else XAML drops them), printable characters go as layout VK events not Unicode packets (which coalesce), and a freshly-foregrounded app drops input for ~500 ms. |
+| **V2-M1** serializer | **Done** | `crates/screen-serializer::screenshot::observe_frame` — OCR with word boxes (`OcrOutput.lines`, new) → `privacy::image_redaction::redact_bgra` (solid block over every word a text rule covers, same coordinate space) → 768 px JPEG → base64. Q-V2-02 measured. Live feed: `CaptureSubsystem::observe_now` (same exclusion gate as a scheduled sample, frame returned not sunk). |
+| **V2-M2** loop + task manager | **Done** | `crates/agent-loop::driver::AgentDriver` (pure policy, 16 offline tests) + `src-tauri/src/agent.rs` (I/O: waits for the user inside the MCP call ≤110 s, executes on a blocking thread with the driver moved out of the mutex, observes, audits **before** release fail-closed). `task-manager` gained `list_tasks`. |
+| **V2-M3** once-per-task approval | **Done (#48)** | `PauseReason::Approval` card on the overlay; a user-typed task is approved by construction (locked 4). Every step still audited; STOP always visible. |
+| **V2-M4** multi-app | **Built, not gated** | `switch_window` + `launch` exist; no multi-app gate test yet. |
+| **V2-M5** hard stop + exclusions | **Done** | Stop = tray item "Stop agent task" (own thread) + surface button + `agent_decide(stop)`: flags the executor first, then transitions. Exclusions/elevation pause-and-notify. |
+| **V2-M6** history UI | **Done** | Dashboard → **Agent** tab: tasks, per-step audit rows (payload hash, action, result, reasoning), purge. |
+| **V2-M7** privacy audit + onboarding | **Partial** | The approval card states what leaves per step (§8). A formal redaction-coverage review of agent payloads has not been done; the owner QA list in the session bridge covers it. |
+
+**Deviations from this spec, stated plainly:**
+- §3.3 "hard stop … separate lightweight process": implemented **in-process on the tray thread** (M-V2-0 resolved per the kickoff's recommendation). The tray survives an unresponsive WebView; it does not survive an unresponsive `aperture.exe`.
+- §9.4 "task-complete bubble": the terminal card on the agent surface plays that role (with the #54 undo offer). A v1 bubble with no Resume action does not exist yet; bubbling it would have meant a no-action bubble variant.
+- §9.3 "auto-approves after timeout": **not implemented** — a consequential action waits for the user (the MCP call returns "still waiting" after 110 s and Claude re-calls). Auto-approval would contradict #47.
+- §4.2 agent-VLM priority: not added (Q-V2-10).
+- Decision #50's "run as admin" prompt explains and offers Resume; it does not relaunch Aperture elevated.
+
+**Invariants confirmed by gates this session:** SC5 is now a real byte-level harness (`gates/tests/sc5_network_monitor.rs`, not `#[ignore]`): zero bytes / zero non-loopback connections / zero child processes through the proactive path, and the approved Send's body hash == preview hash == `cloud_send` row. The executor is not an emitter (`lint-emitters` passes with the new crates scanned; the F2 ticket lint refuses `ExecutorTicket::for_task(` outside `agent-loop`).
+
+Full detail: `docs/handoff/session-bridge-2026-08-22-v2-wiring.md`.

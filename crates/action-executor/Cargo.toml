@@ -3,7 +3,7 @@ name = "aperture-action-executor"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "v2 agent 'hands' (Doc 22 §3.1, SKELETON): Win32/UIA click/type/launch behind the ActionExecutor seam. UI-only action surface — no filesystem, no registry, no network (locked decision 3; the executor is NOT an emitter). The UIA backend body is the V2-M0 spike (Q-V2-01)."
+description = "v2 agent 'hands' (Doc 22 §3.1, V2-M0): Win32/UIA click/type/key/launch/switch/scroll behind the ActionExecutor seam. UI-only action surface — no filesystem, no registry, no network, no process spawn (locked decision 3, Doc 24 #52; the executor is NOT an emitter)."
 
 [dependencies]
 aperture-contracts = { workspace = true }
@@ -14,11 +14,18 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-# UIA tree walk + SendInput land with the V2-M0 spike; features are [VERIFY]
-# at spike time (UIAutomationClient interfaces).
+# V2-M0 backend: UIA tree walk (UIAutomationClient), SendInput, window
+# enumeration/foreground, token elevation (Doc 24 #50), physical screen size
+# for absolute mouse coordinates (Gdi DESKTOPHORZRES). No process/shell API
+# feature is enabled — Launch is a simulated Win-key search (Doc 24 #52).
 windows = { version = "0.58", features = [
     "Win32_Foundation",
-    "Win32_UI_Accessibility",         # IUIAutomation tree walk (V2-M0)
-    "Win32_UI_Input_KeyboardAndMouse", # SendInput for type/key/click
-    "Win32_UI_WindowsAndMessaging",   # window enumeration / focus
+    "Win32_Graphics_Gdi",              # GetDeviceCaps(DESKTOPHORZRES): physical px, DPI-independent
+    "Win32_Security",                  # OpenProcessToken/GetTokenInformation(TokenElevation)
+    "Win32_System_Com",                # CoInitializeEx/CoCreateInstance(CUIAutomation)
+    "Win32_System_Threading",          # OpenProcess/QueryFullProcessImageNameW/AttachThreadInput
+    "Win32_System_Variant",            # VARIANT property conditions
+    "Win32_UI_Accessibility",          # IUIAutomation tree walk + patterns
+    "Win32_UI_Input_KeyboardAndMouse", # SendInput for click/type/key/scroll
+    "Win32_UI_WindowsAndMessaging",    # EnumWindows / foreground / metrics
 ] }

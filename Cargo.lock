@@ -155,6 +155,8 @@ checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 name = "aperture"
 version = "0.1.0"
 dependencies = [
+ "aperture-action-executor",
+ "aperture-agent-loop",
  "aperture-capture",
  "aperture-connectors",
  "aperture-contracts",
@@ -165,9 +167,12 @@ dependencies = [
  "aperture-pattern-engine",
  "aperture-privacy",
  "aperture-reasoning-gateway",
+ "aperture-screen-serializer",
  "aperture-suggestion-generator",
+ "aperture-task-manager",
  "aperture-vision-ocr",
  "aperture-voice",
+ "base64 0.22.1",
  "rusqlite",
  "serde",
  "serde_json",
@@ -203,6 +208,7 @@ version = "0.1.0"
 dependencies = [
  "aperture-action-executor",
  "aperture-contracts",
+ "aperture-db",
  "aperture-screen-serializer",
  "aperture-task-manager",
  "serde",
@@ -291,13 +297,16 @@ dependencies = [
 name = "aperture-gates"
 version = "0.1.0"
 dependencies = [
+ "aperture-action-executor",
  "aperture-capture",
  "aperture-connectors",
  "aperture-contracts",
  "aperture-db",
  "aperture-event-bus",
  "aperture-orchestration",
+ "aperture-pattern-engine",
  "aperture-privacy",
+ "aperture-reasoning-gateway",
  "aperture-suggestion-generator",
  "rusqlite",
  "serde_json",
@@ -314,6 +323,7 @@ dependencies = [
  "axum",
  "reqwest 0.12.28",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -375,6 +385,9 @@ version = "0.1.0"
 dependencies = [
  "aperture-contracts",
  "aperture-privacy",
+ "aperture-vision-ocr",
+ "base64 0.22.1",
+ "image",
  "serde",
  "serde_json",
  "sha2",

@@ -17,6 +17,12 @@
 //!   `aperture_get_context` after the user's explicit "Approve for Claude".
 //! - `aperture_submit_suggestions(json)` — the return channel: schema-checked
 //!   and connector-validated (the cloud suggests, only connectors act).
+//! - `aperture_agent_start(task?)` / `aperture_agent_step(task_id, instruction?)`
+//!   (v2, Doc 22, 2026-08-22) — the agent loop on the SAME pipe: the task is
+//!   approved ONCE by the user on screen (decision #48); every step's screen
+//!   payload is redacted (text + image gate), audited as `cloud_send` BEFORE
+//!   release (fail-closed, like `get_context`), and capped like every other
+//!   MCP result (decision #42). The policy lives in `crate::agent`.
 //!
 //! The pipe is loopback-local IPC (no socket); the EGRESS surface is the
 //! `aperture-mcp` binary's stdout, which is why that binary lives in the
@@ -30,8 +36,8 @@ use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
 use aperture_privacy::audit_log::{AuditLog, AuditSink, CloudSendRecord};
 use aperture_reasoning_gateway::transports::mcp::{
-    MCP_PIPE_NAME, MCP_RESULT_MAX_BYTES, TOOL_GET_CONTEXT, TOOL_LIST_RECENT,
-    TOOL_SEARCH_HISTORY, TOOL_SUBMIT_SUGGESTIONS,
+    MCP_PIPE_NAME, MCP_RESULT_MAX_BYTES, TOOL_AGENT_START, TOOL_AGENT_STEP, TOOL_GET_CONTEXT,
+    TOOL_LIST_RECENT, TOOL_SEARCH_HISTORY, TOOL_SUBMIT_SUGGESTIONS,
 };
 
 use crate::app_state::AppState;
@@ -159,6 +165,8 @@ async fn dispatch(app: &tauri::AppHandle, req: serde_json::Value) -> serde_json:
         TOOL_LIST_RECENT => list_recent(&state).await,
         TOOL_SEARCH_HISTORY => search_history(app, &state, &args).await,
         TOOL_SUBMIT_SUGGESTIONS => submit_suggestions(app, &state, &args).await,
+        TOOL_AGENT_START => agent_start(app, &state, &args).await,
+        TOOL_AGENT_STEP => agent_step(app, &state, &args).await,
         other => Err(format!("unknown tool: {other}")),
     };
     match outcome {
@@ -173,6 +181,69 @@ fn text_result(text: impl Into<String>, is_error: bool) -> serde_json::Value {
         "content": [ { "type": "text", "text": text.into() } ],
         "isError": is_error
     })
+}
+
+/// `aperture_agent_start` (v2, Doc 22 §9.1 + decision #48).
+async fn agent_start(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let task = args.get("task").and_then(|v| v.as_str());
+    match crate::agent::mcp_start(app, state, task).await {
+        Ok((task_id, approved)) => Ok(text_result(
+            if approved {
+                format!(
+                    "task {task_id} is approved by the user. Call aperture_agent_step with this task_id and no instruction to observe the screen."
+                )
+            } else {
+                format!(
+                    "task {task_id} created and shown to the user for approval — nothing runs until they allow it. Call aperture_agent_step with this task_id and no instruction; it waits for their decision."
+                )
+            },
+            false,
+        )),
+        Err(e) => Ok(text_result(e, true)),
+    }
+}
+
+/// `aperture_agent_step` (v2, Doc 22 §2). The reply carries the redacted
+/// payload as text and the redacted screenshot as an MCP image block; the
+/// decision-#42 cap applies to both together.
+async fn agent_step(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let task_id = args
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "task_id is required".to_string())?;
+    let instruction = args.get("instruction").cloned().filter(|v| v.is_object());
+    let reply = match crate::agent::mcp_step(app, state, task_id, instruction).await {
+        Ok(r) => r,
+        Err(e) => return Ok(text_result(e, true)),
+    };
+    let image_len = reply.image_jpeg.as_ref().map(|i| i.len()).unwrap_or(0);
+    if reply.text.len() + image_len > MCP_RESULT_MAX_BYTES {
+        return Ok(text_result(
+            format!(
+                "the screen payload is {} B — over Claude Desktop (MCP)'s hard cap of {MCP_RESULT_MAX_BYTES} B. Nothing was released (decision #42).",
+                reply.text.len() + image_len
+            ),
+            true,
+        ));
+    }
+    let mut content = vec![serde_json::json!({ "type": "text", "text": reply.text })];
+    if let Some(jpeg) = reply.image_jpeg {
+        use base64::Engine as _;
+        content.push(serde_json::json!({
+            "type": "image",
+            "data": base64::engine::general_purpose::STANDARD.encode(jpeg),
+            "mimeType": "image/jpeg"
+        }));
+    }
+    Ok(serde_json::json!({ "content": content, "isError": reply.is_error }))
 }
 
 /// `aperture_get_context` — release an APPROVED payload, audited + consumed.

@@ -43,3 +43,12 @@ Additive-only fields everywhere; unknown-field tolerance mandatory; breaking cha
 
 ---
 > **R2 amendments applied** (see docs/19–21): ADR-026 (scoped-allow approval), ADR-035 (validate-on-click), ADR-025 (MCP→CLI→API transport order), ADR-036 (gateway sole diagnostics emitter).
+
+## Implementation status (2026-08-22) — additive contract changes (§6 law honoured)
+
+- **Contract 6 (`contracts/src/agent.rs`, v2):** `AgentAction` derives `PartialEq/Eq`; `ActionError` gains `Stopped` (hard stop observed before acting) and `Unsupported(String)`. `action-executor::ActionOutcome` gains `new_windows: Vec<WindowInfo>` (`#[serde(default)]`).
+- **Layer A OCR:** `OcrOutput.lines` (`#[serde(default)]`, see doc 06).
+- **Preview/Send IPC:** `preview_send` returns `PreviewSendResult` (`{kind:"sent", suggestions}` | `{kind:"transport_mismatch", named, available}`); new `preview_retarget(payload_id, target)`; new event `suggestions_refresh { reason }`.
+- **Agent IPC (new):** commands `agent_status`, `agent_start_task`, `agent_decide(task_id, decision)`, `agent_answer`, `agent_undo_close_windows`, `agent_dismiss`, `agent_list_tasks`, `agent_task_steps`, `agent_purge_task`; event `agent_task` (`TaskView` or `null`); MCP tools `aperture_agent_start` / `aperture_agent_step` (`tool_descriptors()` is still the single source of truth). `task-manager` gains `list_tasks(limit)`.
+- **Fakes (§7):** `golden::redaction_fixture()` is real (raw payload: 2 e-mails + 1 secret assembled at runtime; the redactor must yield `email × 2, secret_key × 1`).
+Full detail: `docs/handoff/session-bridge-2026-08-22-v2-wiring.md`.

@@ -98,3 +98,13 @@ A failed gate stops forward progress on that path; the fix lands, the gate re-ru
 ## Implementation status (as of 2026-08-13) — v1 composition root wired; the app runs
 
 `VoiceSubsystem` and `Gateway` are now constructed in the shell (the doc's §37 gap is closed): capture-toggle→voice enable/disable, the PTT hotkey thread, warm-keep→`set_warm_kept`, the gateway↔preview wiring with the DB-backed audit log, bubble hit-testing, exclusion hot-reload, settings seeding, and CONN-M1 are all landed and adversarially reviewed (18-agent workflow; 8 confirmed findings fixed same-day). The app launches in dev (`npm --prefix ui run dev` + `cargo run -p aperture`) and has been used live: consent → capture ON → WGC sampling → 171 patterns mined on this box. Remaining for v1: the sqlcipher build (Strawberry Perl + NASM), the STT backend (whisper weights + host binaries + lifting `model_lifecycle`'s stt-host refusal + implementing `/transcribe` in `SidecarRunner`), on-hardware gates (SC3/SC4/PresentMon/SC5), and the deferred MCP stdio server + gated-search UX. Full detail: `docs/handoff/session-bridge-2026-08-13-v1-wiring.md`.
+
+## Implementation status (as of 2026-08-22) — v1 fix-ups closed; SC5 real; v2 M0→M6 wired
+
+- **SC5 (M1→every gate, strict at M7):** real harness, runs on every `cargo test --workspace` (see doc 13). `cargo xtask sc5` runs it unconditionally now; `APERTURE_SC5_STRICT` is a no-op kept for the call shape.
+- **2026-08-19 SDLC review:** all 8 open findings closed (`docs/handoff/sdlc-review-2026-08-19.md` table).
+- **Doc 24 §0:** #1 (SC5) done; #3 (image redaction) built, consumed by v2 only.
+- **v2 (Doc 22 §10):** V2-M0 done + on-target gate passed (`gates/tests/v2m0_uia_executor.rs`, `#[ignore]` — drives a real Notepad); V2-M1/M2/M3/M5/M6 done; V2-M4 built but not gated; V2-M7 partial. Doc 22 carries the per-milestone table and the [PROVISIONAL] answers the owner still has to confirm.
+- **Still on hardware / owner:** SC3 (idle CPU — now cheaper, still unmeasured), SC4, PresentMon, #25/#26, the `m5_load_times` stubs, and the installer + owner QA (the 2026-08-22 bridge has the checklist).
+- **Verification at session end:** `cargo test --workspace` 479 passed / 0 failed / 0 warnings (6 ignored = on-hardware gates); `npm --prefix ui run test` 19/19; `tsc --noEmit` clean; `vite build` clean; `cargo run -p xtask -- lint-emitters` OK (110 files; the new crates scanned as non-emitters; the F2 ticket lint active).
+Full detail: `docs/handoff/session-bridge-2026-08-22-v2-wiring.md`.

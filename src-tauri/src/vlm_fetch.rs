@@ -25,15 +25,21 @@ pub const VLM_MMPROJ_FILE: &str = "qwen2.5-vl-3b-mmproj-f16.gguf";
 // Fallback download spec, mirroring `config/settings.default.json`'s
 // `loadout.vlm_download` byte-for-byte. Needed because the settings seed runs
 // on FIRST run only — an upgraded install never re-seeds, so its settings rows
-// predate this key. NG8 still holds: the settings value, when present, always
-// wins; these are the same values the seed would have written. Verified
-// byte-exact against the ggml-org HF repo 2026-08-16.
+// predate this key (the additive backfill in `main` adds missing leaves such
+// as `sha256`, never rewrites a stored `url`). NG8 still holds: the settings
+// value, when present, always wins; these are the same values the seed would
+// have written. SDLC review 2026-08-19 finding 5: URLs pinned to HF revision
+// 5037fcf163dd95d1e41d1974465f0898ed108ca2 (not the moving `main`) + the
+// whole-file sha256. Size + sha256 verified against the ggml-org HF repo and
+// the dev machine's files 2026-08-22.
 const DEFAULT_MODEL_URL: &str =
-    "https://huggingface.co/ggml-org/Qwen2.5-VL-3B-Instruct-GGUF/resolve/main/Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf";
+    "https://huggingface.co/ggml-org/Qwen2.5-VL-3B-Instruct-GGUF/resolve/5037fcf163dd95d1e41d1974465f0898ed108ca2/Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf";
 const DEFAULT_MODEL_BYTES: u64 = 1_929_901_056;
+const DEFAULT_MODEL_SHA256: &str = "d02fe9b69ad8cadbbd228e387667af66612c44bed29ffc8eb1e7caf9ac486c12";
 const DEFAULT_MMPROJ_URL: &str =
-    "https://huggingface.co/ggml-org/Qwen2.5-VL-3B-Instruct-GGUF/resolve/main/mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf";
+    "https://huggingface.co/ggml-org/Qwen2.5-VL-3B-Instruct-GGUF/resolve/5037fcf163dd95d1e41d1974465f0898ed108ca2/mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf";
 const DEFAULT_MMPROJ_BYTES: u64 = 1_338_428_128;
+const DEFAULT_MMPROJ_SHA256: &str = "b9160fe9d814d1fadf68395677468534778b39ac33c2e7561b7b218626e60d5e";
 
 /// Shared VLM-install state (in [`crate::app_state::AppState`]). The dest
 /// paths are the resolved `SidecarConfig` weight paths — one source of truth
@@ -57,8 +63,15 @@ impl VlmFetchState {
 }
 
 /// Build the two-artifact fetch spec from the `loadout.vlm_download` settings
-/// block (URLs + sizes are settings, never code — NG8), with the seed-mirroring
-/// defaults for any missing/invalid key so a typo can never brick the download.
+/// block (URLs + sizes + sha256 are settings, never code — NG8), with the
+/// seed-mirroring defaults for any missing/invalid key so a typo can never
+/// brick the download.
+///
+/// `sha256` (finding 5) follows the URL rather than falling back on its own:
+/// a present key decides (`""` is the explicit opt-out for a custom mirror of
+/// a different file ⇒ size-only, as before finding 5); an absent key takes the
+/// default digest only when the URL also fell back to the default — the
+/// default hash is right for the default artifact and nothing else.
 pub fn spec_from_settings(loadout: &serde_json::Value, state: &VlmFetchState) -> Vec<FetchItem> {
     let dl = loadout.get("vlm_download");
     vec![
@@ -66,18 +79,26 @@ pub fn spec_from_settings(loadout: &serde_json::Value, state: &VlmFetchState) ->
             dl.and_then(|d| d.get("model")),
             DEFAULT_MODEL_URL,
             DEFAULT_MODEL_BYTES,
+            DEFAULT_MODEL_SHA256,
             &state.model_dest,
         ),
         item(
             dl.and_then(|d| d.get("mmproj")),
             DEFAULT_MMPROJ_URL,
             DEFAULT_MMPROJ_BYTES,
+            DEFAULT_MMPROJ_SHA256,
             &state.mmproj_dest,
         ),
     ]
 }
 
-fn item(section: Option<&serde_json::Value>, default_url: &str, default_bytes: u64, dest: &Path) -> FetchItem {
+fn item(
+    section: Option<&serde_json::Value>,
+    default_url: &str,
+    default_bytes: u64,
+    default_sha256: &str,
+    dest: &Path,
+) -> FetchItem {
     let url = section
         .and_then(|s| s.get("url"))
         .and_then(|v| v.as_str())
@@ -89,10 +110,19 @@ fn item(section: Option<&serde_json::Value>, default_url: &str, default_bytes: u
         .and_then(serde_json::Value::as_u64)
         .filter(|b| *b > 0)
         .unwrap_or(default_bytes);
+    let sha256 = match section.and_then(|s| s.get("sha256")) {
+        Some(v) => v
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_ascii_lowercase),
+        None => (url == default_url).then(|| default_sha256.to_string()),
+    };
     FetchItem {
         url,
         dest: dest.to_path_buf(),
         expected_bytes,
+        sha256,
     }
 }
 
@@ -125,26 +155,52 @@ mod tests {
         assert_eq!(spec.len(), 2);
         assert_eq!(spec[0].url, DEFAULT_MODEL_URL);
         assert_eq!(spec[0].expected_bytes, DEFAULT_MODEL_BYTES);
+        assert_eq!(spec[0].sha256.as_deref(), Some(DEFAULT_MODEL_SHA256));
         assert_eq!(spec[0].dest, PathBuf::from("models").join(VLM_MODEL_FILE));
         assert_eq!(spec[1].url, DEFAULT_MMPROJ_URL);
         assert_eq!(spec[1].expected_bytes, DEFAULT_MMPROJ_BYTES);
+        assert_eq!(spec[1].sha256.as_deref(), Some(DEFAULT_MMPROJ_SHA256));
         assert_eq!(spec[1].dest, PathBuf::from("models").join(VLM_MMPROJ_FILE));
     }
 
-    /// NG8: a settings-declared URL/size always wins over the code default.
+    /// The code defaults must be the seed, byte for byte (finding 5: pinned
+    /// revision + sha256 included) — the shipped JSON is the source of truth.
+    #[test]
+    fn defaults_mirror_the_shipped_seed() {
+        let seed: serde_json::Value =
+            serde_json::from_str(include_str!("../../config/settings.default.json")).unwrap();
+        let dl = &seed["loadout"]["vlm_download"];
+        assert_eq!(dl["model"]["url"], DEFAULT_MODEL_URL);
+        assert_eq!(dl["model"]["bytes"], DEFAULT_MODEL_BYTES);
+        assert_eq!(dl["model"]["sha256"], DEFAULT_MODEL_SHA256);
+        assert_eq!(dl["mmproj"]["url"], DEFAULT_MMPROJ_URL);
+        assert_eq!(dl["mmproj"]["bytes"], DEFAULT_MMPROJ_BYTES);
+        assert_eq!(dl["mmproj"]["sha256"], DEFAULT_MMPROJ_SHA256);
+        for url in [DEFAULT_MODEL_URL, DEFAULT_MMPROJ_URL] {
+            assert!(!url.contains("/resolve/main/"), "revision must be pinned, not `main`: {url}");
+        }
+        for sha in [DEFAULT_MODEL_SHA256, DEFAULT_MMPROJ_SHA256] {
+            assert_eq!(sha.len(), 64);
+            assert!(sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')), "lowercase hex: {sha}");
+        }
+    }
+
+    /// NG8: a settings-declared URL/size/sha256 always wins over the code default.
     #[test]
     fn settings_values_override_the_defaults() {
         let loadout = serde_json::json!({
             "vlm_download": {
-                "model": { "url": "https://mirror.example/model.gguf", "bytes": 42 },
-                "mmproj": { "url": "https://mirror.example/mmproj.gguf", "bytes": 7 }
+                "model": { "url": "https://mirror.example/model.gguf", "bytes": 42, "sha256": "ABCD" },
+                "mmproj": { "url": "https://mirror.example/mmproj.gguf", "bytes": 7, "sha256": " 0123 " }
             }
         });
         let spec = spec_from_settings(&loadout, &state());
         assert_eq!(spec[0].url, "https://mirror.example/model.gguf");
         assert_eq!(spec[0].expected_bytes, 42);
+        assert_eq!(spec[0].sha256.as_deref(), Some("abcd"), "normalized to lowercase hex");
         assert_eq!(spec[1].url, "https://mirror.example/mmproj.gguf");
         assert_eq!(spec[1].expected_bytes, 7);
+        assert_eq!(spec[1].sha256.as_deref(), Some("0123"), "trimmed");
     }
 
     /// A typo'd block (empty URL, zero/negative size) must never produce an
@@ -160,7 +216,29 @@ mod tests {
         let spec = spec_from_settings(&loadout, &state());
         assert_eq!(spec[0].url, DEFAULT_MODEL_URL, "empty url ignored");
         assert_eq!(spec[0].expected_bytes, DEFAULT_MODEL_BYTES, "zero size ignored");
+        assert_eq!(spec[0].sha256.as_deref(), Some(DEFAULT_MODEL_SHA256),
+            "url fell back to the default, so its digest applies");
         assert_eq!(spec[1].url, "https://mirror.example/mmproj.gguf");
         assert_eq!(spec[1].expected_bytes, DEFAULT_MMPROJ_BYTES, "negative size ignored");
+        assert_eq!(spec[1].sha256, None,
+            "a custom url with no sha256 key is size-only — the default digest is not its digest");
+    }
+
+    /// `sha256: ""` is the explicit opt-out (a custom mirror of a different
+    /// file); a non-string value is ignored the same way. Neither silently
+    /// substitutes the default digest.
+    #[test]
+    fn an_empty_or_invalid_sha256_means_size_only() {
+        let loadout = serde_json::json!({
+            "vlm_download": {
+                "model": { "sha256": "" },
+                "mmproj": { "sha256": 12345 }
+            }
+        });
+        let spec = spec_from_settings(&loadout, &state());
+        assert_eq!(spec[0].url, DEFAULT_MODEL_URL);
+        assert_eq!(spec[0].sha256, None, "explicit empty = opt-out, even on the default url");
+        assert_eq!(spec[1].url, DEFAULT_MMPROJ_URL);
+        assert_eq!(spec[1].sha256, None, "non-string ignored");
     }
 }

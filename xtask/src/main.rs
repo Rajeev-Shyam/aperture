@@ -114,6 +114,14 @@ const LOOPBACK_SCOPED_CRATES: &[&str] = &["vlm-host", "stt-host"];
 /// Crates skipped entirely (tooling / not part of the product egress surface).
 const SKIPPED_CRATES: &[&str] = &["gates", "xtask"];
 
+/// Doc 24 F2 — the executor capability token. `ExecutorTicket::for_task` is
+/// the only way to drive `action-executor`, and Rust has no cross-crate
+/// `pub(crate)`, so the capability is enforced here: the literal may appear
+/// only in the loop that owns tasks and in the executor's own source (its
+/// tests). Same pass, same failure semantics as the two-emitter needles.
+const TICKET_MINT_NEEDLE: &str = "ExecutorTicket::for_task(";
+const TICKET_MINT_CRATES: &[&str] = &["agent-loop", "action-executor"];
+
 fn lint_emitters() -> Result<()> {
     let root = workspace_root();
     let crates_dir = root.join("crates");
@@ -292,6 +300,17 @@ fn non_loopback_host_in(line: &str) -> Option<String> {
     None
 }
 
+/// Doc 24 F2: is this a *code* line minting an `ExecutorTicket` in a crate
+/// that may not? (`crate_name` is the directory name under `crates/`, or
+/// `src-tauri`.) Comment/doc lines are not code, as in the needle scan.
+fn ticket_minted_outside_loop(crate_name: &str, line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("//") || trimmed.starts_with("//!") || trimmed.starts_with("*") {
+        return false;
+    }
+    line.contains(TICKET_MINT_NEEDLE) && !TICKET_MINT_CRATES.contains(&crate_name)
+}
+
 /// Recursively visit every `.rs` file under `dir`, calling `f(path, line_no, line)`.
 fn scan_rs_files(
     dir: &Path,
@@ -436,20 +455,18 @@ fn run_gate(milestone: &str) -> Result<()> {
 fn run_sc5() -> Result<()> {
     println!("sc5: zero silent egress; bytes only after approved Send (doc 13 §2)");
     // Two halves (ADR-036 wording):
-    //  - STATIC (runs today): lint-emitters — the capability-surface deny list.
-    //  - DYNAMIC (M7): the #[ignore]d network-monitor test. Until its ETW/proxy
-    //    backend exists, we compile + surface it as `ignored` (visible, never
-    //    silently skipped) — forcing it with --include-ignored before M7 would
-    //    fail on the deliberate todo!() harness and make every earlier gate
-    //    dishonest in the other direction. `APERTURE_SC5_STRICT=1` (set by the
-    //    M7 gate) opts into the strict run.
+    //  - STATIC: lint-emitters — the capability-surface deny list.
+    //  - DYNAMIC (real since 2026-08-22, owner decision #1): the byte-level
+    //    harness in gates/tests/sc5_network_monitor.rs — a loopback origin
+    //    stands in for the API, netstat proves no non-loopback connection from
+    //    the test process, a CIM query proves no child spawn, and the approved
+    //    Send's body hash must equal the preview hash AND the cloud_send audit
+    //    row. It is NOT #[ignore]d any more (loopback-only, unprivileged), so
+    //    every `cargo test --workspace` runs it; `APERTURE_SC5_STRICT` is kept
+    //    as a no-op for the M7 gate's call shape.
     lint_emitters()?;
-    let strict = std::env::var("APERTURE_SC5_STRICT").is_ok_and(|v| v == "1");
-    let mut args = vec!["-p", "aperture-gates", "--test", "sc5_network_monitor"];
-    if strict {
-        args.extend(["--", "--include-ignored"]);
-    }
-    cargo_test(&args)
+    let _strict = std::env::var("APERTURE_SC5_STRICT").is_ok_and(|v| v == "1");
+    cargo_test(&["-p", "aperture-gates", "--test", "sc5_network_monitor"])
 }
 
 fn run_sc6() -> Result<()> {
@@ -528,6 +545,21 @@ mod tests {
         // Comments and doc lines are not code.
         assert_eq!(non_loopback_host_in("// see https://docs.rs/whatever"), None);
         assert_eq!(non_loopback_host_in("//! posts to https://api.anthropic.com"), None);
+    }
+
+    /// Doc 24 F2: the ticket is a capability; only the loop may mint it.
+    #[test]
+    fn executor_ticket_may_only_be_minted_by_agent_loop() {
+        let mint = "let ticket = ExecutorTicket::for_task(task.id);";
+        assert!(!ticket_minted_outside_loop("agent-loop", mint));
+        assert!(!ticket_minted_outside_loop("action-executor", mint), "its own tests");
+        assert!(ticket_minted_outside_loop("src-tauri", mint));
+        assert!(ticket_minted_outside_loop("task-manager", mint));
+        assert!(ticket_minted_outside_loop("screen-serializer", mint));
+        // Comments and docs are not code; unrelated lines never match.
+        assert!(!ticket_minted_outside_loop("src-tauri", "// never call ExecutorTicket::for_task( here"));
+        assert!(!ticket_minted_outside_loop("src-tauri", "/// see ExecutorTicket::for_task("));
+        assert!(!ticket_minted_outside_loop("src-tauri", "let t = ticket.task_id();"));
     }
 
     #[test]

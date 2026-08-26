@@ -61,3 +61,9 @@ frame ──► [pHash gate, Doc 05: near-dup? drop] ──► downscale ──�
 
 ---
 > **R2 amendments applied** (see docs/19–21): ADR-031, ADR-032; Q72 (upstream pHash gate), Q85 (adaptive image downscale).
+
+## Implementation status (2026-08-22) — OCR keeps word geometry (owner decision #3, v2 M1)
+
+- **§2 Layer A output is additive-extended:** `OcrOutput.lines: Vec<OcrLine { text, words: Vec<OcrWord { text, x, y, w, h }> }>` — the surviving post-quality-filter lines with every word's bounding box, in the pixel space of the (≤ 1600 px) frame handed to the engine. `text` / `mean_confidence` are byte-identical to before (they feed embeddings and pattern signatures). `windows_media_ocr::recognize_bgra` now reads `OcrLine.Words()` → `OcrWord.BoundingRect()` (rounded outward); `aggregate_lines(Vec<String>)` is kept and delegates to the new `aggregate_ocr_lines`.
+- **Consumer:** the v2 `screen-serializer` — OCR at Layer A scale → `privacy::image_redaction::redact_bgra` paints a solid block over every word a text rule covers, in that same coordinate space → downscale to 768 px → JPEG. Nothing in the v1 enrichment path produces a screenshot yet (Doc 24 #3 status).
+Full detail: `docs/handoff/session-bridge-2026-08-22-v2-wiring.md`.

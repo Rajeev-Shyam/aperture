@@ -10,6 +10,9 @@
 import { useEffect, useRef, useState } from "react";
 
 import {
+  agentListTasks,
+  agentPurgeTask,
+  agentTaskSteps,
   dashboardStats,
   getAutostart,
   getSettings,
@@ -24,6 +27,8 @@ import {
   transportHealth,
   vlmDownload,
   vlmStatus,
+  type AgentStepRow,
+  type AgentTaskRow,
   type DashboardStats,
   type Health,
   type HistoryEvent,
@@ -38,7 +43,7 @@ import {
 import { useDraggable } from "../state/useDraggable";
 import { useModalSurface } from "../state/useModalSurface";
 
-type Tab = "overview" | "history" | "patterns" | "suggestions" | "voice" | "advanced";
+type Tab = "overview" | "history" | "patterns" | "suggestions" | "voice" | "agent" | "advanced";
 
 const TABS: { id: Tab; label: string; hint: string }[] = [
   { id: "overview", label: "Overview", hint: "What Aperture holds right now" },
@@ -46,6 +51,7 @@ const TABS: { id: Tab; label: string; hint: string }[] = [
   { id: "patterns", label: "Patterns", hint: "Habits the engine has mined" },
   { id: "suggestions", label: "Suggestions", hint: "Every bubble ever surfaced" },
   { id: "voice", label: "Voice", hint: "Push-to-talk transcripts" },
+  { id: "agent", label: "Agent", hint: "Every agent task and each audited step" },
   { id: "advanced", label: "Advanced", hint: "Tuning: bubbles, habits, transport" },
 ];
 
@@ -115,6 +121,7 @@ export function Dashboard({ onClose, onOpenPrivacy }: Props) {
           {tab === "patterns" && <PatternsTab />}
           {tab === "suggestions" && <SuggestionsTab />}
           {tab === "voice" && <VoiceTab />}
+          {tab === "agent" && <AgentTab />}
           {tab === "advanced" && <AdvancedTab />}
         </main>
       </div>
@@ -387,6 +394,12 @@ function VoiceTab() {
   // ptt_hotkey etc. (set_settings replaces top-level keys wholesale).
   const voiceSection = useRef<VoiceSettings>({});
   const [error, setError] = useState<string | null>(null);
+  // One write per gesture (SDLC review 2026-08-19 finding 10, the AdvancedTab
+  // fix applied here): a range input fires onChange for EVERY step of a drag,
+  // and each write is a DB row + a `settings_changed` broadcast to every
+  // window. The slider's last value waits 300 ms after the last step.
+  const pendingFloor = useRef<number | null>(null);
+  const flushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   function refresh() {
     void dashboardStats().then(setStats).catch((e) => setError(String(e)));
@@ -402,7 +415,15 @@ function VoiceTab() {
       .catch(() => {});
   }
 
-  useEffect(refresh, []);
+  useEffect(() => {
+    refresh();
+    // A gesture still in flight when the panel closes must not be lost.
+    return () => {
+      if (flushTimer.current) clearTimeout(flushTimer.current);
+      flushFloor();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function enable() {
     try {
@@ -415,13 +436,23 @@ function VoiceTab() {
     }
   }
 
-  /** Persist the confirm floor (decision #27): merge into the voice section so
-   *  the write can't drop sibling keys. The core reads it per utterance — the
-   *  change applies to the very next press, no restart. */
-  function updateFloor(v: number) {
-    setFloor(v);
+  /** Write the pending floor, if any (decision #27): merge into the voice
+   *  section so the write can't drop sibling keys. The core reads it per
+   *  utterance — the change applies to the very next press, no restart. */
+  function flushFloor() {
+    const v = pendingFloor.current;
+    if (v === null) return;
+    pendingFloor.current = null;
     voiceSection.current = { ...voiceSection.current, intent_confidence_floor: v };
     void setSettings({ voice: voiceSection.current }).catch((e) => setError(String(e)));
+  }
+
+  /** Slider step: show it now, persist it once the gesture settles. */
+  function updateFloor(v: number) {
+    setFloor(v);
+    pendingFloor.current = v;
+    if (flushTimer.current) clearTimeout(flushTimer.current);
+    flushTimer.current = setTimeout(flushFloor, 300);
   }
 
   return (
@@ -906,4 +937,100 @@ function fmtTime(ts: number): string {
   return sameDay
     ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
     : d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+// --- Agent (v2, Doc 22 §9 / V2-M6) -------------------------------------------
+
+/** Task history + the per-step audit trail (payload hash, action, result). */
+function AgentTab() {
+  const [rows, setRows] = useState<AgentTaskRow[]>([]);
+  const [open, setOpen] = useState<string | null>(null);
+  const [steps, setSteps] = useState<AgentStepRow[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  const reload = () => agentListTasks(100).then(setRows).catch((e) => setError(String(e)));
+  useEffect(() => {
+    void reload();
+  }, []);
+
+  async function toggle(id: string) {
+    if (open === id) {
+      setOpen(null);
+      return;
+    }
+    try {
+      setSteps(await agentTaskSteps(id));
+      setOpen(id);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function purge(id: string) {
+    try {
+      await agentPurgeTask(id);
+      if (open === id) setOpen(null);
+      await reload();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  return (
+    <div>
+      <h2>Agent tasks</h2>
+      <p className="dash__lede">
+        Every task Claude has driven on this PC, and every step it took — what was sent
+        (as a hash), what it did, and what happened. "Purge" deletes a task and its steps.
+      </p>
+      {error && <p className="dash__error">{error}</p>}
+      {!error && rows.length === 0 && (
+        <p className="dash__empty">No agent tasks yet — press ✦ on the overlay, or ask Claude Desktop.</p>
+      )}
+      <ul className="dash__rows">
+        {rows.map((t) => (
+          <li key={t.id} className="dash__row">
+            <div className="dash__row-head">
+              <span className="dash__row-type">
+                {t.status} · {t.step_count} step{t.step_count === 1 ? "" : "s"}
+              </span>
+              <time dateTime={new Date(t.created_at).toISOString()}>
+                {new Date(t.created_at).toLocaleString()}
+              </time>
+            </div>
+            <div className="dash__row-title">{t.description}</div>
+            {t.outcome_summary && <div className="dash__row-app">{t.outcome_summary}</div>}
+            <div className="dash__row-head">
+              <button className="btn" onClick={() => void toggle(t.id)}>
+                {open === t.id ? "Hide steps" : "Show steps"}
+              </button>
+              <button className="btn btn--danger" onClick={() => void purge(t.id)}>
+                Purge
+              </button>
+            </div>
+            {open === t.id && (
+              <ol className="dash__steps">
+                {steps.length === 0 && <li className="dash__empty">No steps recorded.</li>}
+                {steps.map((s) => (
+                  <li key={`${s.step_number}-${s.timestamp}`}>
+                    {s.step_number}. {s.action_type ?? "—"}
+                    {s.action_target ? ` "${s.action_target}"` : ""} → {s.result ?? "—"}
+                    {s.claude_reasoning ? ` — ${s.claude_reasoning}` : ""}
+                    {s.screen_payload_hash && (
+                      <>
+                        {" "}
+                        <code title="SHA-256 of the payload sent for this step">
+                          {s.screen_payload_hash.slice(0, 12)}…
+                        </code>
+                      </>
+                    )}
+                  </li>
+                ))}
+              </ol>
+            )}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
 }

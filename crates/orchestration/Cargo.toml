@@ -23,6 +23,10 @@ async-trait = { workspace = true }
 # user-click-initiated VLM weight INGRESS from Hugging Face (decision #30);
 # carries no user data, see its module doc.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart"] }  # [VERIFY]
+# SHA-256 of the streamed VLM weights (model_fetch.rs) — content verification
+# at download time, not just byte count (SDLC review 2026-08-19 finding 5).
+# Same crate/version privacy + reasoning-gateway already pull in.
+sha2 = "0.10"  # [VERIFY]
 
 [dev-dependencies]
 # Loopback fakes only: the decision #33 round-trip test (a fake sidecar host

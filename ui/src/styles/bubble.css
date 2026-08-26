@@ -95,6 +95,10 @@
   font-size: 11px;
   line-height: 1.3;
 }
+/* Fallback copy after a Resume that did not open (doc 10 §6). */
+.bubble__sublabel--fallback {
+  color: var(--health-down);
+}
 .bubble__actions {
   grid-area: actions;
   display: flex;

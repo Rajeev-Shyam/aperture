@@ -18,6 +18,15 @@
 //      bracket but don't cover; 100 ms keeps a moving rect at most one bubble
 //      edge stale.
 //  The Rust side reconciles immediately on every publish (no poll-tick wait).
+//
+//  The interval runs ONLY while the last published set is non-empty (SDLC
+//  review 2026-08-19 finding 6). With nothing interactive on screen — the
+//  common idle case — a 10 Hz querySelectorAll + getBoundingClientRect sweep in
+//  every monitor's WebView forces layout forever to learn nothing, and that
+//  per-monitor wakeup was never budgeted against doc 04 §8's <2 % idle CPU.
+//  Mount/unmount and motion still publish through the observer + event layers,
+//  which are what bring the first rect back; the interval re-arms on that
+//  publish and stops again when a measurement publishes `[]`.
 
 import { useEffect } from "react";
 
@@ -39,6 +48,8 @@ export function useHitTestRects(): void {
   useEffect(() => {
     let last = "";
     let raf = 0;
+    // The drift net, armed only while something is on screen (finding 6).
+    let interval: ReturnType<typeof setInterval> | null = null;
 
     const measure = () => {
       const dpr = window.devicePixelRatio || 1;
@@ -54,6 +65,12 @@ export function useHitTestRects(): void {
       const key = JSON.stringify(rects);
       if (key === last) return;
       last = key;
+      if (rects.length === 0) {
+        if (interval !== null) clearInterval(interval);
+        interval = null;
+      } else if (interval === null) {
+        interval = setInterval(measure, REMEASURE_MS);
+      }
       void setHitTestRects(rects).catch((e) =>
         console.error("set_hit_test_rects failed; surfaces may be unclickable", e),
       );
@@ -65,7 +82,6 @@ export function useHitTestRects(): void {
     };
 
     schedule();
-    const interval = setInterval(measure, REMEASURE_MS);
     const observer = new MutationObserver(schedule);
     observer.observe(document.body, {
       childList: true,
@@ -79,7 +95,7 @@ export function useHitTestRects(): void {
 
     return () => {
       cancelAnimationFrame(raf);
-      clearInterval(interval);
+      if (interval !== null) clearInterval(interval);
       observer.disconnect();
       MOTION_EVENTS.forEach((name) => document.removeEventListener(name, schedule));
       // Unmounting the overlay root means nothing is interactive anymore.

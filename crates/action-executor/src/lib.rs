@@ -1,26 +1,42 @@
-//! The agent's "hands" (Doc 22 §3.1) — **v2 SKELETON**.
+//! The agent's "hands" (Doc 22 §3.1) — **V2-M0: the real UIA backend**.
 //!
 //! Wraps Win32/UIA behind one seam so `agent-loop` is testable without a
-//! desktop. The UIA backend body is the **V2-M0 spike** (Doc 22 §10): its gate
-//! is "click a known element in a test app reliably", and Q-V2-01 (is fuzzy
-//! UIA label matching sufficient?) is answered by that spike, not assumed here.
+//! desktop. [`UiaExecutor`] is the backend the V2-M0 gate drives
+//! (`gates/tests/v2m0_uia_executor.rs`: a real Notepad window); Q-V2-01 (is
+//! fuzzy UIA label matching sufficient?) is answered by that gate and the
+//! pure [`grounding`] tests, not assumed here.
 //!
-//! ## Safety constraints (locked decisions, Doc 22 §11)
-//! - **UI-only action surface**: no filesystem writes, no registry, no network,
-//!   no shell. This crate deliberately has no such dependencies; adding one is
-//!   a review flag.
+//! ## Safety constraints (locked decisions, Doc 22 §11; Doc 24 §K)
+//! - **UI-only action surface, forever** (Doc 24 #52): no filesystem writes,
+//!   no registry, no network, no shell, **no process spawn** — `launch` is a
+//!   simulated Start-menu search (Win key, type, Enter). This crate has no
+//!   such dependencies and `xtask lint-emitters` denies the spawn/socket
+//!   surface here; adding one is a review flag.
 //! - **Only an active, user-initiated agent loop may act**: every call takes an
-//!   [`ExecutorTicket`], which only `agent-loop` can mint (`pub(crate)` would
-//!   not cross crates, so the ticket constructor is gated by a marker the loop
-//!   owns — see [`ExecutorTicket::for_task`]). Arbitrary crates cannot invoke
-//!   the executor with a forged loop context without visibly constructing a
-//!   ticket, which review + the gates watch for.
-//! - **Exclusions are checked before acting** (Doc 22 §4.3): the executor
-//!   receives the same shared [`ExclusionList`] handle capture uses; a match
-//!   pauses the loop (`ActionError::Excluded`) — Q-V2-03 decides whether the
-//!   loop may skip-and-continue instead.
+//!   [`ExecutorTicket`], minted only by `agent-loop` — see the lint note on
+//!   [`ExecutorTicket::for_task`] (Doc 24 F2).
+//! - **Exclusions are checked before acting** (Doc 22 §4.3, Doc 24 #49): the
+//!   executor asks its [`ExclusionProbe`] about the foreground window on every
+//!   call; a hit is `ActionError::Excluded` and the loop pauses and notifies.
+//! - **Elevated windows are refused** (Doc 24 #50): `ActionError::Elevated`;
+//!   the run-as-admin prompt is the loop's UI, not the executor's.
+//! - **The hard stop wins** (locked decision 5): a raised stop flag makes
+//!   every call `ActionError::Stopped` before anything is touched.
+//!
+//! Policy helpers the loop consults *before* dispatching live in [`risk`]
+//! (consequential-action keywords, Doc 24 #47/#51; reversibility, #54).
+
+pub mod grounding;
+pub mod keys;
+pub mod platform;
+pub mod risk;
+pub mod uia;
 
 use aperture_contracts::agent::{ActionError, AgentAction};
+
+pub use platform::{foreground_window, list_open_windows, read_document_text};
+pub use risk::{consequential_reason, reversibility, Reversibility};
+pub use uia::{close_windows, UiaExecutor};
 
 /// Proof that an action originates from a user-initiated task loop
 /// (Doc 22 §3.1 safety constraint). Carries the task id for the audit row.
@@ -31,13 +47,56 @@ pub struct ExecutorTicket {
 
 impl ExecutorTicket {
     /// Minted by `agent-loop` when a task enters RUNNING; the ticket dies with
-    /// the task. Constructing one anywhere else is a deliberate, visible act.
+    /// the task.
+    ///
+    /// **Enforcement (Doc 24 F2):** Rust has no cross-crate `pub(crate)`, so
+    /// the capability is enforced by `xtask lint-emitters` — the literal
+    /// `ExecutorTicket::for_task(` may appear only under `crates/agent-loop/src`
+    /// and this crate's own `src` (its tests); anywhere else under
+    /// `crates/*/src` or `src-tauri/src` fails CI with "executor ticket minted
+    /// outside agent-loop (Doc 24 F2)". The `gates` harness is lint-exempt by
+    /// design (it drives the executor directly, on-target).
     pub fn for_task(task_id: uuid::Uuid) -> Self {
         Self { task_id }
     }
 
     pub fn task_id(&self) -> uuid::Uuid {
         self.task_id
+    }
+}
+
+/// A top-level window as the executor sees it (`list_open_windows`,
+/// `foreground_window`, [`ActionOutcome::new_windows`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WindowInfo {
+    /// Raw `HWND` (valid only while the window lives).
+    pub hwnd: isize,
+    /// Window title (never empty for listed windows).
+    pub title: String,
+    /// Lowercased process image name (`"notepad.exe"`), when readable.
+    pub process: Option<String>,
+    /// Window class — the exclusion key capture also uses (doc 05 §4).
+    pub window_class: Option<String>,
+}
+
+/// "Is this window excluded?" — the seam over capture's `ExclusionList`
+/// (Doc 22 §4.3, Doc 24 #49). src-tauri implements it; returns the matching
+/// rule's label (what the pause notification shows), or `None`.
+pub trait ExclusionProbe: Send + Sync {
+    fn excluded_label(
+        &self,
+        process: Option<&str>,
+        window_class: Option<&str>,
+        title: Option<&str>,
+    ) -> Option<String>;
+}
+
+/// No exclusion rules at all (gates, spikes).
+pub struct NoExclusions;
+
+impl ExclusionProbe for NoExclusions {
+    fn excluded_label(&self, _: Option<&str>, _: Option<&str>, _: Option<&str>) -> Option<String> {
+        None
     }
 }
 
@@ -49,6 +108,10 @@ pub struct ActionOutcome {
     pub description: String,
     /// The UIA name of the element that ended up focused, if readable.
     pub focused_element: Option<String>,
+    /// Top-level windows that appeared during the action — the undo hook for
+    /// `launch` (Doc 24 #54: "closed an app it opened" is reversible).
+    #[serde(default)]
+    pub new_windows: Vec<WindowInfo>,
 }
 
 /// The seam `agent-loop` drives (Doc 22 §3.1). One implementor per backend:
@@ -67,46 +130,6 @@ pub trait ActionExecutor: Send + Sync {
     /// next observation. 300–800 ms is Doc 22 §2's [VERIFY] band.
     fn settle_hint(&self) -> std::time::Duration {
         std::time::Duration::from_millis(500)
-    }
-}
-
-/// The real Win32/UIA backend — **body lands with the V2-M0 spike**.
-///
-/// Everything here intentionally returns `ElementNotFound` until the spike:
-/// a skeleton that pretends to click is worse than one that says it can't.
-pub struct UiaExecutor {
-    _private: (),
-}
-
-impl UiaExecutor {
-    pub fn new() -> Self {
-        Self { _private: () }
-    }
-}
-
-impl Default for UiaExecutor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ActionExecutor for UiaExecutor {
-    fn execute(
-        &self,
-        ticket: &ExecutorTicket,
-        action: &AgentAction,
-    ) -> Result<ActionOutcome, ActionError> {
-        // V2-M0 (Doc 22 §10): UIA tree walk (fuzzy name match, Levenshtein ≤ 2
-        // [ASSUMPTION, Q-V2-01]) → bounding-rect click / SendInput type.
-        tracing::warn!(
-            task_id = %ticket.task_id(),
-            action = ?action.action_type,
-            "UiaExecutor is a V2-M0 skeleton — no action performed"
-        );
-        Err(ActionError::ElementNotFound(
-            "action-executor is a v2 skeleton: the UIA backend lands with the V2-M0 spike"
-                .to_string(),
-        ))
     }
 }
 
@@ -166,7 +189,11 @@ mod tests {
     #[test]
     fn scripted_executor_replays_outcomes_and_records_calls() {
         let exec = ScriptedExecutor::new([
-            Ok(ActionOutcome { description: "clicked Submit".into(), focused_element: None }),
+            Ok(ActionOutcome {
+                description: "clicked Submit".into(),
+                focused_element: None,
+                new_windows: Vec::new(),
+            }),
             Err(ActionError::Timeout),
         ]);
         let ticket = ExecutorTicket::for_task(uuid::Uuid::new_v4());
@@ -180,13 +207,19 @@ mod tests {
         assert_eq!(exec.calls.lock().unwrap().len(), 3);
     }
 
+    /// `new_windows` is additive on the wire (doc 15 §6): an outcome persisted
+    /// before V2-M0 still parses.
     #[test]
-    fn uia_skeleton_refuses_rather_than_pretending() {
-        let exec = UiaExecutor::new();
-        let ticket = ExecutorTicket::for_task(uuid::Uuid::new_v4());
-        assert!(matches!(
-            exec.execute(&ticket, &click("Submit")),
-            Err(ActionError::ElementNotFound(_))
-        ));
+    fn outcome_new_windows_defaults_on_the_wire() {
+        let old = serde_json::json!({ "description": "clicked", "focused_element": null });
+        let parsed: ActionOutcome = serde_json::from_value(old).expect("pre-M0 outcome parses");
+        assert!(parsed.new_windows.is_empty());
+        let back = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(back["new_windows"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn no_exclusions_never_excludes() {
+        assert_eq!(NoExclusions.excluded_label(Some("x.exe"), Some("Cls"), Some("T")), None);
     }
 }

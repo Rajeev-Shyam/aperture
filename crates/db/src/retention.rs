@@ -111,9 +111,14 @@ pub fn run_nightly_prune(db: &Db, now_ms: i64, policy: &RetentionPolicy) -> Resu
         //    decay rule, and two uncoordinated deleters on two timers could
         //    disagree. Purge-All still nukes patterns directly — that is the
         //    user's explicit action, not a retention policy.
+        //
+        //    Age = resolved, else shown, else created (SDLC review 2026-08-19,
+        //    finding 8): a row queued while snoozed has neither resolved_ts nor
+        //    shown_ts, and without the created_ts fallback it could never be
+        //    pruned — "snooze forever" made every mined suggestion immortal.
         report.suggestions_deleted = conn.execute(
-            "DELETE FROM suggestions WHERE COALESCE(resolved_ts, shown_ts, 0) < ?1 \
-               AND COALESCE(resolved_ts, shown_ts) IS NOT NULL",
+            "DELETE FROM suggestions WHERE COALESCE(resolved_ts, shown_ts, created_ts, 0) < ?1 \
+               AND COALESCE(resolved_ts, shown_ts, created_ts) IS NOT NULL",
             [sugg_floor],
         )?;
 
@@ -299,6 +304,34 @@ mod tests {
             .unwrap();
         assert_eq!(sugg_ref, None, "suggestion detached, row kept");
         assert_eq!(ev_ref, None, "event detached, row kept");
+    }
+
+    /// Review finding 8: a suggestion queued during a snooze (never shown, never
+    /// resolved) ages by `created_ts` — an old one is pruned, a fresh one is not.
+    #[test]
+    fn queued_never_shown_suggestions_age_by_created_ts() {
+        let db = Db::open_in_memory().expect("open");
+        let now = 1_700_000_000_000 + 400 * DAY_MS;
+        let old = now - 200 * DAY_MS; // past the 180 d suggestions TTL
+        let fresh = now - DAY_MS;
+        db.with_conn(|c| {
+            for ts in [old, fresh] {
+                c.execute(
+                    "INSERT INTO suggestions (source, title, state, shown_ts, resolved_ts, created_ts) \
+                     VALUES ('local', 'queued while snoozed', 'queued', NULL, NULL, ?1)",
+                    [ts],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        let report = run_nightly_prune(&db, now, &RetentionPolicy::default()).unwrap();
+        assert_eq!(report.suggestions_deleted, 1, "the old queued row is no longer immortal");
+        let survivor: i64 = db
+            .with_conn(|c| c.query_row("SELECT created_ts FROM suggestions", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(survivor, fresh, "the fresh queued row is kept");
     }
 
     #[test]

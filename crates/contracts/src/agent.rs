@@ -73,7 +73,7 @@ pub struct PixelCoords {
 }
 
 /// One action instruction inside Claude's step response (Doc 22 §5).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentAction {
     #[serde(rename = "type")]
     pub action_type: ActionType,
@@ -162,6 +162,15 @@ pub enum ActionError {
     /// and notifies rather than acting blind (Doc 22 §4.3, Q-V2-03).
     #[error("target window is excluded: {0}")]
     Excluded(String),
+    /// The hard stop was observed before the action was performed (locked
+    /// decision 5): nothing was done. V2-M0 — the executor checks the stop
+    /// flag first, every call.
+    #[error("hard stop observed before acting")]
+    Stopped,
+    /// The action is well-formed but outside the executor's UI-only surface
+    /// (an unknown key chord, a `type` with no text, …). V2-M0.
+    #[error("unsupported action: {0}")]
+    Unsupported(String),
 }
 
 /// Per-step outcome persisted in `task_steps.result` (Doc 22 §3.4).
