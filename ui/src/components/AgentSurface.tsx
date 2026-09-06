@@ -13,7 +13,7 @@
 // not spend a glass slot) and `surface-interactive` (hit-test registration is
 // implicit, see useHitTestRects).
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import {
   agentAnswer,
@@ -22,12 +22,12 @@ import {
   agentStartTask,
   agentStatus,
   agentUndoCloseWindows,
-  focusOverlay,
   onAgentTask,
   type AgentAction,
   type AgentDecision,
   type AgentTaskView,
 } from "../lib/ipc";
+import { subscribeAgentTask } from "../state/agentSubscription";
 import { useModalSurface } from "../state/useModalSurface";
 
 /** Plain-English rendering of an action Claude wants to take. */
@@ -66,22 +66,9 @@ export function AgentSurface({ composing, onCloseComposer }: Props) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    void agentStatus().then(setView).catch(() => {});
-    void onAgentTask(setView).then((u) => {
-      unlisten = u;
-    });
-    return () => unlisten?.();
-  }, []);
-
-  // The overlay window is created `focus:false`; a card that needs typing
-  // (Claude's question) must ask for OS focus or keystrokes go to the app
-  // behind — the same rule every summoned panel follows (useModalSurface).
-  const pauseKind = view?.pause?.kind ?? null;
-  useEffect(() => {
-    if (pauseKind === "clarification") void focusOverlay().catch(() => {});
-  }, [pauseKind]);
+  // Snapshot + stream, with the unmount races closed (08-22 review; the
+  // logic and its tests live in state/agentSubscription.ts).
+  useEffect(() => subscribeAgentTask(setView, { status: agentStatus, listen: onAgentTask }), []);
 
   async function decide(decision: AgentDecision) {
     if (!view) return;
@@ -113,8 +100,11 @@ export function AgentSurface({ composing, onCloseComposer }: Props) {
       {view && (
         <div className="agent__bar surface-opaque surface-interactive">
           <div className="agent__head">
+            {/* A stop pressed mid-action is acknowledged immediately (the
+                core applies it when the action returns) — never a stale
+                "running"/"acting". */}
             <span className="agent__state" data-state={view.state}>
-              {view.in_flight ? "acting" : view.state}
+              {view.stopping ? "stopping…" : view.in_flight ? "acting" : view.state}
             </span>
             <span className="agent__title" title={view.description}>
               {view.description}
@@ -237,7 +227,7 @@ function PauseCard({
       );
     case "confirm":
       return (
-        <div className="agent__card" role="alertdialog" aria-label="Confirm action">
+        <ModalCard key={p.kind} label="Confirm action">
           <p className="agent__card-lead">Claude wants to {describeAction(p.action)}</p>
           <p className="agent__muted">Paused because it {p.reason}.</p>
           <div className="agent__actions">
@@ -251,11 +241,11 @@ function PauseCard({
               Stop
             </button>
           </div>
-        </div>
+        </ModalCard>
       );
     case "clarification":
       return (
-        <div className="agent__card" role="alertdialog" aria-label="Claude has a question">
+        <ModalCard key={p.kind} label="Claude has a question">
           <p className="agent__card-lead">Claude asks:</p>
           <p className="agent__quote">{p.question}</p>
           <form
@@ -286,7 +276,7 @@ function PauseCard({
               Stop
             </button>
           </form>
-        </div>
+        </ModalCard>
       );
     case "excluded":
       return (
@@ -340,6 +330,33 @@ function PauseCard({
     default:
       return null;
   }
+}
+
+/** A pause card the user must ANSWER from the keyboard (Claude's question, the
+ *  consequential-action chip). The overlay window is created `focus:false`, so
+ *  a bare `<input autoFocus>` in the hover-only bar moved DOM focus while OS
+ *  keystrokes kept going to the app Claude was just driving (08-22 review):
+ *  `useModalSurface` asks for OS focus, moves DOM focus in unless a child's
+ *  `autoFocus` already did, cycles Tab inside, and restores focus on close.
+ *  Callers key it by pause kind so a kind switch is a fresh surface.
+ *  The other cards (approval, excluded, elevated, vram) stay click-only: they
+ *  appear while the user may be working in another app and must not take its
+ *  focus. */
+function ModalCard({ label, children }: { label: string; children: ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const onKeyDown = useModalSurface(ref, { exclusive: false });
+  return (
+    <div
+      ref={ref}
+      className="agent__card"
+      role="alertdialog"
+      aria-label={label}
+      tabIndex={-1}
+      onKeyDown={onKeyDown}
+    >
+      {children}
+    </div>
+  );
 }
 
 /** Doc 22 §9.1 — the user types a task; Claude Desktop then adopts it. */

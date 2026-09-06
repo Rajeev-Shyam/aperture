@@ -24,20 +24,34 @@ host → host pushes `{type:"toggle", capturing:false}` → the worker drops
 everything until re-enabled. Host/core absence also silences forwarding —
 nothing is ever queued.
 
-## Install (dev, unpacked)
+## Install (unpacked — the only step is yours)
 
-1. `chrome://extensions` → Developer mode → *Load unpacked* → this directory.
-   Note the extension ID.
-2. Register the host manifest (fills `path` + `allowed_origins` from the
-   template and writes the registry key):
-   `cargo run -p aperture-capture --bin aperture-nm-host -- install --extension-id <ID>`
-   (add `--browser opera` for Opera GX; repeat per browser).
-3. Start Aperture; the worker connects on the next tab event.
+The extension's ID is **pinned**: `manifest.json` carries a `key`, so an
+unpacked load on any machine gets the same ID
+(`gkfkhokbibedjcgepmaakaelhdoboomj`, `nm_bridge::EXTENSION_ID`). Aperture
+registers the native-messaging host for that ID **on every launch** (host
+manifest under `%LOCALAPPDATA%\Aperture\nm\`, HKCU keys for Chrome — which
+Opera / Opera GX / Brave read — and Edge; per-user, no admin). So:
 
-Registry keys written (HKCU, per-user, no admin):
-- Chrome: `HKCU\Software\Google\Chrome\NativeMessagingHosts\com.aperture.bridge`
-- Opera GX uses Chrome's key path on Windows (Chromium default); Edge:
-  `HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.aperture.bridge`
+1. Start Aperture once (any launch registers the host).
+2. `opera://extensions` (or `chrome://extensions`, `edge://extensions`) →
+   Developer mode → *Load unpacked* → this directory. Installed:
+   `%LOCALAPPDATA%\Aperture\extension\`; dev: the checkout's `extension/`.
+3. The worker connects on the next tab event. Dashboard → Advanced → the
+   diagnostics block shows "Browser extension: connected".
 
-`[VERIFY]` at first on-target install: both store extension IDs must appear in
-`allowed_origins` before store publication (ADR-027c).
+Manual / repair registration (dev, or a different extension ID):
+`cargo run -p aperture-capture --bin aperture-nm-host -- install [--extension-id <ID>] [--browser chrome|opera|edge]`
+— the same `nm_bridge::install_host_manifest` call the app makes.
+
+Why this matters: Opera exposes no UI Automation tree (verified on-target
+2026-09-06), so the address-bar fallback can never read it — the extension is
+the only URL source for Opera, and without URLs there are no "resume this
+page" bubbles.
+
+Regenerating the key (only if it leaks): `openssl genrsa 2048 | openssl rsa
+-pubout -outform DER`, base64 → `key`; ID = first 16 bytes of SHA-256(DER) as
+hex with `0-9a-f` → `a-p`; update `EXTENSION_ID` in the same change.
+
+`[VERIFY]` at store publication: the store-assigned IDs must be added to
+`allowed_origins` (ADR-027c).

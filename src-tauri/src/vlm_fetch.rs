@@ -17,10 +17,10 @@ use std::sync::atomic::AtomicBool;
 
 use aperture_orchestration::model_fetch::FetchItem;
 
-/// The weight file names `SidecarConfig` spawns with (doc 04 §3 L1). The
-/// download destination and the spawn path must agree on these by construction.
-pub const VLM_MODEL_FILE: &str = "qwen2.5-vl-3b-q4_k_m.gguf";
-pub const VLM_MMPROJ_FILE: &str = "qwen2.5-vl-3b-mmproj-f16.gguf";
+// The weight file names `SidecarConfig` spawns with (doc 04 §3 L1) are
+// `aperture_orchestration::model_lifecycle::{VLM_MODEL_FILE, VLM_MMPROJ_FILE}`
+// — defined once, beside the resolver (2026-09-05), so the download
+// destination and the spawn path agree by construction.
 
 // Fallback download spec, mirroring `config/settings.default.json`'s
 // `loadout.vlm_download` byte-for-byte. Needed because the settings seed runs
@@ -99,12 +99,28 @@ fn item(
     default_sha256: &str,
     dest: &Path,
 ) -> FetchItem {
-    let url = section
+    let stored = section
         .and_then(|s| s.get("url"))
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(default_url)
-        .to_string();
+        .filter(|s| !s.is_empty());
+    let url = match stored {
+        // A DB seeded between 2026-08-16 and 08-22 carries the then-default
+        // moving `resolve/main` URL for the SAME file, and the 08-19 additive
+        // backfill later paired it with the pinned sha256. The moment
+        // upstream re-uploads that file, the pair loops on HashMismatch
+        // forever (08-22 review) — so the legacy default is treated as the
+        // default it was, and the pinned revision is fetched instead.
+        Some(s) if is_legacy_default(s, default_url) => {
+            tracing::info!(
+                stored = s,
+                pinned = default_url,
+                "vlm_fetch: legacy resolve/main default replaced by the pinned revision"
+            );
+            default_url.to_string()
+        }
+        Some(s) => s.to_string(),
+        None => default_url.to_string(),
+    };
     let expected_bytes = section
         .and_then(|s| s.get("bytes"))
         .and_then(serde_json::Value::as_u64)
@@ -126,6 +142,17 @@ fn item(
     }
 }
 
+/// Is `stored` the pre-pinning default for the SAME artifact as `default_url`
+/// — identical repo prefix and file name, `main` where the default carries a
+/// revision hash? Anything else (a mirror, another repo, another file) is the
+/// user's own choice and is left alone.
+fn is_legacy_default(stored: &str, default_url: &str) -> bool {
+    let Some((repo, rest)) = default_url.split_once("/resolve/") else { return false };
+    let Some((_rev, file)) = rest.split_once('/') else { return false };
+    let Some((s_repo, s_rest)) = stored.split_once("/resolve/") else { return false };
+    s_repo == repo && s_rest == format!("main/{file}")
+}
+
 /// The `loadout` settings section (missing/unparseable ⇒ `{}` — the defaults
 /// above take over, same contract as `main::read_settings_section`).
 pub(crate) fn loadout_section(db: &aperture_db::Db) -> serde_json::Value {
@@ -139,6 +166,7 @@ pub(crate) fn loadout_section(db: &aperture_db::Db) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aperture_orchestration::model_lifecycle::{VLM_MMPROJ_FILE, VLM_MODEL_FILE};
 
     fn state() -> VlmFetchState {
         VlmFetchState::new(
@@ -222,6 +250,43 @@ mod tests {
         assert_eq!(spec[1].expected_bytes, DEFAULT_MMPROJ_BYTES, "negative size ignored");
         assert_eq!(spec[1].sha256, None,
             "a custom url with no sha256 key is size-only — the default digest is not its digest");
+    }
+
+    /// 08-22 review [low]: a DB seeded with the pre-pinning `resolve/main`
+    /// URL and later backfilled with the pinned sha256 must fetch the pinned
+    /// revision — never loop on HashMismatch after an upstream re-upload.
+    /// Another repo's `main`, or another file in the same repo, is the user's
+    /// own choice and stays untouched.
+    #[test]
+    fn legacy_resolve_main_default_is_replaced_by_the_pinned_revision() {
+        let legacy_model = DEFAULT_MODEL_URL
+            .replace("/resolve/5037fcf163dd95d1e41d1974465f0898ed108ca2/", "/resolve/main/");
+        assert!(legacy_model.contains("/resolve/main/"), "test premise: {legacy_model}");
+        let other_repo = "https://huggingface.co/other-org/Other-GGUF/resolve/main/mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf";
+        let loadout = serde_json::json!({
+            "vlm_download": {
+                "model": { "url": legacy_model, "sha256": DEFAULT_MODEL_SHA256 },
+                "mmproj": { "url": other_repo }
+            }
+        });
+        let spec = spec_from_settings(&loadout, &state());
+        assert_eq!(spec[0].url, DEFAULT_MODEL_URL, "legacy default → the pinned revision");
+        assert_eq!(spec[0].sha256.as_deref(), Some(DEFAULT_MODEL_SHA256), "the pairing rule is unchanged");
+        assert_eq!(spec[1].url, other_repo, "another repo's main is the user's own choice");
+        assert_eq!(spec[1].sha256, None, "…and carries no default digest");
+
+        // The legacy default with NO sha key is still the default file, so the
+        // pinned digest applies to it exactly as to the pinned URL.
+        let loadout = serde_json::json!({ "vlm_download": { "model": { "url": legacy_model } } });
+        let spec = spec_from_settings(&loadout, &state());
+        assert_eq!(spec[0].url, DEFAULT_MODEL_URL);
+        assert_eq!(spec[0].sha256.as_deref(), Some(DEFAULT_MODEL_SHA256));
+
+        let same_repo_other_file =
+            "https://huggingface.co/ggml-org/Qwen2.5-VL-3B-Instruct-GGUF/resolve/main/some-other-file.gguf";
+        assert!(!is_legacy_default(same_repo_other_file, DEFAULT_MODEL_URL), "same repo, different file");
+        assert!(!is_legacy_default(DEFAULT_MODEL_URL, DEFAULT_MODEL_URL), "the pinned URL is not legacy");
+        assert!(!is_legacy_default("https://mirror.example/model.gguf", DEFAULT_MODEL_URL), "no /resolve/ at all");
     }
 
     /// `sha256: ""` is the explicit opt-out (a custom mirror of a different

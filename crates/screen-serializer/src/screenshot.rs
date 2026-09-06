@@ -39,6 +39,12 @@ pub enum ScreenshotError {
     Ocr(String),
     #[error("image: {0}")]
     Image(String),
+    /// A text rule hit a line whose word geometry is missing or incomplete,
+    /// so the pixels it covers could not be painted with certainty — the
+    /// frame is withheld and the step goes text-only (fail closed, 08-22
+    /// review).
+    #[error("redaction: {0}")]
+    Redaction(String),
 }
 
 /// A redacted payload screenshot, ready to base64 (Doc 22 §3.2).
@@ -78,10 +84,16 @@ pub fn observe_frame(
         .map_err(|e| ScreenshotError::Ocr(e.to_string()))?;
 
     // 2. Paint over every word a text rule covers — same coordinate space.
+    //    The quality-DROPPED lines go through the gate too (08-22 review):
+    //    their text never reaches `ocr.text`, but their pixels are still in
+    //    the frame. Each line carries its own text so the gate can tell
+    //    whether its geometry is complete.
     let lines: Vec<LineBoxes> = ocr
         .lines
         .iter()
+        .chain(ocr.dropped_lines.iter())
         .map(|l| LineBoxes {
+            text: l.text.clone(),
             words: l
                 .words
                 .iter()
@@ -90,6 +102,14 @@ pub fn observe_frame(
         })
         .collect();
     let image_redaction = redact_bgra(&mut ocr_scale, ow, oh, &lines, redactor);
+    if image_redaction.lines_unpaintable > 0 {
+        // Fail closed: a rule hit text with no (complete) box under it — the
+        // text path redacts it, the pixels might still show it. No frame.
+        return Err(ScreenshotError::Redaction(format!(
+            "{} line(s) a rule hit have missing or incomplete word geometry — frame withheld",
+            image_redaction.lines_unpaintable
+        )));
+    }
     let (ocr_text, _) = redactor.redact_text(&ocr.text);
 
     // 3. Shrink to the payload edge and encode.
@@ -138,12 +158,13 @@ mod tests {
     use aperture_vision_ocr::ocr_engine::{OcrLine, OcrWord};
     use aperture_vision_ocr::VisionError;
 
-    /// A fake engine that "reads" a fixed set of words with boxes.
-    struct FixedOcr(Vec<OcrLine>);
+    /// A fake engine that "reads" a fixed set of words with boxes (`.0`), plus
+    /// the lines a quality filter would have dropped, geometry intact (`.1`).
+    struct FixedOcr(Vec<OcrLine>, Vec<OcrLine>);
     impl OcrEngine for FixedOcr {
         fn process_frame(&self, _: &[u8], _: u32, _: u32) -> Result<OcrOutput, VisionError> {
             let text = self.0.iter().map(|l| l.text.clone()).collect::<Vec<_>>().join("\n");
-            Ok(OcrOutput { text, mean_confidence: 0.9, lines: self.0.clone() })
+            Ok(OcrOutput { text, mean_confidence: 0.9, lines: self.0.clone(), dropped_lines: self.1.clone() })
         }
         fn engine_id(&self) -> &'static str {
             "fixed"
@@ -161,10 +182,13 @@ mod tests {
     #[test]
     fn secret_words_are_blocked_before_the_jpeg_exists_and_text_is_redacted() {
         let secret = "sk-abcdefghijklmnop1234";
-        let engine = FixedOcr(vec![OcrLine {
-            text: format!("token {secret} ok"),
-            words: vec![word("token", 0), word(secret, 40), word("ok", 80)],
-        }]);
+        let engine = FixedOcr(
+            vec![OcrLine {
+                text: format!("token {secret} ok"),
+                words: vec![word("token", 0), word(secret, 40), word("ok", 80)],
+            }],
+            vec![],
+        );
         let redactor = Redactor::new(&[]).unwrap();
         let out = observe_frame(&white_frame(128, 32), 128, 32, &engine, &redactor).unwrap();
         assert_eq!(out.image_redaction.boxes_painted, 1, "exactly the secret's box");
@@ -174,9 +198,57 @@ mod tests {
         assert_eq!((out.screenshot.width, out.screenshot.height), (128, 32));
     }
 
+    /// 08-22 review [low]: the engine gave a line's text but no word boxes
+    /// (`Words()` failed) and a rule hits it — nothing can be painted with
+    /// certainty, so the frame is withheld and the caller degrades to a
+    /// text-only observation.
+    #[test]
+    fn a_hit_line_without_geometry_withholds_the_frame() {
+        let engine = FixedOcr(
+            vec![OcrLine { text: "token sk-abcdefghijklmnop1234 ok".into(), words: vec![] }],
+            vec![],
+        );
+        let redactor = Redactor::new(&[]).unwrap();
+        let err = observe_frame(&white_frame(128, 32), 128, 32, &engine, &redactor).unwrap_err();
+        assert!(matches!(err, ScreenshotError::Redaction(_)), "{err}");
+    }
+
+    /// …but a geometry-less line NO rule hits costs nothing: the frame ships.
+    #[test]
+    fn a_clean_line_without_geometry_still_ships() {
+        let engine = FixedOcr(vec![OcrLine { text: "hello world".into(), words: vec![] }], vec![]);
+        let redactor = Redactor::new(&[]).unwrap();
+        let out = observe_frame(&white_frame(128, 32), 128, 32, &engine, &redactor).unwrap();
+        assert_eq!(out.image_redaction.lines_unpaintable, 0);
+        assert_eq!(out.ocr_text, "hello world");
+    }
+
+    /// 08-22 review [low]: a quality-DROPPED line never reaches the text, but
+    /// its pixels are in the frame — the gate paints it all the same, and the
+    /// black block survives into the JPEG.
+    #[test]
+    fn quality_dropped_lines_are_painted_but_never_in_the_text() {
+        let secret = "sk-abcdefghijklmnop1234";
+        let engine = FixedOcr(
+            vec![OcrLine { text: "hello".into(), words: vec![word("hello", 0)] }],
+            vec![OcrLine { text: format!("¦¦ {secret}"), words: vec![word("¦¦", 0), word(secret, 40)] }],
+        );
+        let redactor = Redactor::new(&[]).unwrap();
+        let out = observe_frame(&white_frame(128, 32), 128, 32, &engine, &redactor).unwrap();
+        assert_eq!(out.image_redaction.boxes_painted, 1, "the dropped line's secret box");
+        assert_eq!(out.image_redaction.lines_unpaintable, 0);
+        assert_eq!(out.ocr_text, "hello", "dropped text stays out of the text path");
+        // No downscale at 128×32, so the box (x 40..70, y 4..14) maps 1:1.
+        let img = image::load_from_memory(&out.screenshot.jpeg).unwrap().to_rgb8();
+        let inside = img.get_pixel(55, 9);
+        assert!(inside[0] < 48 && inside[1] < 48 && inside[2] < 48, "painted black in the JPEG: {inside:?}");
+        let outside = img.get_pixel(10, 24);
+        assert!(outside[0] > 200 && outside[1] > 200 && outside[2] > 200, "untouched pixel stays white: {outside:?}");
+    }
+
     #[test]
     fn payload_edge_is_768_and_never_upscales() {
-        let engine = FixedOcr(vec![]);
+        let engine = FixedOcr(vec![], vec![]);
         let redactor = Redactor::new(&[]).unwrap();
         let out = observe_frame(&white_frame(1920, 1080), 1920, 1080, &engine, &redactor).unwrap();
         assert_eq!(out.screenshot.width, 768);

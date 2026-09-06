@@ -16,7 +16,8 @@
 //! queued** — user data does not accumulate outside the encrypted store.
 //!
 //! `install` subcommand: writes the host manifest JSON and the per-browser
-//! HKCU registry key (no admin needed). See `extension/README.md`.
+//! HKCU registry key (no admin needed) through `nm_bridge::install_host_manifest`
+//! — the same call the app makes on every launch. See `extension/README.md`.
 
 #[cfg(windows)]
 mod host {
@@ -162,13 +163,16 @@ mod host {
         }
     }
 
-    /// `install --extension-id <ID> [--browser chrome|edge] [--extension-id <ID2> ...]`
-    /// Writes the host manifest + the per-browser HKCU registry key. Chrome and
-    /// Opera GX both read Chrome's registry location on Windows; Edge has its
-    /// own hive. [VERIFY on-target: Opera GX manifest discovery.]
+    /// `install [--extension-id <ID>]... [--browser chrome|opera|edge]`
+    /// Writes the host manifest + the per-browser HKCU registry key through the
+    /// library (`nm_bridge::install_host_manifest`, 2026-09-06 — the app runs the
+    /// same call on every launch, so this subcommand is for dev / repair). With
+    /// no `--extension-id` the pinned [`aperture_capture::nm_bridge::EXTENSION_ID`]
+    /// is used; Chrome and Opera share Chrome's hive, Edge has its own.
     pub fn install(args: &[String]) -> Result<(), String> {
+        use aperture_capture::nm_bridge::{install_host_manifest, BrowserHive, EXTENSION_ID};
         let mut extension_ids = Vec::new();
-        let mut browser = "chrome".to_string();
+        let mut hive = BrowserHive::Chrome;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
@@ -182,110 +186,24 @@ mod host {
                 }
                 "--browser" => {
                     i += 1;
-                    browser = args.get(i).ok_or("--browser needs a value")?.clone();
+                    let name = args.get(i).ok_or("--browser needs a value")?;
+                    hive = BrowserHive::parse(name)
+                        .ok_or_else(|| format!("unsupported browser: {name}"))?;
                 }
                 other => return Err(format!("unknown arg: {other}")),
             }
             i += 1;
         }
         if extension_ids.is_empty() {
-            return Err("at least one --extension-id is required".into());
+            extension_ids.push(EXTENSION_ID.to_string());
         }
-
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let manifest_dir = std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .ok_or("LOCALAPPDATA unset")?
-            .join("Aperture")
-            .join("nm");
-        std::fs::create_dir_all(&manifest_dir).map_err(|e| e.to_string())?;
-        let manifest_path = manifest_dir.join(format!("{HOST_NAME}.json"));
-
-        // Merge origins with any existing manifest (multi-browser installs).
-        let mut origins: Vec<String> = std::fs::read_to_string(&manifest_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|v| {
-                v.get("allowed_origins").and_then(|a| {
-                    a.as_array().map(|arr| {
-                        arr.iter()
-                            .filter_map(|o| o.as_str().map(str::to_string))
-                            .collect()
-                    })
-                })
-            })
-            .unwrap_or_default();
-        for id in &extension_ids {
-            let origin = format!("chrome-extension://{id}/");
-            if !origins.contains(&origin) {
-                origins.push(origin);
-            }
-        }
-
-        let manifest = serde_json::json!({
-            "name": HOST_NAME,
-            "description": "Aperture native-messaging host (ADR-028): stdio bridge between the Capture Bridge extension and the local Aperture core. No sockets.",
-            "path": exe.display().to_string(),
-            "type": "stdio",
-            "allowed_origins": origins,
-        });
-        std::fs::write(
-            &manifest_path,
-            serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-
-        let key_path = match browser.as_str() {
-            // Chromium browsers (Chrome, Opera/Opera GX) read Chrome's hive.
-            "chrome" | "opera" => format!(r"Software\Google\Chrome\NativeMessagingHosts\{HOST_NAME}"),
-            "edge" => format!(r"Software\Microsoft\Edge\NativeMessagingHosts\{HOST_NAME}"),
-            other => return Err(format!("unsupported browser: {other}")),
-        };
-        write_hkcu_default_value(&key_path, &manifest_path.display().to_string())?;
+        let manifest_path = install_host_manifest(&exe, &extension_ids, &[hive])?;
         println!(
-            "installed: manifest {} + HKCU\\{key_path}",
-            manifest_path.display()
+            "installed: manifest {} + HKCU\\{}",
+            manifest_path.display(),
+            hive.registry_key()
         );
-        Ok(())
-    }
-
-    /// `HKCU\<key_path>` default value = `value` (REG_SZ). Per-user, no admin.
-    fn write_hkcu_default_value(key_path: &str, value: &str) -> Result<(), String> {
-        use windows::core::PCWSTR;
-        use windows::Win32::System::Registry::{
-            RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
-            KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ,
-        };
-
-        let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
-        let key_w = wide(key_path);
-        let value_w = wide(value);
-        let value_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(value_w.as_ptr().cast::<u8>(), value_w.len() * 2)
-        };
-
-        unsafe {
-            let mut hkey = HKEY::default();
-            let rc = RegCreateKeyExW(
-                HKEY_CURRENT_USER,
-                PCWSTR(key_w.as_ptr()),
-                0,
-                PCWSTR::null(),
-                REG_OPTION_NON_VOLATILE,
-                KEY_WRITE,
-                None,
-                &mut hkey,
-                None,
-            );
-            if rc.is_err() {
-                return Err(format!("RegCreateKeyExW failed: {rc:?}"));
-            }
-            let rc = RegSetValueExW(hkey, PCWSTR::null(), 0, REG_SZ, Some(value_bytes));
-            let _ = RegCloseKey(hkey);
-            if rc.is_err() {
-                return Err(format!("RegSetValueExW failed: {rc:?}"));
-            }
-        }
         Ok(())
     }
 }

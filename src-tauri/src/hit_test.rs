@@ -136,7 +136,18 @@ impl HitTestState {
     }
 
     /// One poller tick: for every tracked window, decide `interactive` from
-    /// (modal || cursor-in-rect) and apply it only on change.
+    /// (modal || cursor-in-rect) and **re-assert** the window style every tick.
+    ///
+    /// Re-asserting (rather than applying only on a cached transition, as this
+    /// did until 2026-09-06) is what makes the click-through invariant
+    /// self-healing: the style bits are set with raw `SetWindowLongPtrW` and
+    /// tao — which rewrites `GWL_EXSTYLE` wholesale from its own flag model on
+    /// any window-flag change — does not know about them, so a cache-trusting
+    /// poller could leave a whole monitor swallowing clicks until the next
+    /// hover transition. The cost is one `GetWindowLongPtrW` per window per
+    /// tick; the write only happens when the live style actually differs. The
+    /// cache still gates the one side effect that must NOT repeat: a modal's
+    /// focus grab (`set_interactive`) fires on its transition only.
     pub fn reconcile(&self, app: &tauri::AppHandle) {
         use tauri::Manager;
         let cursor = cursor_pos();
@@ -155,19 +166,22 @@ impl HitTestState {
                     _ => false,
                 };
             let target = Applied { interactive, modal: want_modal && interactive };
-            if hit.applied == Some(target) {
-                continue;
-            }
+            let transition = hit.applied != Some(target);
             // Modal surfaces also need focus (the window is created focus:false);
             // hover interactivity must NOT steal focus from the user's work.
-            let result = if target.modal {
+            let result = if target.modal && transition {
                 overlay::set_interactive(&window, true)
             } else {
                 overlay::set_transparent(&window, !target.interactive)
             };
             match result {
                 Ok(()) => hit.applied = Some(target),
-                Err(e) => tracing::error!(%e, label, "hit-test style flip failed"),
+                // Log on the transition only — a hwnd that cannot be styled
+                // would otherwise spam at 60 Hz.
+                Err(e) if transition => {
+                    tracing::error!(%e, label, "hit-test style flip failed")
+                }
+                Err(_) => {}
             }
         }
     }

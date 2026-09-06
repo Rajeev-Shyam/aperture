@@ -38,7 +38,7 @@ use crate::normalizer::Token;
 use crate::scorer::PatternStats;
 use crate::sessionizer::Sessionizer;
 use crate::temporal::TemporalHistogram;
-use crate::trigger::{TriggerGate, TriggerInput};
+use crate::trigger::{GateStats, TriggerGate, TriggerInput};
 
 /// A user reaction routed back into the feedback loop (doc 08 §7).
 ///
@@ -167,6 +167,36 @@ pub struct PatternEngine {
     /// `None` when that event was not sessionized (capture off / not minable).
     /// The shell stamps it back onto the durable events row (doc 03 §3).
     last_session: Option<i64>,
+    /// Every gate decision since startup, for the Dashboard diagnostics block
+    /// (doc 11 §6; 2026-09-06). Read through [`Self::snapshot`].
+    stats: GateStats,
+}
+
+/// A read-only view of the engine for the Dashboard's "why am I not seeing
+/// bubbles?" block (doc 11 §6 diagnostics, 2026-09-06). Counts, thresholds and
+/// coarse class-token signatures only — nothing here is a title, URL or path.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EngineSnapshot {
+    pub capture_on: bool,
+    pub tau_conf: f64,
+    pub support_floor: f64,
+    pub cap_per_hour: u32,
+    /// Rows in the in-memory pattern cache.
+    pub patterns_cached: usize,
+    /// Rows whose decayed support clears the rule-2 floor right now.
+    pub patterns_at_floor: usize,
+    pub current_session: Option<i64>,
+    pub gate: GateStats,
+    /// `gate.rejected` laid out for display, in rule order.
+    pub rejected_by_reason: Vec<RejectRow>,
+}
+
+/// One row of [`EngineSnapshot::rejected_by_reason`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RejectRow {
+    pub label: &'static str,
+    pub hint: &'static str,
+    pub count: u64,
 }
 
 impl PatternEngine {
@@ -192,6 +222,37 @@ impl PatternEngine {
             last_process: HashMap::new(),
             next_local_id: -1,
             last_session: None,
+            stats: GateStats::default(),
+        }
+    }
+
+    /// The diagnostics view (doc 11 §6, 2026-09-06). `now_ms` re-bases the
+    /// cached supports so "patterns at the floor" is what the gate would see.
+    pub fn snapshot(&self, now_ms: i64) -> EngineSnapshot {
+        let floor = self.gate.support_floor();
+        let half_life = self.config.half_life_sequence_days;
+        let patterns_at_floor = self
+            .patterns
+            .values()
+            .filter(|row| {
+                row.stats.decayed_to(now_ms, half_life).weighted_support + 0.01 >= floor
+            })
+            .count();
+        EngineSnapshot {
+            capture_on: self.capture_on,
+            tau_conf: self.gate.tau_conf(),
+            support_floor: floor,
+            cap_per_hour: self.gate.cap_per_hour(),
+            patterns_cached: self.patterns.len(),
+            patterns_at_floor,
+            current_session: self.sessionizer.current(),
+            gate: self.stats.clone(),
+            rejected_by_reason: self
+                .stats
+                .rejected_by_reason()
+                .into_iter()
+                .map(|(label, hint, count)| RejectRow { label, hint, count })
+                .collect(),
         }
     }
 
@@ -422,7 +483,9 @@ impl PatternEngine {
                     now_ms: ctx.now_ms,
                 };
 
-                if self.gate.admit(&input, self.capture_on).is_ok() {
+                let outcome = self.gate.admit(&input, self.capture_on);
+                self.stats.record(&sig, score, ctx.now_ms, outcome);
+                if outcome.is_ok() {
                     let connector_id = match app_target {
                         // "Switch to X": the sentinel ref the shell resolves to
                         // an app-focus dispatch (Path B analog, decision #15).
@@ -536,7 +599,9 @@ impl PatternEngine {
                 consequent_last_focused_ms: self.last_focused.get(&res).copied(),
                 now_ms: ctx.now_ms,
             };
-            if self.gate.admit(&input, self.capture_on).is_ok() {
+            let outcome = self.gate.admit(&input, self.capture_on);
+            self.stats.record(&sig, score, ctx.now_ms, outcome);
+            if outcome.is_ok() {
                 let state = state.expect("rule 3 held");
                 out.push(SuggestionCandidate {
                     action_template: action_template_for(&consequent),
@@ -659,6 +724,17 @@ impl PatternEngine {
                 skipped.push(p.signature);
                 continue;
             };
+            // A row whose tokens the normalizer no longer mints (a `close`
+            // token, 2026-09-06) can never be credited, matched or fed back
+            // again — returning it lets the shell delete it (decision #18's
+            // sole-deleter path) instead of hydrating dead weight forever.
+            let minable = ngram::signature_tokens(&p.signature)
+                .is_some_and(|tokens| tokens.iter().all(normalizer::is_minable));
+            if !minable {
+                tracing::debug!(signature = %p.signature, "dropping persisted pattern with unminable tokens");
+                skipped.push(p.signature);
+                continue;
+            }
             let weighted_support = p.support as f64;
             // confidence = weighted_support / antecedent_total (capped at 1.0), so
             // antecedent_total = weighted_support / confidence (>= weighted_support).
@@ -762,7 +838,9 @@ mod tests {
             r#type: EventType::WindowFocus,
             app: None,
             process: Some(process.into()),
-            window_title: None,
+            // A real window carries a title; the nameless are shell transients
+            // the normalizer drops (2026-09-06).
+            window_title: Some(format!("{process} window")),
             payload: serde_json::json!({}),
             connector_id: None,
             session_id: None,
@@ -819,6 +897,20 @@ mod tests {
         assert_eq!(c.connector_id, "conn-yt");
         assert!(c.action_template.contains("{position}"), "youtube template");
         assert!(c.confidence >= config::TAU_CONF);
+
+        // 2026-09-06 diagnostics: the admit is on the record, with the
+        // thresholds the gate actually used and the cache size.
+        let snap = engine.snapshot(ts);
+        assert!(snap.capture_on);
+        assert_eq!(snap.gate.admitted, 1);
+        assert!(snap.gate.evaluated >= 1);
+        assert_eq!(
+            snap.gate.last_admitted.as_ref().map(|d| d.signature.as_str()),
+            Some("ide:focus:∅ ⇒ browser:navigation:youtube")
+        );
+        assert!((snap.tau_conf - config::TAU_CONF).abs() < 1e-12);
+        assert!(snap.patterns_cached >= 1 && snap.patterns_at_floor >= 1);
+        assert_eq!(snap.rejected_by_reason.len(), 7);
     }
 
     #[test]
@@ -1156,6 +1248,42 @@ mod tests {
         assert!(
             (decay - 0.288).abs() < 1e-9,
             "re-mining a hydrated signature keeps its decay (CONN-M2), got {decay}"
+        );
+    }
+
+    /// 2026-09-06: rows learned under the old vocabulary (`close` tokens) are
+    /// returned for deletion by the hydrate — never cached, never matched —
+    /// while a row of minable tokens hydrates as before.
+    #[test]
+    fn hydrate_returns_rows_with_unminable_tokens_for_deletion() {
+        let mut engine = PatternEngine::new();
+        let row = |id: i64, sig: &str| PersistedPattern {
+            pattern_id: id,
+            signature: sig.to_string(),
+            support: 300,
+            confidence: 0.9,
+            last_seen: 0,
+            dismiss_decay: 1.0,
+            muted_until: None,
+            recent_dismissals: vec![],
+        };
+        let skipped = engine.hydrate([
+            row(1, "shell:close:∅ ⇒ terminal:close:∅"),
+            row(2, "browser:focus:∅ | browser:open:∅ ⇒ browser:close:∅"),
+            row(3, "ide:focus:∅ ⇒ browser:navigation:youtube"),
+            row(4, "not a signature"),
+        ]);
+        assert_eq!(skipped.len(), 3, "two close rows + one unparseable: {skipped:?}");
+        assert!(skipped.iter().any(|s| s.starts_with("shell:close")));
+        assert!(skipped.iter().any(|s| s.ends_with("browser:close:∅")));
+        assert!(skipped.iter().any(|s| s == "not a signature"));
+        assert!(
+            engine.patterns.contains_key("ide:focus:∅ ⇒ browser:navigation:youtube"),
+            "the minable row hydrated"
+        );
+        assert!(
+            !engine.patterns.keys().any(|k| k.contains(":close:")),
+            "no close row reached the cache"
         );
     }
 }

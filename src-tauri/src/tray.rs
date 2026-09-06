@@ -37,6 +37,18 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         commands::autostart_enabled(app),
         None::<&str>,
     )?;
+    // 2026-09-06: the way back after the HUD orb's hide button — once the HUD
+    // is hidden the overlay has no chrome of its own. Checked = visible. Seeded
+    // from the stored `ui.hud_hidden`; the settings_changed listener below
+    // keeps it truthful whichever side (orb or tray) flips the key.
+    let show_hud = CheckMenuItem::with_id(
+        app,
+        "show_hud",
+        "Show overlay controls",
+        true,
+        !commands::ui_flag(&app.state::<AppState>().db, "hud_hidden"),
+        None::<&str>,
+    )?;
     // v2 (Doc 22 §3.3, locked decision 5): the hard stop must reach the loop
     // even if the overlay is wedged — the tray runs on its own thread. Always
     // enabled: a stop with no task is a harmless no-op, and a greyed item
@@ -48,6 +60,7 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         &[
             &dashboard,
             &capture,
+            &show_hud,
             &PredefinedMenuItem::separator(app)?,
             &stop_agent,
             &PredefinedMenuItem::separator(app)?,
@@ -66,10 +79,32 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
     }
 
     let capture_for_menu = capture.clone();
+    let show_hud_for_menu = show_hud.clone();
     let tray = builder
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "dashboard" => {
                 let _ = events::emit_dashboard_open(app);
+            }
+            "show_hud" => {
+                // The check item flipped itself; is_checked() is what the user
+                // now WANTS (checked = visible). Persist the inverse flag and
+                // announce it — the overlay's Hud re-reads `ui` on the
+                // broadcast and mounts / unmounts the orb.
+                let want_visible = show_hud_for_menu.is_checked().unwrap_or(true);
+                let state = app.state::<AppState>();
+                match commands::persist_ui_key(
+                    &state.db,
+                    "hud_hidden",
+                    serde_json::Value::Bool(!want_visible),
+                ) {
+                    Ok(()) => {
+                        let _ = events::emit_settings_changed(app, vec!["ui".into()]);
+                    }
+                    Err(e) => {
+                        tracing::error!(%e, "tray show-overlay-controls toggle failed");
+                        let _ = show_hud_for_menu.set_checked(!want_visible);
+                    }
+                }
             }
             "capture" => {
                 // The check item flipped itself on click; is_checked() is the
@@ -169,6 +204,20 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
             }
         })
         .build(app)?;
+
+    // Mirror the stored `ui.hud_hidden` onto the "Show overlay controls"
+    // checkmark on every `ui` write — the orb's hide button lands here, so the
+    // tray can never disagree with what the overlay shows.
+    let app_for_hud = app.clone();
+    app.listen_any(events::SETTINGS_CHANGED, move |event| {
+        let Ok(p) = serde_json::from_str::<events::SettingsChangedPayload>(event.payload()) else {
+            return;
+        };
+        if p.sections.iter().any(|s| s == "ui") {
+            let hidden = commands::ui_flag(&app_for_hud.state::<AppState>().db, "hud_hidden");
+            let _ = show_hud.set_checked(!hidden);
+        }
+    });
 
     // Mirror the observed capture state onto the checkmark + tooltip.
     app.listen_any(events::CAPTURE_INDICATOR, move |event| {

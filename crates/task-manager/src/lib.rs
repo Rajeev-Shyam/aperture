@@ -54,6 +54,9 @@ pub struct StepRecord {
     pub timestamp: i64,
 }
 
+/// The outcome stamped on rows [`TaskManager::reconcile_interrupted`] ends.
+pub const INTERRUPTED_SUMMARY: &str = "interrupted: Aperture restarted";
+
 /// Is `from -> to` a legal Doc 22 §3.3 transition?
 /// `IDLE → RUNNING → (PAUSED | COMPLETE | FAILED | CANCELLED)`, `PAUSED`
 /// resumes to `RUNNING` or terminates; terminal states never move again.
@@ -163,6 +166,41 @@ impl TaskManager {
             })
             .map_err(|e| TaskError::Db(e.to_string()))?;
         self.get_task(id)
+    }
+
+    /// Startup reconciliation (08-22 review): rows a previous process left
+    /// non-terminal (a crash or quit mid-task) can never resume — the driver
+    /// died with that process — so they are ended here, through the same
+    /// legality gate as every other transition: `Idle` (never started) →
+    /// `Cancelled`, `Running` / `Paused` → `Failed`, each stamped
+    /// [`INTERRUPTED_SUMMARY`]. Step rows are never touched (locked decision
+    /// 6: the audit trail is what the row preserves). Returns how many rows
+    /// were reconciled; a second pass finds nothing.
+    pub fn reconcile_interrupted(&self, now_ms: i64) -> Result<usize, TaskError> {
+        let live: Vec<(uuid::Uuid, TaskState)> = self
+            .db
+            .with_conn(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT id, status FROM tasks WHERE status IN ('idle', 'running', 'paused')",
+                )?;
+                let rows = stmt.query_map([], |r| {
+                    let id: String = r.get(0)?;
+                    let status: String = r.get(1)?;
+                    Ok((uuid::Uuid::parse_str(&id).unwrap_or_default(), parse_state(&status)))
+                })?;
+                rows.collect()
+            })
+            .map_err(|e| TaskError::Db(e.to_string()))?;
+        let mut reconciled = 0;
+        for (id, from) in live {
+            let to = match from {
+                TaskState::Idle => TaskState::Cancelled,
+                _ => TaskState::Failed,
+            };
+            self.transition(id, to, now_ms, Some(INTERRUPTED_SUMMARY))?;
+            reconciled += 1;
+        }
+        Ok(reconciled)
     }
 
     /// Append one step's audit row and bump the task's `step_count` — one
@@ -385,6 +423,52 @@ mod tests {
         let all = m.list_tasks(10).unwrap();
         assert_eq!(all.iter().map(|t| t.description.as_str()).collect::<Vec<_>>(), ["c", "b", "a"]);
         assert_eq!(m.list_tasks(2).unwrap().len(), 2);
+    }
+
+    /// 08-22 review: a crash/quit leaves idle/running/paused rows behind; on
+    /// the next launch every one of them is ended through the legal path,
+    /// terminal rows are untouched, and step rows survive (locked decision 6).
+    #[test]
+    fn reconcile_interrupted_ends_non_terminal_rows_and_keeps_steps() {
+        let m = mgr();
+        let idle = m.create_task("idle", 0).unwrap();
+        let running = m.create_task("running", 0).unwrap();
+        m.transition(running.id, TaskState::Running, 1, None).unwrap();
+        let paused = m.create_task("paused", 0).unwrap();
+        m.transition(paused.id, TaskState::Running, 1, None).unwrap();
+        m.transition(paused.id, TaskState::Paused, 2, None).unwrap();
+        let done = m.create_task("done", 0).unwrap();
+        m.transition(done.id, TaskState::Running, 1, None).unwrap();
+        m.transition(done.id, TaskState::Complete, 2, Some("finished")).unwrap();
+        m.record_step(&StepRecord {
+            task_id: running.id,
+            step_number: 1,
+            screen_payload_hash: Some("h1".into()),
+            action_type: Some("click".into()),
+            action_target: None,
+            action_value: None,
+            result: Some(StepResult::Success),
+            claude_reasoning: None,
+            timestamp: 3,
+        })
+        .unwrap();
+
+        assert_eq!(m.reconcile_interrupted(9_000).unwrap(), 3);
+
+        let idle = m.get_task(idle.id).unwrap();
+        assert_eq!(idle.status, TaskState::Cancelled, "never started → cancelled (Idle→Failed is illegal)");
+        assert_eq!(idle.outcome_summary.as_deref(), Some(INTERRUPTED_SUMMARY));
+        assert_eq!(idle.completed_at, Some(9_000));
+        let running = m.get_task(running.id).unwrap();
+        assert_eq!(running.status, TaskState::Failed);
+        assert_eq!(running.outcome_summary.as_deref(), Some(INTERRUPTED_SUMMARY));
+        assert_eq!(m.get_task(paused.id).unwrap().status, TaskState::Failed);
+        let done = m.get_task(done.id).unwrap();
+        assert_eq!(done.status, TaskState::Complete, "terminal rows never move");
+        assert_eq!(done.outcome_summary.as_deref(), Some("finished"));
+        assert_eq!(m.steps(running.id).unwrap().len(), 1, "steps are never deleted");
+        assert_eq!(running.step_count, 1);
+        assert_eq!(m.reconcile_interrupted(9_001).unwrap(), 0, "idempotent");
     }
 
     #[test]

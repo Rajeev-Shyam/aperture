@@ -78,10 +78,8 @@ pub struct AppState {
     pub db: Arc<Db>,
 
     /// The capture subsystem mechanism (doc 05). Driven by the orchestration
-    /// toggle broadcast — commands never call start/stop directly. Read by the
-    /// M2-tuning/diagnostics surfaces (frame counters); held from M0 so the
-    /// composition is complete.
-    #[allow(dead_code)]
+    /// toggle broadcast — commands never call start/stop directly. Read by
+    /// `get_diagnostics` (the extension bridge's connected-host count).
     pub capture: Arc<CaptureSubsystem>,
 
     /// Orchestration: the toggle single-writer + GPU scheduler (doc 12).
@@ -158,6 +156,12 @@ pub struct AppState {
     /// Wakes an `aperture_agent_step` call that is waiting on a user decision
     /// (approve / confirm / answer / resume / stop).
     pub agent_notify: Arc<tokio::sync::Notify>,
+
+    /// The pattern engine's latest diagnostics view (doc 11 §6, 2026-09-06):
+    /// written by the pattern task after each event it mines (throttled),
+    /// read by `get_diagnostics` for the Dashboard's "why am I not seeing
+    /// bubbles?" block. `None` until the first event since launch.
+    pub engine_snapshot: Arc<std::sync::Mutex<Option<aperture_pattern_engine::EngineSnapshot>>>,
 }
 
 impl AppState {
@@ -204,6 +208,7 @@ impl AppState {
             settings_reload_tx,
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
             agent_notify: Arc::new(tokio::sync::Notify::new()),
+            engine_snapshot: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 

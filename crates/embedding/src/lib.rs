@@ -51,10 +51,21 @@ pub const QUERY_PREFIX: &str = "search_query: ";
 pub enum EmbedError {
     #[error("failed to load embedding model: {0}")]
     ModelLoad(String),
-    #[error("tokenization failed: {0}")]
-    Tokenize(String),
     #[error("inference failed: {0}")]
     Inference(String),
+}
+
+/// Scale `vec` to unit L2 length in place (a zero vector is left as is).
+/// Every [`Embedder`] output goes through this so retrieval's unit-vector
+/// assumption (`crates/voice/src/retrieval.rs` maps L2 distance to cosine)
+/// holds by construction, not by trusting the backend.
+pub fn l2_normalize(vec: &mut [f32]) {
+    let norm: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for v in vec.iter_mut() {
+            *v /= norm;
+        }
+    }
 }
 
 /// A text embedder. Implementations are CPU-only and produce a fixed
@@ -109,12 +120,7 @@ impl Embedder for HashEmbedder {
             }
         }
         // L2-normalize (cosine-comparable, like the real model's output).
-        let norm: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
-        if norm > 0.0 {
-            for v in &mut vec {
-                *v /= norm;
-            }
-        }
+        l2_normalize(&mut vec);
         Ok(vec)
     }
 
@@ -124,7 +130,8 @@ impl Embedder for HashEmbedder {
 }
 
 // ---------------------------------------------------------------------------
-// NomicEmbedder — the real model (feature `nomic`, default OFF; see module doc).
+// NomicEmbedder — the real model (feature `nomic`, default ON since 2026-07-05;
+// see module doc).
 // ---------------------------------------------------------------------------
 
 /// The default Tier-0 embedder: `nomic-embed-text-v1.5`, 137M, CPU, 768-d,
@@ -165,13 +172,16 @@ impl Embedder for NomicEmbedder {
         let mut out = model
             .embed(vec![input], None)
             .map_err(|e| EmbedError::Inference(e.to_string()))?;
-        let vec = out.pop().ok_or_else(|| EmbedError::Inference("empty batch".into()))?;
+        let mut vec = out.pop().ok_or_else(|| EmbedError::Inference("empty batch".into()))?;
         if vec.len() != EMBED_DIM {
             return Err(EmbedError::Inference(format!(
                 "backend returned {} dims, ctx_vec is pinned to {EMBED_DIM} (doc 03 §3)",
                 vec.len()
             )));
         }
+        // fastembed normalizes nomic output already; re-normalizing is idempotent
+        // and makes the unit-vector contract ours rather than the backend's.
+        l2_normalize(&mut vec);
         Ok(vec)
     }
 

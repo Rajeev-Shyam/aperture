@@ -68,6 +68,148 @@ pub fn default_token_path() -> PathBuf {
     base.join("Aperture").join("nm-token")
 }
 
+/// The native-messaging host name the extension connects to
+/// (`chrome.runtime.connectNative`), the host-manifest file name and the
+/// registry key leaf — the host binary and this server must agree.
+pub const HOST_NAME: &str = "com.aperture.bridge";
+
+/// The Capture Bridge extension's ID. Stable across machines because
+/// `extension/manifest.json` pins a `key` (Chromium derives the ID from the
+/// public key, so an unpacked load anywhere gets this same ID) — which is what
+/// lets the app register the host manifest at startup with no per-machine
+/// step (2026-09-06). If the key is ever regenerated, regenerate this with it:
+/// `openssl genrsa 2048 | openssl rsa -pubout -outform DER`, base64 → `key`;
+/// ID = the first 16 bytes of SHA-256(DER) as hex with `0-9a-f` mapped to `a-p`.
+pub const EXTENSION_ID: &str = "gkfkhokbibedjcgepmaakaelhdoboomj";
+
+/// Which browser hive the host manifest is registered under. Every Chromium
+/// browser except Edge (Chrome, Opera, Opera GX, Brave) reads Chrome's key on
+/// Windows; Edge has its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserHive {
+    Chrome,
+    Edge,
+}
+
+impl BrowserHive {
+    /// Parse a `--browser` argument / brand name.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "chrome" | "chromium" | "opera" | "opera_gx" | "brave" => Some(Self::Chrome),
+            "edge" | "msedge" => Some(Self::Edge),
+            _ => None,
+        }
+    }
+
+    /// The `HKCU\…` key whose default value must hold the manifest path.
+    pub fn registry_key(self) -> String {
+        match self {
+            Self::Chrome => format!(r"Software\Google\Chrome\NativeMessagingHosts\{HOST_NAME}"),
+            Self::Edge => format!(r"Software\Microsoft\Edge\NativeMessagingHosts\{HOST_NAME}"),
+        }
+    }
+}
+
+/// `%LOCALAPPDATA%\Aperture\nm\com.aperture.bridge.json` — where the host
+/// manifest lives (one file, all browsers point at it).
+pub fn host_manifest_path() -> Option<PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)?;
+    Some(base.join("Aperture").join("nm").join(format!("{HOST_NAME}.json")))
+}
+
+/// Write the host manifest for `host_exe` — merging `extension_ids` into any
+/// `allowed_origins` an earlier install left — and point each hive's HKCU key
+/// at it. Per-user, no admin. Idempotent: run on every app launch
+/// (`register_nm_host` in the shell) and by `aperture-nm-host install`.
+/// Returns the manifest path.
+#[cfg(windows)]
+pub fn install_host_manifest(
+    host_exe: &std::path::Path,
+    extension_ids: &[String],
+    hives: &[BrowserHive],
+) -> Result<PathBuf, String> {
+    let manifest_path = host_manifest_path().ok_or("LOCALAPPDATA unset")?;
+    if let Some(dir) = manifest_path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    // Merge origins with any existing manifest (multi-browser / dev installs).
+    let mut origins: Vec<String> = std::fs::read_to_string(&manifest_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| {
+            v.get("allowed_origins").and_then(|a| {
+                a.as_array().map(|arr| {
+                    arr.iter()
+                        .filter_map(|o| o.as_str().map(str::to_string))
+                        .collect()
+                })
+            })
+        })
+        .unwrap_or_default();
+    for id in extension_ids {
+        let origin = format!("chrome-extension://{id}/");
+        if !origins.contains(&origin) {
+            origins.push(origin);
+        }
+    }
+    let manifest = serde_json::json!({
+        "name": HOST_NAME,
+        "description": "Aperture native-messaging host (ADR-028): stdio bridge between the Capture Bridge extension and the local Aperture core. No sockets.",
+        "path": host_exe.display().to_string(),
+        "type": "stdio",
+        "allowed_origins": origins,
+    });
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    for hive in hives {
+        write_hkcu_default_value(&hive.registry_key(), &manifest_path.display().to_string())?;
+    }
+    Ok(manifest_path)
+}
+
+/// `HKCU\<key_path>` default value = `value` (REG_SZ). Per-user, no admin.
+#[cfg(windows)]
+fn write_hkcu_default_value(key_path: &str, value: &str) -> Result<(), String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_WRITE,
+        REG_OPTION_NON_VOLATILE, REG_SZ,
+    };
+
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    let key_w = wide(key_path);
+    let value_w = wide(value);
+    let value_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(value_w.as_ptr().cast::<u8>(), value_w.len() * 2) };
+
+    unsafe {
+        let mut hkey = HKEY::default();
+        let rc = RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key_w.as_ptr()),
+            0,
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            None,
+            &mut hkey,
+            None,
+        );
+        if rc.is_err() {
+            return Err(format!("RegCreateKeyExW failed: {rc:?}"));
+        }
+        let rc = RegSetValueExW(hkey, PCWSTR::null(), 0, REG_SZ, Some(value_bytes));
+        let _ = RegCloseKey(hkey);
+        if rc.is_err() {
+            return Err(format!("RegSetValueExW failed: {rc:?}"));
+        }
+    }
+    Ok(())
+}
+
 /// A message from the extension, relayed verbatim by the host (protocol v1).
 /// Unknown fields are tolerated (doc 15 §6).
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -172,6 +314,13 @@ impl NmBridge {
 
     pub fn forwarding(&self) -> bool {
         *self.forwarding.read().expect("forwarding lock")
+    }
+
+    /// How many `aperture-nm-host` processes (one per running browser with the
+    /// extension loaded) are connected right now — the Dashboard diagnostics
+    /// block's "is the extension talking to me?" answer (2026-09-06).
+    pub fn connected_hosts(&self) -> usize {
+        self.controls.lock().expect("controls lock").len()
     }
 
     /// Read-or-create the per-install token (hex uuid, 128-bit).

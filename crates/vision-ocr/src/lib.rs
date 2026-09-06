@@ -8,12 +8,14 @@
 //!   text + confidence written to `screen_context` (doc 06 §2). The OCR *text*
 //!   — not the screenshot — is the context currency that gets embedded (doc 03
 //!   §5) and feeds patterns and payloads.
-//! - **Layer B — on-demand VLM (Tier 1, GPU, mutex)** [`vlm_layer`] /
-//!   [`vlm_gating`]: only when the gate (doc 06 §4) says so, one downscaled
-//!   image is enqueued as a `prio:50` GPU job through the orchestration
-//!   scheduler; its structured-JSON result enriches `screen_context.vlm_summary`
-//!   and the *next* pattern cycle. **The VLM never gates a bubble** (doc 02
-//!   Path A invariant).
+//! - **Layer B — on-demand VLM (Tier 1, GPU, mutex)** [`vlm_layer`]: only when
+//!   the wake gate says so (doc 06 §4 — operationalised in
+//!   `aperture_orchestration::tier_router::TierRouter::should_wake_vlm`, the
+//!   single source since the crate-local duplicate was removed 2026-09-05), one
+//!   downscaled image is enqueued as a `prio:50` GPU job through the
+//!   orchestration scheduler; its structured-JSON result enriches
+//!   `screen_context.vlm_summary` and the *next* pattern cycle. **The VLM never
+//!   gates a bubble** (doc 02 Path A invariant).
 //!
 //! ## Invariants honored here
 //! - **8 GB VRAM ceiling / single GPU mutex:** this crate never touches the GPU
@@ -27,20 +29,19 @@
 //!   are *never* persisted; only OCR text, confidence, an optional VLM summary,
 //!   and a perceptual hash reach the DB (doc 03 §3, doc 13).
 
-// TODO(M2): Layer A — ocr_engine + windows_media_ocr + frame_processor + screen_context_writer.
-// TODO(M5): Layer B — vlm_layer + vlm_gating wired to the real GpuScheduler.
+// Layer A (M2): ocr_engine + windows_media_ocr + frame_processor + screen_context_writer.
+// Layer B (M5): vlm_layer, driven by the shell's VLM task against the real
+// GpuScheduler; the wake gate lives in orchestration's `tier_router`.
 
 pub mod frame_processor;
 pub mod ocr_engine;
 pub mod screen_context_writer;
-pub mod vlm_gating;
 pub mod vlm_layer;
 pub mod windows_media_ocr;
 
 pub use frame_processor::{FrameProcessor, ProcessedFrame};
 pub use ocr_engine::{OcrEngine, OcrLine, OcrOutput, OcrWord};
 pub use screen_context_writer::ScreenContextRow;
-pub use vlm_gating::{should_wake_vlm, WakeReason};
 pub use vlm_layer::{SceneJson, VlmLayer};
 
 /// Errors surfaced by the vision pipeline. OCR and VLM failures are *soft* by

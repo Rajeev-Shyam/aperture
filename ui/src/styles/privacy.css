@@ -282,18 +282,13 @@
 
 /* The shield affordance that opens the privacy view.
  *
- * Anchored TOP-right, directly under the capture indicator (`.capture` is
- * `top: var(--edge-inset)`, bubble.css). It previously sat bottom-right, which
- * is the bubble stack's territory (`.bubble-stack`, 320px-wide bubbles at
- * `bottom: var(--edge-inset)`) — the shield overlapped the first bubble and
- * competed with it for clicks. Privacy chrome belongs next to the indicator it
- * explains, not inside the suggestion surface. */
+ * The round icon buttons of the HUD's expanded row (snooze, dashboard, agent,
+ * privacy, hide — Hud.tsx / App.tsx). They live only inside `.hud__row` since
+ * 2026-09-06 (the row lays them out; nothing pins to the viewport). */
 .privacy-open {
-  position: fixed;
-  right: var(--edge-inset);
-  top: calc(var(--edge-inset) + 40px);
-  width: 32px;
-  height: 32px;
+  width: 30px;
+  height: 30px;
+  padding: 0;
   border-radius: 50%;
   border: 1px solid var(--border-hairline);
   background: var(--fallback-opaque);

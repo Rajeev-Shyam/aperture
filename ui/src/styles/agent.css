@@ -4,18 +4,28 @@
  * not spend a glass slot). Tokens only (design-tokens.css loads first).
  * Anchored bottom-centre: clear of the HUD corners and the bubble stack's
  * right edge, always in the user's eyeline while the agent drives.
+ *
+ * The bottom-centre slot is shared (08-22 review): the voice surfaces
+ * (`.voice`, bubble.css) and a HUD dragged to its `bottom-center` anchor sit
+ * at `bottom: var(--edge-inset)` too. So the agent stack is LIFTED by
+ * `--agent-lift` — enough to clear the HUD's grip + two controls — and the
+ * voice surfaces are stacked ABOVE it in z: push-to-talk is momentary and the
+ * user is holding a key for it, so its pill/chip/answer must never render
+ * under the opaque agent bar. [VERIFY on-screen: the lift is CSS arithmetic,
+ * not a measured HUD height.]
  * ======================================================================== */
 
 .agent {
+  --agent-lift: 88px;
   position: fixed;
   left: 50%;
-  bottom: var(--edge-inset);
+  bottom: calc(var(--edge-inset) + var(--agent-lift));
   transform: translateX(-50%);
   display: flex;
   flex-direction: column;
   gap: 8px;
   width: min(560px, calc(100vw - 2 * var(--edge-inset)));
-  z-index: 35; /* above bubbles and the HUD (30); below the panels (40) */
+  z-index: 35; /* above bubbles and the HUD (30); below voice (36) and the panels (40) */
 }
 
 .agent__bar,

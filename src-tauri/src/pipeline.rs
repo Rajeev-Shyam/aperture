@@ -86,7 +86,7 @@ impl FrameSink for OcrStoreSink {
         // ceiling + budget, ADR-032) runs off the bubble path in maybe_enrich_vlm.
         let ocr = &processed.ocr;
         // Thresholds come from `tier_router` — the SAME source the authoritative
-        // gate reads (they were duplicated in `vlm_gating`; a single source keeps
+        // gate reads (a crate-local duplicate, vision-ocr's `vlm_gating`, was deleted 2026-09-05; one source keeps
         // the pre-filter and the gate from silently diverging at M5 tuning).
         let vlm_jpeg = (self.orchestration.is_some()
             && ocr.mean_confidence < WEAK_OCR_CONFIDENCE
@@ -279,10 +279,15 @@ pub fn spawn_pattern_task(
     mut settings_reload_rx: tokio::sync::broadcast::Receiver<Vec<String>>,
     snooze_until: Arc<std::sync::atomic::AtomicI64>,
     current_session: Arc<std::sync::atomic::AtomicI64>,
+    snapshot: Arc<std::sync::Mutex<Option<aperture_pattern_engine::EngineSnapshot>>>,
     app: tauri::AppHandle,
 ) -> tokio::task::JoinHandle<()> {
     let mut events = bus.subscribe();
     tokio::spawn(async move {
+        // Diagnostics publish (doc 11 §6, 2026-09-06): the snapshot walks the
+        // whole pattern cache, so a focus storm must not pay for it per event.
+        let mut last_snapshot_ms: i64 = 0;
+        const SNAPSHOT_MIN_GAP_MS: i64 = 2_000;
         // Hydrate the session id source past the DB's max (doc 03 §3:
         // session_id is monotonic; ADR-032 forbids retro-sessionizing, so a
         // restart must never reuse persisted ids).
@@ -347,12 +352,14 @@ pub fn spawn_pattern_task(
                 // or decay — and the engine prune (the sole patterns deleter,
                 // decision #18) only sees cached rows, so drop them here or they
                 // linger forever.
+                // …and, since 2026-09-06, rows whose tokens the normalizer no
+                // longer mints (the `close`-noise vocabulary) — same fate.
                 if !unparseable.is_empty() {
                     let n = unparseable.len();
                     if let Err(e) = delete_pattern_rows(&db, &unparseable) {
-                        tracing::error!(%e, "unparseable pattern cleanup failed");
+                        tracing::error!(%e, "unminable pattern cleanup failed");
                     } else {
-                        tracing::warn!(dropped = n, "unparseable persisted patterns deleted");
+                        tracing::warn!(dropped = n, "unminable / unparseable persisted patterns deleted");
                     }
                 }
             }
@@ -414,10 +421,14 @@ pub fn spawn_pattern_task(
                 }
                 state = capture_rx.recv() => {
                     match state {
-                        Ok(s) => engine.set_capture(matches!(
-                            s,
-                            aperture_orchestration::toggle_owner::CaptureState::On
-                        )),
+                        Ok(s) => {
+                            engine.set_capture(matches!(
+                                s,
+                                aperture_orchestration::toggle_owner::CaptureState::On
+                            ));
+                            // A toggle is rare and the block shows capture state.
+                            *lock_snapshot(&snapshot) = Some(engine.snapshot(epoch_ms()));
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(_) => break, // owner gone: shutdown
                     }
@@ -456,6 +467,10 @@ pub fn spawn_pattern_task(
                         connector_lookup: &lookup,
                         now_ms,
                     });
+                    if now_ms - last_snapshot_ms >= SNAPSHOT_MIN_GAP_MS || !candidates.is_empty() {
+                        *lock_snapshot(&snapshot) = Some(engine.snapshot(now_ms));
+                        last_snapshot_ms = now_ms;
+                    }
 
                     // Stamp the assigned session onto the durable row (doc 03
                     // §3): the engine sessionizes in-memory; SQLite is the
@@ -882,6 +897,13 @@ fn engine_config_from_settings(db: &Db) -> aperture_pattern_engine::config::Engi
 /// (suggestions outlive their pattern). The ONLY policy-driven `patterns`
 /// deleter is the engine's decay prune mirrored through here (decision #18);
 /// hydrate-time cleanup of unparseable rows shares the path.
+/// The diagnostics slot's lock, shrugging off poisoning (plain data).
+fn lock_snapshot(
+    slot: &std::sync::Mutex<Option<aperture_pattern_engine::EngineSnapshot>>,
+) -> std::sync::MutexGuard<'_, Option<aperture_pattern_engine::EngineSnapshot>> {
+    slot.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 fn delete_pattern_rows(db: &Db, signatures: &[String]) -> Result<(), aperture_db::DbError> {
     db.with_conn(|c| {
         for sig in signatures {

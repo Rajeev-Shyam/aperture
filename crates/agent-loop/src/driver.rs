@@ -465,6 +465,18 @@ impl AgentDriver {
         }
     }
 
+    /// The shell caught a panic on the executor thread (08-22 review): the
+    /// driver survived but the step did not. A failed row, then the task ends
+    /// Failed via `CannotProceed` — the errors terminal path — never
+    /// `HardStop`, which is reserved for the user (locked decision 5).
+    pub fn fail_internal(&mut self, why: &str, now_ms: i64) {
+        if self.is_terminal() {
+            return;
+        }
+        self.record_row("internal_error", None, None, StepResult::Failure, Some(why), now_ms);
+        let _ = self.finish(StopReason::CannotProceed(format!("internal error: {why}")), now_ms);
+    }
+
     /// Q-V2-07 [PROVISIONAL]: an instruction that did not parse is a failed
     /// step — audited and counted toward the consecutive-error threshold, so
     /// a planner stuck emitting garbage cannot loop forever.
@@ -801,6 +813,24 @@ mod tests {
         let i = click("Next", AgentConfidence::High);
         assert_eq!(d.classify(&i, 2).unwrap(), Disposition::Finished(StopReason::HardStop));
         assert_eq!(d.state(), TaskState::Cancelled);
+    }
+
+    #[test]
+    fn fail_internal_marks_failed_without_a_user_stop() {
+        let (mut d, tasks, stop) = harness(vec![]);
+        d.approve(1).unwrap();
+        d.fail_internal("the action crashed inside Aperture", 2);
+        assert_eq!(d.state(), TaskState::Failed);
+        assert!(!stop.load(Ordering::SeqCst), "an internal failure is not a user hard stop");
+        assert!(matches!(d.stop_reason(), Some(StopReason::CannotProceed(_))));
+        assert_eq!(tasks.get_task(d.task_id()).unwrap().status, TaskState::Failed);
+        let steps = tasks.steps(d.task_id()).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].action_type.as_deref(), Some("internal_error"));
+        assert_eq!(steps[0].result, Some(StepResult::Failure));
+        // Terminal already ⇒ a second call is a no-op, no extra rows.
+        d.fail_internal("again", 3);
+        assert_eq!(tasks.steps(d.task_id()).unwrap().len(), 1);
     }
 
     #[test]

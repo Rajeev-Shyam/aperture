@@ -162,6 +162,13 @@ impl ExclusionList {
         self.snapshot().is_empty()
     }
 
+    /// Does any rule carry a (compiled) `url_pattern` matcher? Callers that
+    /// gate on a browser URL use this to decide whether "no URL resolvable"
+    /// must fail closed (the executor's exclusion probe, decision #49).
+    pub fn has_url_rules(&self) -> bool {
+        self.snapshot().iter().any(|r| r.url_pattern.is_some())
+    }
+
     /// The core predicate (doc 05 §4, doc 13 §4): is this context excluded?
     /// Matched against process / window-class / title / url in that order; the
     /// private-window heuristic runs even with zero rules (doc 13 §4).
@@ -531,6 +538,38 @@ mod tests {
             list.is_excluded(Some("code.exe"), None, Some("main.rs"), None),
             ExclusionVerdict::Allowed
         );
+    }
+
+    #[test]
+    fn has_url_rules_reflects_compiled_url_pattern_matchers_only() {
+        assert!(!ExclusionList::shipped_defaults().has_url_rules(), "empty list");
+        let process_only = ExclusionList::compile(vec![ExclusionRule {
+            process: Some("1password.exe".into()),
+            label: "1Password".into(),
+            ..Default::default()
+        }]);
+        assert!(!process_only.has_url_rules());
+        let with_url = ExclusionList::compile(vec![ExclusionRule {
+            url_pattern: Some(r"^https://banking\.".into()),
+            label: "banking".into(),
+            ..Default::default()
+        }]);
+        assert!(with_url.has_url_rules());
+        // A url_pattern that failed to compile was dropped: it is not a rule.
+        let broken = ExclusionList::compile(vec![ExclusionRule {
+            url_pattern: Some("([unclosed".into()),
+            label: "broken".into(),
+            ..Default::default()
+        }]);
+        assert!(!broken.has_url_rules());
+        // `replace` swaps the shared set: every clone sees the new answer.
+        let clone = process_only.clone();
+        process_only.replace(vec![ExclusionRule {
+            url_pattern: Some("^https://x".into()),
+            label: "x".into(),
+            ..Default::default()
+        }]);
+        assert!(clone.has_url_rules());
     }
 
     #[test]

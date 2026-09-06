@@ -74,11 +74,7 @@ impl UiaExecutor {
         let Some(fg) = platform::foreground_window() else {
             return Ok(None);
         };
-        if let Some(label) = self.probe.excluded_label(
-            fg.process.as_deref(),
-            fg.window_class.as_deref(),
-            Some(fg.title.as_str()),
-        ) {
+        if let Some(label) = self.probe.excluded_label(&fg) {
             return Err(ActionError::Excluded(label));
         }
         if platform::window_is_elevated_above_us(fg.hwnd) {
@@ -119,9 +115,9 @@ impl UiaExecutor {
             (None, Some(target)) => ActionError::ElementNotFound(target.to_string()),
             (_, None) => ActionError::Unsupported("click needs a target label or coords".into()),
         };
-        // Fallback (Doc 22 §6): Claude's pixel coordinates. They are **primary-
-        // monitor physical pixels**; the loop scales them up from the 768-px
-        // screenshot space before handing them here.
+        // Fallback (Doc 22 §6): Claude's pixel coordinates, used verbatim as
+        // **primary-monitor physical pixels** — nothing scales them (doc 22 §6
+        // agrees; a stale comment claiming a 768-px rescale was fixed 2026-09-05).
         if let Some(c) = action.coords {
             platform::click_at(c.x, c.y)?;
             let why = target.map(|t| format!(" (no UIA match for '{t}')")).unwrap_or_default();
@@ -267,11 +263,7 @@ pub fn close_windows(targets: &[WindowInfo], probe: &dyn ExclusionProbe) -> usiz
     let mut closed = 0;
     for w in targets {
         let Some(live) = open.iter().find(|o| o.hwnd == w.hwnd) else { continue };
-        if probe
-            .excluded_label(live.process.as_deref(), live.window_class.as_deref(), Some(&live.title))
-            .is_some()
-            || platform::window_is_elevated_above_us(live.hwnd)
-        {
+        if probe.excluded_label(live).is_some() || platform::window_is_elevated_above_us(live.hwnd) {
             continue;
         }
         if !platform::bring_to_foreground(live.hwnd) {
@@ -297,11 +289,16 @@ impl Default for UiaExecutor {
 impl ActionExecutor for UiaExecutor {
     fn execute(&self, ticket: &ExecutorTicket, action: &AgentAction) -> Result<ActionOutcome, ActionError> {
         let fg = self.guard()?;
+        // Process + hwnd only — NEVER the window title (a password manager's
+        // or mail client's title is screen content; doc 13 §4 strips exactly
+        // these from excluded rows, so they must not land in the log either).
+        // `target` stays: it is Claude's requested label, not the screen's.
         tracing::debug!(
             task_id = %ticket.task_id(),
             action = ?action.action_type,
             target = action.target.as_deref().unwrap_or(""),
-            foreground = fg.as_ref().map(|w| w.title.as_str()).unwrap_or(""),
+            foreground_process = fg.as_ref().and_then(|w| w.process.as_deref()).unwrap_or(""),
+            foreground_hwnd = fg.as_ref().map(|w| w.hwnd).unwrap_or(0),
             "executing"
         );
         match action.action_type {
@@ -371,7 +368,7 @@ mod tests {
     fn excluded_foreground_window_pauses_rather_than_acting() {
         struct All;
         impl ExclusionProbe for All {
-            fn excluded_label(&self, _: Option<&str>, _: Option<&str>, _: Option<&str>) -> Option<String> {
+            fn excluded_label(&self, _: &WindowInfo) -> Option<String> {
                 Some("everything".into())
             }
         }

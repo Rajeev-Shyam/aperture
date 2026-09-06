@@ -39,7 +39,6 @@ import { useHitTestRects } from "./state/useHitTestRects";
 
 import { AgentSurface } from "./components/AgentSurface";
 import { BubbleContainer } from "./components/BubbleContainer";
-import { CaptureIndicator } from "./components/CaptureIndicator";
 import { ContextPreviewPanel } from "./components/ContextPreviewPanel";
 import { Dashboard } from "./components/Dashboard";
 import { FirstRunConsent } from "./components/FirstRunConsent";
@@ -303,55 +302,54 @@ export default function App() {
           while a task exists, and the pause cards. Primary-only — one task
           at a time, one place to stop it. */}
       <AgentSurface composing={agentComposing} onCloseComposer={() => setAgentComposing(false)} />
-      {/* The HUD cluster: capture indicator + dashboard + privacy, draggable
-          to any corner or edge (persisted in ui.hud_anchor). */}
+      {/* The HUD orb: the capture dot, expanding on click into one row —
+          capture toggle (owned by the Hud) + these App-owned controls + hide.
+          Draggable to any corner or edge (persisted in ui.hud_anchor),
+          hideable (ui.hud_hidden, the tray brings it back). */}
       <Hud>
-        <CaptureIndicator />
-        <div className="hud__buttons">
-          {/* Global snooze (doc 11 §6, ADR-040): quiet bubbles, keep learning. */}
-          <SnoozeControl />
-          <button
-            className="privacy-open"
-            aria-label={dashboardOpen ? "Close the Aperture dashboard" : "Open the Aperture dashboard"}
-            aria-pressed={dashboardOpen}
-            title="Dashboard — history, patterns, everything it knows"
-            onClick={() => {
-              // Open optimistically AND through the core: the broadcast is
-              // what closes a copy open on another monitor (decision #13).
-              if (dashboardOpen) setDashboardOpen(false);
-              else {
-                setDashboardOpen(true);
-                void openDashboard().catch(() => {});
-              }
-            }}
-          >
-            ◎
-          </button>
-          <button
-            className="privacy-open"
-            aria-label={agentComposing ? "Close the agent task composer" : "New agent task"}
-            aria-pressed={agentComposing}
-            title="New agent task — Claude drives this PC, step by step, with you in control"
-            onClick={() => setAgentComposing((v) => !v)}
-          >
-            ✦
-          </button>
-          <button
-            className="privacy-open"
-            aria-label={privacyOpen ? "Close activity and privacy" : "Open activity and privacy"}
-            aria-pressed={privacyOpen}
-            title="Activity & Privacy"
-            onClick={() => {
-              if (privacyOpen) setPrivacyOpen(false);
-              else {
-                setPrivacyOpen(true);
-                void openPrivacy().catch(() => {});
-              }
-            }}
-          >
-            🛡
-          </button>
-        </div>
+        {/* Global snooze (doc 11 §6, ADR-040): quiet bubbles, keep learning. */}
+        <SnoozeControl />
+        <button
+          className="privacy-open"
+          aria-label={dashboardOpen ? "Close the Aperture dashboard" : "Open the Aperture dashboard"}
+          aria-pressed={dashboardOpen}
+          title="Dashboard — history, patterns, everything it knows"
+          onClick={() => {
+            // Open optimistically AND through the core: the broadcast is
+            // what closes a copy open on another monitor (decision #13).
+            if (dashboardOpen) setDashboardOpen(false);
+            else {
+              setDashboardOpen(true);
+              void openDashboard().catch(() => {});
+            }
+          }}
+        >
+          ◎
+        </button>
+        <button
+          className="privacy-open"
+          aria-label={agentComposing ? "Close the agent task composer" : "New agent task"}
+          aria-pressed={agentComposing}
+          title="New agent task — Claude drives this PC, step by step, with you in control"
+          onClick={() => setAgentComposing((v) => !v)}
+        >
+          ✦
+        </button>
+        <button
+          className="privacy-open"
+          aria-label={privacyOpen ? "Close activity and privacy" : "Open activity and privacy"}
+          aria-pressed={privacyOpen}
+          title="Activity & Privacy"
+          onClick={() => {
+            if (privacyOpen) setPrivacyOpen(false);
+            else {
+              setPrivacyOpen(true);
+              void openPrivacy().catch(() => {});
+            }
+          }}
+        >
+          🛡
+        </button>
       </Hud>
       </>
       )}

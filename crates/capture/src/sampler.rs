@@ -323,9 +323,12 @@ impl Sampler {
     /// means no frames, invariant 3), exclusion BEFORE the frame pull (doc 05
     /// §4) — but no debounce, no pHash gate, and the frame is returned.
     ///
-    /// `fg` is the hook-tracked foreground context; its URL is used only when
-    /// that identity is the window actually in front now (TOCTOU rule), so a
-    /// stale URL can never un-gate an excluded page or mislabel a frame.
+    /// `fg` is the hook-tracked foreground context. If that identity is NOT
+    /// the window actually in front now, the observation FAILS CLOSED (the
+    /// same TOCTOU posture as [`Sampler::sample_once`]'s skip): gating with a
+    /// dropped URL would bypass `url_pattern` exclusion rules right after the
+    /// agent's own navigation changed the title (08-22 review). The caller
+    /// re-settles and retries.
     pub fn observe_now(&self, fg: ForegroundContext) -> Result<Observation, CaptureError> {
         if self.suspended.load(Ordering::SeqCst) {
             return Err(CaptureError::CaptureUnavailable(
@@ -337,7 +340,12 @@ impl Sampler {
                 "no foreground window to observe".into(),
             ));
         };
-        let url = if fg.identity == identity { fg.url } else { None };
+        if fg.identity != identity {
+            return Err(CaptureError::CaptureUnavailable(
+                "the foreground window changed while observing — call again to retry".into(),
+            ));
+        }
+        let url = fg.url;
 
         // Exclusion gate — earliest, before any pixel exists (doc 13 §4).
         if let crate::exclusion::ExclusionVerdict::Excluded { label, .. } = self.exclusion.is_excluded(

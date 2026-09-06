@@ -38,8 +38,6 @@ const RELEASE_SLA: Duration = Duration::from_secs(3);
 const VRAM_FLOOR_MIB: u64 = 64;
 /// The GPU-holding grandchild process names VRAM is attributed to.
 const GPU_PROCESS_NAMES: [&str; 2] = ["llama-server", "whisper-server"];
-/// The host process images whose death the gate asserts.
-const HOST_IMAGES: [&str; 2] = ["aperture-vlm-host.exe", "stt-host-x86_64-pc-windows-msvc.exe"];
 
 /// Repo root (this file lives at crates/gates/tests/).
 fn repo_root() -> PathBuf {
@@ -50,37 +48,34 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// The dev-checkout sidecar layout `main::sidecar_config()` resolves — kept in
-/// lockstep with src-tauri/src/main.rs (an on-target gate may assume the dev
-/// checkout it runs from).
+/// The dev-checkout sidecar layout, resolved by the SAME candidate list the
+/// shell uses (`SidecarConfig::resolve`, 2026-09-05 — before that this file
+/// hard-coded its own paths and drifted from `main.rs::sidecar_config`). The
+/// "exe dir" of a checkout is the cargo profile dir the hosts were built into
+/// (release preferred), the root anchors `src-tauri\binaries` + `models\`.
 fn dev_sidecar_config(root: &PathBuf) -> SidecarConfig {
-    let profile_dir = |bin: &str| {
-        let release = root.join("target").join("release").join(bin);
-        if release.exists() {
-            release
-        } else {
-            root.join("target").join("debug").join(bin)
-        }
+    let release = root.join("target").join("release");
+    let profile_dir = if release.join("aperture-vlm-host.exe").exists() {
+        release
+    } else {
+        root.join("target").join("debug")
     };
-    SidecarConfig {
-        vlm_host_bin: profile_dir("aperture-vlm-host.exe"),
-        vlm_model_gguf: root.join("models").join("qwen2.5-vl-3b-q4_k_m.gguf"),
-        vlm_mmproj_gguf: root.join("models").join("qwen2.5-vl-3b-mmproj-f16.gguf"),
-        llama_bin: root.join("src-tauri").join("binaries").join("llama").join("llama-server.exe"),
-        stt_host_bin: root
-            .join("src-tauri")
-            .join("binaries")
-            .join("stt-host-x86_64-pc-windows-msvc.exe"),
-        whisper_bin: root
-            .join("src-tauri")
-            .join("binaries")
-            .join("whisper")
-            .join("whisper-server.exe"),
-        stt_model: root.join("models").join("ggml-base.en.bin"),
-        stt_on_gpu: false,
-        vlm_ctx: 4096,
-        cold_load_timeout: Duration::from_secs(60), // cold llama load is slow; generous here
-    }
+    let mut config = SidecarConfig::resolve(Some(&profile_dir), Some(root));
+    config.cold_load_timeout = Duration::from_secs(60); // cold llama load is slow; generous here
+    config
+}
+
+/// The host process images whose death the gate asserts — whatever the
+/// resolver picked, so the assertion tracks the binaries actually spawned.
+fn host_images(config: &SidecarConfig) -> Vec<String> {
+    [&config.vlm_host_bin, &config.stt_host_bin]
+        .iter()
+        .map(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .expect("resolved host path has a file name")
+        })
+        .collect()
 }
 
 /// Sum of `nvidia-smi` compute-app VRAM (MiB) for Aperture's model processes.
@@ -128,6 +123,8 @@ fn sc6_toggle_off_releases_vram_within_3s_and_kills_sidecars() {
             "SC6 setup: missing sidecar asset {path:?} — build the hosts and fetch the models first"
         );
     }
+    let host_images = host_images(&config);
+    let host_images: Vec<&str> = host_images.iter().map(String::as_str).collect();
     // Name-attributed VRAM demands exclusivity: another Aperture (or bare
     // llama/whisper server) would pollute both measurements.
     assert!(
@@ -161,7 +158,7 @@ fn sc6_toggle_off_releases_vram_within_3s_and_kills_sidecars() {
         "SC6 setup invalid: model processes hold only {before} MiB (≤ {VRAM_FLOOR_MIB} floor)"
     );
     assert!(
-        any_process_alive(&HOST_IMAGES),
+        any_process_alive(&host_images),
         "hosts must be alive before the kill"
     );
 
@@ -192,7 +189,7 @@ fn sc6_toggle_off_releases_vram_within_3s_and_kills_sidecars() {
     // Process death is the release mechanism — assert the WHOLE tree is gone
     // (a surviving grandchild is exactly the orphan bug the Job Object fixed).
     assert!(
-        !any_process_alive(&HOST_IMAGES),
+        !any_process_alive(&host_images),
         "SC6 VIOLATION: a sidecar host survived the kill"
     );
     assert!(

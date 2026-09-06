@@ -1,6 +1,6 @@
 //! Proactive trigger gate — the 7 rules, all of which must hold (doc 08 §6, R2).
 //!
-//! 1. `score ≥ τ_conf = 0.7` ([`config::TAU_CONF`], ADR-033) `[VERIFY — SC7 at M3]`
+//! 1. `score ≥ τ_conf = 0.4` ([`config::TAU_CONF`], owner-lowered 2026-08-26 from ADR-033's 0.7) `[VERIFY — SC7 at M3]`
 //! 2. Weighted support ≥ 3 ([`config::COLD_START_SUPPORT_FLOOR`]) `[ASSUMPTION]`
 //! 3. A **fresh, resumable** `connector_state` exists for the consequent (doc 10
 //!    TTLs). Amended by owner decision #15 (2026-08-16): pure app-focus
@@ -27,8 +27,9 @@ use crate::config;
 use crate::scorer;
 
 /// Why a candidate was suppressed (doc 08 §6); useful for SC7 telemetry and
-/// settings-tuning diagnostics (doc 08 §9).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// settings-tuning diagnostics (doc 08 §9) — counted per reason in
+/// [`GateStats`] and shown in the Dashboard's diagnostics block (doc 11 §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum TriggerReject {
     /// Rule 1: `score < τ_conf`.
     BelowScore,
@@ -44,6 +45,126 @@ pub enum TriggerReject {
     NotNovel,
     /// Rule 7: capture is OFF.
     CaptureOff,
+}
+
+impl TriggerReject {
+    /// Every reason, in rule order — the index into [`GateStats::rejected`].
+    pub const ALL: [TriggerReject; 7] = [
+        TriggerReject::BelowScore,
+        TriggerReject::BelowSupport,
+        TriggerReject::NoFreshState,
+        TriggerReject::Cooldown,
+        TriggerReject::HourlyCapReached,
+        TriggerReject::NotNovel,
+        TriggerReject::CaptureOff,
+    ];
+
+    /// Position in [`Self::ALL`].
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|r| *r == self).expect("every reason is listed")
+    }
+
+    /// The rule in the words the Dashboard shows (doc 11 §6 diagnostics).
+    pub fn label(self) -> &'static str {
+        match self {
+            TriggerReject::BelowScore => "not confident enough",
+            TriggerReject::BelowSupport => "not repeated enough yet",
+            TriggerReject::NoFreshState => "nothing fresh to resume",
+            TriggerReject::Cooldown => "shown too recently",
+            TriggerReject::HourlyCapReached => "hourly budget spent",
+            TriggerReject::NotNovel => "you were just there",
+            TriggerReject::CaptureOff => "capture was off",
+        }
+    }
+
+    /// One sentence explaining what would make the rule pass.
+    pub fn hint(self) -> &'static str {
+        match self {
+            TriggerReject::BelowScore => {
+                "The habit's confidence × freshness × novelty fell under the certainty knob."
+            }
+            TriggerReject::BelowSupport => {
+                "The sequence has been seen fewer times than the repeats knob."
+            }
+            TriggerReject::NoFreshState => {
+                "No captured page, document or file to resume — the browser extension and Office titles feed this."
+            }
+            TriggerReject::Cooldown => "The same habit surfaced inside its quiet window.",
+            TriggerReject::HourlyCapReached => "The rolling-hour cap was already reached.",
+            TriggerReject::NotNovel => {
+                "The thing it would suggest is on screen or was focused in the last ten minutes."
+            }
+            TriggerReject::CaptureOff => "Nothing fires while capture is off.",
+        }
+    }
+}
+
+/// One gate decision, kept as the "last admitted" / "closest miss" exhibits
+/// for the diagnostics block. Signatures are coarse class tokens (`browser:focus:∅
+/// ⇒ ide:focus:∅`) — never titles or URLs beyond a host — so this is safe to show.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct GateDecision {
+    pub signature: String,
+    pub score: f64,
+    /// `None` = admitted.
+    pub reject: Option<TriggerReject>,
+    pub at_ms: i64,
+}
+
+/// Counters over every gate decision since startup (doc 08 §9 diagnostics;
+/// doc 11 §6's Advanced-tab diagnostics, built 2026-09-06 after three weeks of
+/// "zero recommendations" with no way to see why). Pure bookkeeping — the gate
+/// itself never reads it.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct GateStats {
+    /// Candidates the gate looked at.
+    pub evaluated: u64,
+    /// Candidates that passed all seven rules.
+    pub admitted: u64,
+    /// Rejections by rule, indexed by [`TriggerReject::index`].
+    pub rejected: [u64; 7],
+    pub last_admitted: Option<GateDecision>,
+    pub last_rejected: Option<GateDecision>,
+    /// The highest-scoring rejection seen — "the closest miss".
+    pub closest_miss: Option<GateDecision>,
+}
+
+impl GateStats {
+    /// Record one decision.
+    pub fn record(&mut self, signature: &str, score: f64, at_ms: i64, outcome: Result<(), TriggerReject>) {
+        self.evaluated += 1;
+        let decision = GateDecision {
+            signature: signature.to_string(),
+            score,
+            reject: outcome.err(),
+            at_ms,
+        };
+        match outcome {
+            Ok(()) => {
+                self.admitted += 1;
+                self.last_admitted = Some(decision);
+            }
+            Err(reason) => {
+                self.rejected[reason.index()] += 1;
+                if self
+                    .closest_miss
+                    .as_ref()
+                    .map_or(true, |best| score > best.score)
+                {
+                    self.closest_miss = Some(decision.clone());
+                }
+                self.last_rejected = Some(decision);
+            }
+        }
+    }
+
+    /// `(label, hint, count)` per rule, in rule order — the Dashboard's table.
+    pub fn rejected_by_reason(&self) -> Vec<(&'static str, &'static str, u64)> {
+        TriggerReject::ALL
+            .iter()
+            .map(|r| (r.label(), r.hint(), self.rejected[r.index()]))
+            .collect()
+    }
 }
 
 /// Everything the gate needs about one would-be candidate (doc 08 §6).
@@ -142,6 +263,16 @@ impl TriggerGate {
     /// The current adaptive hourly cap (ADR-032).
     pub fn cap_per_hour(&self) -> u32 {
         self.cap_per_hour
+    }
+
+    /// The configured rule-1 threshold (diagnostics).
+    pub fn tau_conf(&self) -> f64 {
+        self.tau_conf
+    }
+
+    /// The configured rule-2 floor (diagnostics).
+    pub fn support_floor(&self) -> f64 {
+        self.support_floor
     }
 
     /// Nudge the adaptive cap on click-through evidence (ADR-032): sustained
@@ -279,12 +410,14 @@ mod tests {
     }
 
     #[test]
-    fn tau_conf_is_the_r2_070() {
+    fn tau_conf_is_the_owner_lowered_040() {
         let gate = TriggerGate::new();
         let st = fresh_state();
         let mut input = ok_input(&st, 0);
-        input.score = 0.65; // passed R1's 0.6, must FAIL R2's 0.7 (ADR-033)
+        input.score = 0.35; // must FAIL the 0.4 floor (owner-lowered 2026-08-26)
         assert_eq!(gate.admit(&input, true), Err(TriggerReject::BelowScore));
+        input.score = 0.65; // failed the old 0.7; must PASS the 0.4 floor
+        assert!(gate.admit(&input, true).is_ok());
     }
 
     #[test]
@@ -337,7 +470,7 @@ mod tests {
         assert!(gate.admit(&input, true).is_ok(), "rule 3 exempt for app-focus (#15)");
 
         // …but every other rule still applies: score, support, novelty, capture.
-        input.score = 0.5;
+        input.score = 0.3;
         assert_eq!(gate.admit(&input, true), Err(TriggerReject::BelowScore));
         input.score = 0.9;
         input.weighted_support = 2.0;
@@ -359,7 +492,7 @@ mod tests {
             ..config::EngineConfig::default()
         };
         gate.configure(&cfg);
-        let input = ok_input(&st, 0); // score 0.9 passes the default 0.7…
+        let input = ok_input(&st, 0); // score 0.9 passes the default 0.4…
         assert_eq!(
             gate.admit(&input, true),
             Err(TriggerReject::BelowScore),
@@ -375,6 +508,29 @@ mod tests {
         gate.adapt_cap(false); // 6 → 5, adapted
         gate.configure(&cfg);
         assert_eq!(gate.cap_per_hour(), 5, "earned adaptation is not reset by a re-read");
+    }
+
+    /// 2026-09-06 diagnostics: every decision is counted once, per rule, and
+    /// the closest miss is the highest-scoring rejection.
+    #[test]
+    fn gate_stats_count_each_decision_and_keep_the_closest_miss() {
+        let mut stats = GateStats::default();
+        stats.record("a ⇒ b", 0.9, 1, Ok(()));
+        stats.record("a ⇒ c", 0.3, 2, Err(TriggerReject::BelowScore));
+        stats.record("a ⇒ d", 0.8, 3, Err(TriggerReject::NotNovel));
+        stats.record("a ⇒ e", 0.5, 4, Err(TriggerReject::NotNovel));
+        assert_eq!((stats.evaluated, stats.admitted), (4, 1));
+        assert_eq!(stats.rejected[TriggerReject::BelowScore.index()], 1);
+        assert_eq!(stats.rejected[TriggerReject::NotNovel.index()], 2);
+        assert_eq!(stats.rejected.iter().sum::<u64>(), 3);
+        assert_eq!(stats.last_admitted.as_ref().map(|d| d.signature.as_str()), Some("a ⇒ b"));
+        assert_eq!(stats.last_rejected.as_ref().map(|d| d.at_ms), Some(4));
+        let miss = stats.closest_miss.as_ref().expect("a miss was recorded");
+        assert_eq!((miss.signature.as_str(), miss.reject), ("a ⇒ d", Some(TriggerReject::NotNovel)));
+        let by_reason = stats.rejected_by_reason();
+        assert_eq!(by_reason.len(), TriggerReject::ALL.len());
+        assert_eq!(by_reason[TriggerReject::NotNovel.index()].2, 2);
+        assert!(by_reason.iter().all(|(label, hint, _)| !label.is_empty() && !hint.is_empty()));
     }
 
     #[test]

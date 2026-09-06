@@ -44,12 +44,33 @@ pub enum OverlayError {
 /// A monitor's physical bounds — the minimal descriptor `plan_overlays` needs,
 /// mapped from `tauri::Monitor` in [`create_overlays`] so the placement math is
 /// pure + testable without a running app.
+///
+/// Two rectangles, on purpose (2026-09-06, owner report "bubbles cover the
+/// taskbar and get cut off"): `x/y/width/height` are the FULL monitor and drive
+/// cursor → monitor routing (a cursor over the taskbar still belongs to that
+/// monitor); `work_*` is the OS work area — the monitor minus the taskbar and
+/// any app bar — and is what the overlay window is sized to. An always-on-top
+/// overlay that covers the taskbar both paints under it (the taskbar is topmost
+/// too, so a bottom-anchored bubble loses its lower rows) and, wherever a
+/// hit-test rect lands there, steals the taskbar's clicks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MonitorInfo {
     pub x: i32,
     pub y: i32,
     pub width: u32,
     pub height: u32,
+    pub work_x: i32,
+    pub work_y: i32,
+    pub work_width: u32,
+    pub work_height: u32,
+}
+
+impl MonitorInfo {
+    /// A monitor whose work area is its whole surface (no taskbar reserved).
+    /// Test + fallback constructor.
+    pub fn full(x: i32, y: i32, width: u32, height: u32) -> Self {
+        Self { x, y, width, height, work_x: x, work_y: y, work_width: width, work_height: height }
+    }
 }
 
 /// The label + physical bounds for one monitor's overlay window (doc 11 §2).
@@ -137,27 +158,38 @@ impl PreviewHost {
     }
 }
 
-/// Map a `tauri::Monitor` to the pure [`MonitorInfo`] descriptor.
+/// Map a `tauri::Monitor` to the pure [`MonitorInfo`] descriptor. A degenerate
+/// work area (zero-sized — seen when a display is mid-reconfiguration) falls
+/// back to the full monitor rather than producing an invisible overlay.
 fn monitor_info(m: &tauri::Monitor) -> MonitorInfo {
     let p = m.position();
     let s = m.size();
-    MonitorInfo { x: p.x, y: p.y, width: s.width, height: s.height }
+    let w = m.work_area();
+    let mut info = MonitorInfo::full(p.x, p.y, s.width, s.height);
+    if w.size.width > 0 && w.size.height > 0 {
+        info.work_x = w.position.x;
+        info.work_y = w.position.y;
+        info.work_width = w.size.width;
+        info.work_height = w.size.height;
+    }
+    info
 }
 
 /// Plan one overlay per monitor (doc 11 §2), **pure**: the primary (index 0)
 /// reuses [`OVERLAY_LABEL`] (the config window, Q42); each subsequent monitor gets
-/// `overlay-1`, `overlay-2`, … Every overlay exactly covers its monitor in
-/// physical pixels. Empty input ⇒ no overlays.
+/// `overlay-1`, `overlay-2`, … Every overlay exactly covers its monitor's WORK
+/// AREA in physical pixels (the taskbar stays uncovered — see [`MonitorInfo`]).
+/// Empty input ⇒ no overlays.
 pub fn plan_overlays(monitors: &[MonitorInfo]) -> Vec<OverlayPlacement> {
     monitors
         .iter()
         .enumerate()
         .map(|(i, m)| OverlayPlacement {
             label: overlay_label(i),
-            x: m.x,
-            y: m.y,
-            width: m.width,
-            height: m.height,
+            x: m.work_x,
+            y: m.work_y,
+            width: m.work_width,
+            height: m.work_height,
         })
         .collect()
 }
@@ -183,7 +215,11 @@ pub fn create_overlays(app: &AppHandle) -> Result<Vec<WebviewWindow>, OverlayErr
         let window = match app.get_webview_window(&placement.label) {
             // The primary config window already exists — re-anchor it.
             Some(existing) => existing,
-            // Secondary monitors: clone the overlay from the same WebView entry.
+            // Secondary monitors: clone the overlay from the same WebView entry,
+            // with the SAME flags as the config window — in particular
+            // `focused(false)`: a focusable always-on-top clone would activate
+            // itself at creation and steal the keyboard from the user's app
+            // (doc 11 §2 "never steal input"; 2026-09-06).
             None => tauri::WebviewWindowBuilder::new(
                 app,
                 &placement.label,
@@ -193,6 +229,9 @@ pub fn create_overlays(app: &AppHandle) -> Result<Vec<WebviewWindow>, OverlayErr
             .decorations(false)
             .always_on_top(true)
             .skip_taskbar(true)
+            .shadow(false)
+            .resizable(false)
+            .focused(false)
             .build()
             .map_err(|e| OverlayError::WindowCreate(e.to_string()))?,
         };
@@ -217,22 +256,41 @@ pub fn harden(window: &WebviewWindow) {
     }
 }
 
-/// Apply `WS_EX_LAYERED | WS_EX_TRANSPARENT` so the window is click-through
-/// (doc 11 §2). With this set, all input falls through to the apps beneath;
-/// hit-testing is selectively restored by [`set_hit_test_rects`].
+/// The ex-style bits every overlay window carries at all times, regardless of
+/// the click-through state: `WS_EX_LAYERED` (click-through needs it) and
+/// `WS_EX_NOACTIVATE` (2026-09-06, owner report "any video on screen goes black
+/// when I click a bubble"). Without NOACTIVATE a click on a bubble ACTIVATES
+/// the overlay like any window, the video's app loses the foreground, and the
+/// browser drops its video out of the hardware overlay plane — black until the
+/// user clicks the video again. With it, a plain click reaches the WebView
+/// (mouse input never needed activation) but never moves the foreground;
+/// panels that need the keyboard take focus explicitly (`focus_overlay`,
+/// `set_interactive`), which NOACTIVATE permits. Re-asserted on every poller
+/// tick with the transparency bit (`hit_test.rs`) because tao rewrites the
+/// whole ex-style from its own flag model and knows none of these bits.
+#[cfg(windows)]
+const ALWAYS_ON_EX_STYLE: isize = {
+    use windows::Win32::UI::WindowsAndMessaging::{WS_EX_LAYERED, WS_EX_NOACTIVATE};
+    (WS_EX_LAYERED.0 | WS_EX_NOACTIVATE.0) as isize
+};
+
+/// Apply `WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT` so the window is
+/// click-through (doc 11 §2) and never activates on a click. With this set, all
+/// input falls through to the apps beneath; hit-testing is selectively restored
+/// by [`set_hit_test_rects`].
 pub fn make_click_through(window: &WebviewWindow) -> Result<(), OverlayError> {
     #[cfg(windows)]
     unsafe {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{
-            GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_LAYERED, WS_EX_TRANSPARENT,
+            GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_TRANSPARENT,
         };
         let hwnd = window
             .hwnd()
             .map_err(|e| OverlayError::Win32(e.to_string()))?;
         let hwnd = HWND(hwnd.0);
         let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let new_style = style | (WS_EX_LAYERED.0 as isize) | (WS_EX_TRANSPARENT.0 as isize);
+        let new_style = style | ALWAYS_ON_EX_STYLE | (WS_EX_TRANSPARENT.0 as isize);
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
         Ok(())
     }
@@ -267,9 +325,13 @@ pub fn exclude_from_capture(window: &WebviewWindow) -> Result<(), OverlayError> 
     }
 }
 
-/// Flip only the `WS_EX_TRANSPARENT` bit — the raw click-through switch, with no
-/// focus side effect. The cursor poller (`hit_test`) drives this at bubble-hover
-/// granularity; [`set_interactive`] layers focus on top for modal surfaces.
+/// Flip the `WS_EX_TRANSPARENT` bit — the raw click-through switch, with no
+/// focus side effect — and keep the always-on bits (`WS_EX_LAYERED |
+/// WS_EX_NOACTIVATE`, [`ALWAYS_ON_EX_STYLE`]) set either way (a style rewrite
+/// by the toolkit drops all of them, see `hit_test.rs`). The cursor poller
+/// (`hit_test`) drives this every tick; [`set_interactive`] layers focus on
+/// top for modal surfaces. Idempotent: reads the live style and writes only on
+/// a real difference.
 pub fn set_transparent(window: &WebviewWindow, transparent: bool) -> Result<(), OverlayError> {
     #[cfg(windows)]
     unsafe {
@@ -282,10 +344,11 @@ pub fn set_transparent(window: &WebviewWindow, transparent: bool) -> Result<(), 
             .map_err(|e| OverlayError::Win32(e.to_string()))?;
         let hwnd = HWND(hwnd.0);
         let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let layered = style | ALWAYS_ON_EX_STYLE;
         let new_style = if transparent {
-            style | (WS_EX_TRANSPARENT.0 as isize)
+            layered | (WS_EX_TRANSPARENT.0 as isize)
         } else {
-            style & !(WS_EX_TRANSPARENT.0 as isize)
+            layered & !(WS_EX_TRANSPARENT.0 as isize)
         };
         if new_style != style {
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
@@ -323,9 +386,10 @@ pub fn set_hit_test_rects(
 /// silently does nothing, forever.
 ///
 /// `interactive == true` also focuses the window, since a window created with
-/// `focus: false` and `skipTaskbar: true` cannot otherwise be reached by
-/// keyboard either. Bubbles keep using [`set_hit_test_rects`]; this is the
-/// coarser "a modal owns the screen" switch.
+/// `focus: false`, `skipTaskbar: true` and `WS_EX_NOACTIVATE` cannot otherwise
+/// be reached by keyboard (an explicit `set_focus` activates it regardless of
+/// NOACTIVATE — that is the documented escape hatch). Bubbles keep using
+/// [`set_hit_test_rects`]; this is the coarser "a modal owns the screen" switch.
 pub fn set_interactive(window: &WebviewWindow, interactive: bool) -> Result<(), OverlayError> {
     #[cfg(windows)]
     {
@@ -339,10 +403,11 @@ pub fn set_interactive(window: &WebviewWindow, interactive: bool) -> Result<(), 
                 .map_err(|e| OverlayError::Win32(e.to_string()))?;
             let hwnd = HWND(hwnd.0);
             let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            let layered = style | ALWAYS_ON_EX_STYLE;
             let new_style = if interactive {
-                style & !(WS_EX_TRANSPARENT.0 as isize)
+                layered & !(WS_EX_TRANSPARENT.0 as isize)
             } else {
-                style | (WS_EX_TRANSPARENT.0 as isize)
+                layered | (WS_EX_TRANSPARENT.0 as isize)
             };
             if new_style != style {
                 SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
@@ -365,7 +430,45 @@ mod tests {
     use super::*;
 
     fn mon(x: i32, y: i32, w: u32, h: u32) -> MonitorInfo {
-        MonitorInfo { x, y, width: w, height: h }
+        MonitorInfo::full(x, y, w, h)
+    }
+
+    /// A monitor with a 48 px bottom taskbar: the work area is the monitor
+    /// minus that strip (what Windows reports for the default Win11 taskbar).
+    fn mon_with_taskbar(x: i32, y: i32, w: u32, h: u32) -> MonitorInfo {
+        let mut m = MonitorInfo::full(x, y, w, h);
+        m.work_height = h - 48;
+        m
+    }
+
+    // --- 2026-09-06: the overlay stays off the taskbar --------------------
+
+    #[test]
+    fn an_overlay_covers_the_work_area_not_the_taskbar() {
+        let plan = plan_overlays(&[mon_with_taskbar(0, 0, 2560, 1440)]);
+        assert_eq!(
+            (plan[0].x, plan[0].y, plan[0].width, plan[0].height),
+            (0, 0, 2560, 1392),
+            "the bottom 48 px (the taskbar) are not part of the overlay window"
+        );
+    }
+
+    #[test]
+    fn a_top_or_left_taskbar_moves_the_overlay_origin() {
+        let mut m = MonitorInfo::full(0, 0, 2560, 1440);
+        m.work_y = 48;
+        m.work_height = 1392;
+        let plan = plan_overlays(&[m]);
+        assert_eq!((plan[0].y, plan[0].height), (48, 1392));
+    }
+
+    #[test]
+    fn a_cursor_over_the_taskbar_still_routes_to_that_monitor() {
+        // Routing uses the FULL bounds: a click on the taskbar (y = 1420, in
+        // the strip the overlay no longer covers) must still map to monitor 0,
+        // not to "no monitor".
+        let monitors = [mon_with_taskbar(0, 0, 2560, 1440), mon(2560, 0, 1920, 1080)];
+        assert_eq!(monitor_index_at((100, 1420), &monitors), Some(0));
     }
 
     #[test]

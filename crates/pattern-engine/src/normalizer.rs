@@ -87,7 +87,10 @@ pub fn app_class(process: &str) -> String {
     let p = p.strip_suffix(".exe").unwrap_or(&p);
     match p {
         "chrome" | "msedge" | "edge" | "firefox" | "brave" | "opera" | "opera_gx" => "browser",
-        "code" | "code - insiders" | "rustrover64" | "idea64" | "pycharm64" | "devenv" => "ide",
+        // VS Code and its forks (Antigravity IDE is the owner's daily driver,
+        // 2026-09-06; Cursor / Windsurf ship the same shell).
+        "code" | "code - insiders" | "antigravity ide" | "antigravity" | "cursor" | "windsurf"
+        | "rustrover64" | "idea64" | "pycharm64" | "devenv" => "ide",
         "excel" | "winword" | "powerpnt" | "onenote" => "office",
         "windowsterminal" | "wt" | "cmd" | "powershell" | "pwsh" => "terminal",
         "explorer" => "shell",
@@ -117,11 +120,20 @@ pub fn action_of(ty: EventType) -> &'static str {
 }
 
 /// Event types the miner ignores entirely (doc 08 §2): audit + feedback rows are
-/// consumed by the feedback loop, not mined as behavior.
-fn is_behavioral(ty: EventType) -> bool {
+/// consumed by the feedback loop, not mined as behavior — and `window_close`,
+/// which doc 08 §2's action list (focus/open/navigation/media/document/ide)
+/// never included. Mining closes was drift with teeth (2026-09-06, the owner's
+/// "not a single recommendation"): on the owner's box `window_close` was 60 %
+/// of the event stream (shell popups, tooltips, browser tab windows), so the
+/// n-gram window was mostly `close` tokens, every `⇒ *` denominator was spread
+/// across close-noise consequents, and no sequence of real app switches ever
+/// reached the 0.4 confidence floor. Closing a window is not a behaviour the
+/// engine can act on either — nothing resumes a closed window.
+pub fn is_behavioral(ty: EventType) -> bool {
     !matches!(
         ty,
-        EventType::SuggestionShown
+        EventType::WindowClose
+            | EventType::SuggestionShown
             | EventType::SuggestionClicked
             | EventType::SuggestionDismissed
             | EventType::CaptureToggle
@@ -130,6 +142,37 @@ fn is_behavioral(ty: EventType) -> bool {
             | EventType::VoiceUtterance // telemetry role; queried, not mined (doc 07)
     )
 }
+
+/// Whether a (persisted or freshly mined) token could be minted by
+/// [`normalize`] today — its action is one of the behavioural event types'.
+/// The hydrate uses it to drop rows learned under an older token vocabulary
+/// (the `close`-noise table, 2026-09-06) instead of carrying them forever.
+pub fn is_minable(token: &Token) -> bool {
+    ALL_EVENT_TYPES
+        .iter()
+        .copied()
+        .filter(|ty| is_behavioral(*ty))
+        .any(|ty| action_of(ty) == token.action)
+}
+
+/// Every taxonomy variant, so [`is_minable`] stays in lock-step with
+/// [`is_behavioral`] / [`action_of`] without a second hand-written list.
+const ALL_EVENT_TYPES: &[EventType] = &[
+    EventType::WindowFocus,
+    EventType::WindowOpen,
+    EventType::WindowClose,
+    EventType::Navigation,
+    EventType::MediaState,
+    EventType::DocumentState,
+    EventType::IdeState,
+    EventType::VoiceUtterance,
+    EventType::SuggestionShown,
+    EventType::SuggestionClicked,
+    EventType::SuggestionDismissed,
+    EventType::CaptureToggle,
+    EventType::CloudSend,
+    EventType::McpSearch,
+];
 
 /// Derive the coarse `resource_class` from an event's connector-typed payload
 /// (doc 08 §2): `youtube`, `doc:<ext>`, `ide:<ext>`, `url:<host>`, else `None` (`∅`).
@@ -228,6 +271,17 @@ pub fn normalize(ev: &Event) -> Option<Token> {
     if process.trim().is_empty() {
         return None;
     }
+    // A focus/open with no window title is a transient shell surface — a
+    // tooltip, a jump list, `PopupHost`, the bare desktop — not a step the
+    // user took (2026-09-06; excluded contexts are title-less too, but they
+    // were already dropped by the redaction flag above, so this only ever sees
+    // the genuinely nameless). Payload-bearing types (navigation, media,
+    // document, ide) identify themselves and need no title.
+    if matches!(ev.r#type, EventType::WindowFocus | EventType::WindowOpen)
+        && ev.window_title.as_deref().map_or(true, |t| t.trim().is_empty())
+    {
+        return None;
+    }
     Some(Token {
         app_class: app_class(process),
         action: action_of(ev.r#type).to_string(),
@@ -306,11 +360,64 @@ mod tests {
     #[test]
     fn excluded_and_audit_events_never_tokenize() {
         let mut e = ev(EventType::WindowFocus, "1password.exe", serde_json::json!({}));
+        e.window_title = Some("Personal vault".into());
         e.redaction_flags = redaction_flags::EXCLUDED;
         assert!(normalize(&e).is_none(), "EXCLUDED never mined (doc 13 §4)");
 
         let audit = ev(EventType::CloudSend, "aperture.exe", serde_json::json!({}));
         assert!(normalize(&audit).is_none(), "audit rows never mined");
+    }
+
+    /// 2026-09-06: `window_close` is not a doc 08 §2 action and is not mined;
+    /// a nameless focus/open is a shell transient, not a behaviour; a titled
+    /// focus still tokenizes. Payload-bearing types need no title.
+    #[test]
+    fn close_and_nameless_focus_are_not_mined_but_titled_focus_is() {
+        let mut close = ev(EventType::WindowClose, "opera.exe", serde_json::json!({}));
+        close.window_title = Some("Claude - Opera".into());
+        assert!(normalize(&close).is_none(), "close is not a minable action");
+
+        let nameless = ev(EventType::WindowFocus, "explorer.exe", serde_json::json!({}));
+        assert!(normalize(&nameless).is_none(), "no title ⇒ shell transient");
+        let mut blank = ev(EventType::WindowOpen, "explorer.exe", serde_json::json!({}));
+        blank.window_title = Some("   ".into());
+        assert!(normalize(&blank).is_none(), "blank title ⇒ shell transient");
+
+        let mut titled = ev(EventType::WindowFocus, "opera.exe", serde_json::json!({}));
+        titled.window_title = Some("Claude - Opera".into());
+        let t = normalize(&titled).expect("a titled focus tokenizes");
+        assert_eq!((t.app_class.as_str(), t.action.as_str()), ("browser", "focus"));
+
+        let nav = ev(
+            EventType::Navigation,
+            "opera.exe",
+            serde_json::json!({"url": "https://docs.rs/tokio"}),
+        );
+        assert!(normalize(&nav).is_some(), "payload-bearing types need no title");
+    }
+
+    #[test]
+    fn is_minable_tracks_the_behavioural_action_list() {
+        let tok = |action: &str| Token {
+            app_class: "browser".into(),
+            action: action.into(),
+            resource_class: None,
+        };
+        for ok in ["focus", "open", "navigation", "media", "document", "ide"] {
+            assert!(is_minable(&tok(ok)), "{ok} is a doc 08 §2 action");
+        }
+        for bad in ["close", "capture_toggle", "voice", "suggestion_clicked", "bogus"] {
+            assert!(!is_minable(&tok(bad)), "{bad} must not be minable");
+        }
+    }
+
+    #[test]
+    fn vscode_forks_fold_into_the_ide_class() {
+        assert_eq!(app_class("Antigravity IDE.exe"), "ide");
+        assert_eq!(app_class("Cursor.exe"), "ide");
+        assert_eq!(app_class("code.exe"), "ide");
+        assert_eq!(app_class("opera.exe"), "browser");
+        assert_eq!(app_class("claude.exe"), "claude", "unknown apps keep their own class");
     }
 
     #[test]

@@ -11,12 +11,11 @@ description = "Milestone validation-gate test harnesses (doc 16): the M0 schema 
 # proactive-path run (doc 15 §7). The M0 gate also asserts these compile + instantiate.
 aperture-contracts = { workspace = true, features = ["fakes"] }
 # aperture-db gives us the authoritative embedded DDL (migrations::MIGRATIONS) and,
-# as a transitive dep, the `bundled` rusqlite used to materialize a scratch DB.
+# as a transitive dep, the rusqlite used to materialize a scratch DB. (A direct
+# `rusqlite` re-declaration was dropped 2026-09-05: no test file named its types.)
 aperture-db = { workspace = true }
 
-# rusqlite (re-declared so the test files can name its types directly) and serde_json
-# (to (de)serialize the Event payload / round-trip each EventType through the schema).
-rusqlite = { workspace = true }
+# serde_json: (de)serialize the Event payload / round-trip each EventType through the schema.
 serde_json = { workspace = true }
 
 # M4 gate (m4_us1_resume): the real connectors + the bubble renderer, driven
@@ -57,13 +56,19 @@ aperture-reasoning-gateway = { workspace = true }
 aperture-action-executor = { workspace = true }
 
 [features]
-default = []
-# Forwards to aperture-db's SQLCipher build so `m9_db_is_unreadable_without_the_key`
-# can run. Needs a native Perl + NASM on PATH (doc 13 §6).
+# Default ON since 2026-09-05: the product build is SQLCipher (src-tauri enables
+# `aperture-db/sqlcipher`), so `cargo test --workspace` already compiles the
+# SQLCipher rusqlite — defaulting the feature here makes the M9 "DB unreadable
+# without the key" exit criterion part of every workspace run instead of a
+# never-compiled `#[cfg(feature)]` test. Needs a native Perl + NASM on PATH
+# (doc 13 §6); `--no-default-features` gives the plaintext build.
+default = ["sqlcipher"]
 sqlcipher = ["aperture-db/sqlcipher"]
 
 # NOTE (doc 16 M0): no extra dev-dependencies. The gate tests deliberately avoid a
 # network/HTTP/process-spawn crate — pulling one in here would itself violate the
-# two-emitter rule (doc 13 §2) that these very gates exist to protect. The SC5/SC6
-# monitor backends are external tools (ETW / mitmproxy / nvidia-smi), invoked out of
-# process and marked `#[ignore]` until M7 / the RTX-target gate wires them up.
+# two-emitter rule (doc 13 §2) that these very gates exist to protect. SC5 is a
+# real in-process harness (loopback origin the test owns) and runs unignored;
+# the SC6 / SC3 / SC4 / V2-M0 backends are external tools or real hardware
+# (nvidia-smi, tasklist, the RTX target, a live desktop), invoked out of process
+# and `#[ignore]`d for the owner to run.
