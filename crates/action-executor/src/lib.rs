@@ -81,21 +81,19 @@ pub struct WindowInfo {
 
 /// "Is this window excluded?" — the seam over capture's `ExclusionList`
 /// (Doc 22 §4.3, Doc 24 #49). src-tauri implements it; returns the matching
-/// rule's label (what the pause notification shows), or `None`.
+/// rule's label (what the pause notification shows), or `None`. The probe
+/// sees the whole foreground [`WindowInfo`] (hwnd included) so it can resolve
+/// a browser window's live URL for `url_pattern` rules — the executor itself
+/// never reads URLs and never decides; it only refuses on `Some`.
 pub trait ExclusionProbe: Send + Sync {
-    fn excluded_label(
-        &self,
-        process: Option<&str>,
-        window_class: Option<&str>,
-        title: Option<&str>,
-    ) -> Option<String>;
+    fn excluded_label(&self, window: &WindowInfo) -> Option<String>;
 }
 
 /// No exclusion rules at all (gates, spikes).
 pub struct NoExclusions;
 
 impl ExclusionProbe for NoExclusions {
-    fn excluded_label(&self, _: Option<&str>, _: Option<&str>, _: Option<&str>) -> Option<String> {
+    fn excluded_label(&self, _: &WindowInfo) -> Option<String> {
         None
     }
 }
@@ -220,6 +218,12 @@ mod tests {
 
     #[test]
     fn no_exclusions_never_excludes() {
-        assert_eq!(NoExclusions.excluded_label(Some("x.exe"), Some("Cls"), Some("T")), None);
+        let w = WindowInfo {
+            hwnd: 1,
+            title: "T".into(),
+            process: Some("x.exe".into()),
+            window_class: Some("Cls".into()),
+        };
+        assert_eq!(NoExclusions.excluded_label(&w), None);
     }
 }

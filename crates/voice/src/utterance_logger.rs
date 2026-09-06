@@ -110,16 +110,20 @@ pub async fn store_and_embed(
 ) -> Result<i64, LoggerError> {
     let ev = record.to_event(now_ms);
     // Embed the transcript as a stored document (doc 03 §5; the embedder applies
-    // the DOC task prefix). A blank transcript embeds nothing but still stores the
-    // event — the telemetry role is unconditional (locked decision B, doc 07 §3).
+    // the DOC task prefix). A blank transcript embeds nothing, and an embedder
+    // failure is logged and dropped — either way the event still stores: the
+    // telemetry role is unconditional (locked decision B, doc 07 §3). Before
+    // 2026-09-05 an embed error returned early and lost the utterance.
     let embedding = if record.transcript.trim().is_empty() {
         None
     } else {
-        Some(
-            embedder
-                .embed(&record.transcript)
-                .map_err(|e| LoggerError::Embed(e.to_string()))?,
-        )
+        match embedder.embed(&record.transcript) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(error = %e, "utterance embed failed; storing the event without ctx_vec");
+                None
+            }
+        }
     };
     // One atomic single-writer transaction: the event row and its `ctx_vec`
     // embedding commit together (doc 03 §1). Returns the DB-assigned event_id.
@@ -170,6 +174,32 @@ mod tests {
             hits.iter().any(|h| h.event_id == id),
             "the utterance transcript is retrievable from ctx_vec"
         );
+    }
+
+    /// An embedder that always fails — the store must not depend on it.
+    struct FailingEmbedder;
+    impl Embedder for FailingEmbedder {
+        fn embed(&self, _text: &str) -> Result<Vec<f32>, aperture_embedding::EmbedError> {
+            Err(aperture_embedding::EmbedError::Inference("boom".into()))
+        }
+        fn id(&self) -> &'static str {
+            "failing"
+        }
+    }
+
+    #[tokio::test]
+    async fn embed_failure_still_stores_the_event_without_a_vector() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let id = store_and_embed(&db, &FailingEmbedder, &record("remind me later", 0.8), 7)
+            .await
+            .expect("stored despite the embed failure (telemetry is unconditional)");
+        let ev = db.read_event(id).expect("event row");
+        assert_eq!(ev.r#type, EventType::VoiceUtterance);
+        assert_eq!(ev.payload["transcript"], "remind me later");
+        // Nothing landed in ctx_vec for it: a KNN over any vector finds no hit for this id.
+        let q = HashEmbedder.embed("remind me later").unwrap();
+        let hits = db.knn(&q, 5, 0).expect("knn");
+        assert!(hits.iter().all(|h| h.event_id != id), "no vector was indexed");
     }
 
     #[tokio::test]

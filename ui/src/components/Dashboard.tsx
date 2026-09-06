@@ -15,6 +15,7 @@ import {
   agentTaskSteps,
   dashboardStats,
   getAutostart,
+  getDiagnostics,
   getSettings,
   grantVoiceConsent,
   listEvents,
@@ -30,6 +31,7 @@ import {
   type AgentStepRow,
   type AgentTaskRow,
   type DashboardStats,
+  type Diagnostics,
   type Health,
   type HistoryEvent,
   type PatternEngineSettings,
@@ -40,6 +42,7 @@ import {
   type VlmStatus,
   type VoiceSettings,
 } from "../lib/ipc";
+import { diagnose } from "../state/diagnosis";
 import { useDraggable } from "../state/useDraggable";
 import { useModalSurface } from "../state/useModalSurface";
 
@@ -583,6 +586,110 @@ function healthLabel(h: Health | undefined): string {
   return `${h.kind === "needs_setup" ? "needs setup" : "unavailable"} — ${h.detail}`;
 }
 
+/** "Why am I not seeing bubbles?" — the doc 11 §6 diagnostics block (built
+ *  2026-09-06 after three weeks of zero recommendations with no way to see
+ *  why). Live counts from the engine's trigger gate plus the 24-hour facts the
+ *  seven rules depend on, refreshed every 5 s while the tab is open. Read-only;
+ *  coarse class-token signatures only — nothing here is a title, URL or path. */
+function DiagnosticsBlock() {
+  const [diag, setDiag] = useState<Diagnostics | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const tick = () =>
+      void getDiagnostics()
+        .then((d) => {
+          if (!cancelled) setDiag(d);
+        })
+        .catch((e) => {
+          if (!cancelled) setError(String(e));
+        });
+    tick();
+    const timer = setInterval(tick, 5_000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, []);
+
+  if (error) return <p className="dash__error">{error}</p>;
+  if (!diag) return <p className="dash__empty">Loading…</p>;
+
+  const e = diag.engine;
+  const { verdict, notes } = diagnose(diag);
+  const tiles: { label: string; value: string; sub?: string }[] = [
+    { label: "Steps captured, 24 h", value: fmtCount(diag.events_24h), sub: `${fmtCount(diag.navigation_24h)} page visits` },
+    {
+      label: "Habits ready to fire",
+      value: e ? fmtCount(e.patterns_at_floor) : "–",
+      sub: e ? `of ${fmtCount(e.patterns_cached)} tracked, floor ${e.support_floor}×` : undefined,
+    },
+    { label: "Candidates judged", value: e ? fmtCount(e.gate.evaluated) : "–", sub: "since launch" },
+    { label: "Bubbles admitted", value: e ? fmtCount(e.gate.admitted) : "–", sub: `${fmtCount(diag.suggestions_24h)} in 24 h` },
+    { label: "Resumable right now", value: fmtCount(diag.connector_states_fresh), sub: "pages, documents, files" },
+    {
+      label: "Browser extension",
+      value: diag.extension_hosts_connected > 0 ? "connected" : "not connected",
+      sub: diag.extension_hosts_connected > 0 ? `${diag.extension_hosts_connected} browser(s)` : "load it to resume pages",
+    },
+  ];
+  const rejected = e ? e.rejected_by_reason.filter((r) => r.count > 0).sort((a, b) => b.count - a.count) : [];
+  const fmtDecision = (d: { signature: string; score: number; at_ms: number } | null) =>
+    d ? `${d.signature} at ${Math.round(d.score * 100)}%, ${new Date(d.at_ms).toLocaleTimeString()}` : null;
+
+  return (
+    <section>
+      <h3 className="dash__subhead">Why am I not seeing bubbles?</h3>
+      <p className="dash__facts">{verdict}</p>
+      {notes.map((n) => (
+        <p key={n} className="dash__facts">
+          {n}
+        </p>
+      ))}
+      <div className="dash__tiles">
+        {tiles.map((t) => (
+          <div key={t.label} className="dash__tile">
+            <div className="dash__tile-value">{t.value}</div>
+            <div className="dash__tile-label">{t.label}</div>
+            {t.sub && <div className="dash__tile-sub">{t.sub}</div>}
+          </div>
+        ))}
+      </div>
+      {rejected.length > 0 && (
+        <ul className="dash__rows">
+          {rejected.map((r) => (
+            <li key={r.label} className="dash__row">
+              <div className="dash__row-head">
+                <span className="dash__row-title">
+                  {r.label} <strong>{fmtCount(r.count)}×</strong>
+                </span>
+              </div>
+              <div className="dash__row-app">{r.hint}</div>
+            </li>
+          ))}
+        </ul>
+      )}
+      {e?.gate.closest_miss && (
+        <p className="dash__facts">
+          Closest miss: <code>{fmtDecision(e.gate.closest_miss)}</code>
+          {e.gate.closest_miss.reject ? ` — ${e.rejected_by_reason[rejectIndex(e.gate.closest_miss.reject)]?.label ?? e.gate.closest_miss.reject}` : ""}
+        </p>
+      )}
+      {e?.gate.last_admitted && (
+        <p className="dash__facts">
+          Last admitted: <code>{fmtDecision(e.gate.last_admitted)}</code>
+        </p>
+      )}
+    </section>
+  );
+}
+
+/** Index of a `TriggerReject` variant name in the rule-ordered rows. */
+function rejectIndex(reject: string): number {
+  return ["BelowScore", "BelowSupport", "NoFreshState", "Cooldown", "HourlyCapReached", "NotNovel", "CaptureOff"].indexOf(reject);
+}
+
 function AdvancedTab() {
   const [dwellSec, setDwellSec] = useState<number | null>(null);
   const [order, setOrder] = useState<TransportTarget[] | null>(null);
@@ -703,6 +810,8 @@ function AdvancedTab() {
       </p>
       {error && <p className="dash__error">{error}</p>}
 
+      <DiagnosticsBlock />
+
       <h3 className="dash__subhead">Bubbles</h3>
       <Knob
         label="How long a bubble stays"
@@ -723,11 +832,11 @@ function AdvancedTab() {
       </p>
       <Knob
         label="Certainty before suggesting"
-        hint="Higher means fewer, more confident bubbles. Shipped default: 70%."
-        min={0.5}
+        hint="Higher means fewer, more confident bubbles. Shipped default: 40% (lowered from 70% on 2026-08-26 — the engine never cleared the old bar in real use)."
+        min={0.2}
         max={0.95}
         step={0.05}
-        value={typeof knobs?.tau_conf === "number" ? knobs.tau_conf : knobs ? 0.7 : null}
+        value={typeof knobs?.tau_conf === "number" ? knobs.tau_conf : knobs ? 0.4 : null}
         format={(v) => `${Math.round(v * 100)}%`}
         onChange={(v) => updateKnob("tau_conf", v)}
       />
@@ -942,11 +1051,25 @@ function fmtTime(ts: number): string {
 // --- Agent (v2, Doc 22 §9 / V2-M6) -------------------------------------------
 
 /** Task history + the per-step audit trail (payload hash, action, result). */
+/** How long an armed Purge stays armed before it disarms itself. */
+const PURGE_ARM_MS = 6000;
+
 function AgentTab() {
   const [rows, setRows] = useState<AgentTaskRow[]>([]);
   const [open, setOpen] = useState<string | null>(null);
   const [steps, setSteps] = useState<AgentStepRow[]>([]);
   const [error, setError] = useState<string | null>(null);
+  // Purge is irreversible — it deletes the task AND every step's audit row,
+  // the only record of what Claude did and what was sent — so it is two-step:
+  // the first click ARMS the row, the second confirms; Cancel or ~6 s of
+  // silence disarms. Never a browser confirm(): a modal dialog would block
+  // the WebView (see PrivacyPanel's typed confirmation). 08-22 review.
+  const [armed, setArmed] = useState<string | null>(null);
+  useEffect(() => {
+    if (!armed) return;
+    const t = window.setTimeout(() => setArmed(null), PURGE_ARM_MS);
+    return () => window.clearTimeout(t);
+  }, [armed]);
 
   const reload = () => agentListTasks(100).then(setRows).catch((e) => setError(String(e)));
   useEffect(() => {
@@ -967,6 +1090,7 @@ function AgentTab() {
   }
 
   async function purge(id: string) {
+    setArmed(null);
     try {
       await agentPurgeTask(id);
       if (open === id) setOpen(null);
@@ -1004,9 +1128,25 @@ function AgentTab() {
               <button className="btn" onClick={() => void toggle(t.id)}>
                 {open === t.id ? "Hide steps" : "Show steps"}
               </button>
-              <button className="btn btn--danger" onClick={() => void purge(t.id)}>
-                Purge
-              </button>
+              {armed === t.id ? (
+                <span className="dash__purge-confirm" role="group" aria-label="Confirm purge">
+                  <span className="dash__purge-warn">Deletes this task and all its step records.</span>
+                  <button className="btn btn--danger" onClick={() => void purge(t.id)}>
+                    Confirm purge
+                  </button>
+                  <button className="btn" onClick={() => setArmed(null)}>
+                    Cancel
+                  </button>
+                </span>
+              ) : (
+                <button
+                  className="btn btn--danger dash__purge"
+                  onClick={() => setArmed(t.id)}
+                  title="Deletes the task and every step's audit row — irreversible"
+                >
+                  Purge…
+                </button>
+              )}
             </div>
             {open === t.id && (
               <ol className="dash__steps">

@@ -37,7 +37,12 @@
   border: 1px solid var(--border-hairline);
   border-radius: var(--radius-16);
   box-shadow: var(--shadow-elev), var(--lens-lip);
-  contain: strict; /* bound rasterization to this box */
+  /* Bound rasterization to this box — layout + paint containment only. It was
+   * `contain: strict` (which adds SIZE containment) until 2026-09-06: size
+   * containment lays the box out as if it had no contents, so an auto-height
+   * card collapsed to its padding and `overflow: hidden` clipped the text —
+   * the owner's "the bubble is cut off, I can't read it". */
+  contain: layout paint;
   overflow: hidden;
 
   color: var(--ink-primary);
@@ -85,9 +90,14 @@
   grid-area: title;
   font-weight: 600;
   line-height: 1.2;
-  white-space: nowrap;
+  /* Wrap to two lines, then clamp (2026-09-06): the one-line ellipsis cut
+   * most real titles ("Resume <document> in Word") before the noun. The full
+   * title stays in the `title` attribute. */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
   overflow: hidden;
-  text-overflow: ellipsis;
+  overflow-wrap: anywhere;
 }
 .bubble__sublabel {
   grid-area: sublabel;
@@ -452,12 +462,16 @@ body.gpu-busy .bubble--exit {
 /* ==========================================================================
  * Voice surfaces (doc 11 §5) — pill / chip / answer bubble. All glass surfaces.
  * Positioned bottom-center so they don't collide with the bottom-right stack.
+ * z 36: above the agent stack (35, agent.css) — PTT is momentary and the user
+ * is holding a key for it, so it must never render under the agent bar
+ * (08-22 review); still below the panels (40).
  * ======================================================================== */
 .voice {
   position: fixed;
   left: 50%;
   bottom: var(--edge-inset);
   transform: translateX(-50%);
+  z-index: 36;
   box-sizing: border-box;
   padding: 10px 14px;
   display: flex;
@@ -584,39 +598,39 @@ body.gpu-busy .bubble--exit {
 }
 
 /* ==========================================================================
- * Capture indicator (doc 12 §6) — master toggle + activity pulse. Bottom-right,
- * above the bubble stack so it is always visible.
+ * Capture indicator (doc 12 §6) — master toggle + activity pulse, rendered
+ * inside the HUD's expanded row (Hud.tsx, 2026-09-06); the collapsed orb shows
+ * the same `.capture__dot`. No surface of its own: the row is the surface.
  * ======================================================================== */
 .capture {
-  position: fixed;
-  right: var(--edge-inset);
-  top: var(--edge-inset);
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 10px;
-
-  background: var(--glass-2);
-  -webkit-backdrop-filter: blur(var(--blur-8)) saturate(var(--saturate));
-  backdrop-filter: blur(var(--blur-8)) saturate(var(--saturate));
-  border: 1px solid var(--border-hairline);
-  border-radius: 999px;
-  box-shadow: var(--shadow-elev), var(--lens-lip);
-}
-@supports not (backdrop-filter: blur(1px)) {
-  .capture {
-    background: var(--fallback-opaque);
-  }
+  padding: 0 6px 0 4px;
 }
 .capture__toggle {
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  padding: 4px 6px;
   background: transparent;
   border: 0;
+  border-radius: 999px;
   color: var(--ink-primary);
   font: inherit;
+  font-weight: 600;
   cursor: pointer;
+}
+.capture__toggle:hover {
+  background: var(--lift-1);
+}
+.capture__toggle:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+.capture__toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 .capture__dot {
   width: 9px;

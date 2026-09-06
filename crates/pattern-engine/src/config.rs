@@ -10,9 +10,11 @@
 //! the 3rd dismiss). ADR-032 makes the cap/sessionization adaptive with bounded
 //! ranges and conservative cold-start defaults.
 
-/// Trigger rule 1 — score threshold `τ_conf` (doc 08 §6.1, ADR-033: 0.6 ⟶ 0.7 —
-/// fewer, higher-confidence bubbles). `[VERIFY — tuned against SC7 at M3]`.
-pub const TAU_CONF: f64 = 0.7;
+/// Trigger rule 1 — score threshold `τ_conf` (doc 08 §6.1, ADR-033: 0.6 ⟶ 0.7,
+/// owner-lowered 2026-08-26: 0.7 ⟶ 0.4 — the engine never cleared the bar in
+/// real use, so trade precision for actually firing). `[VERIFY — tuned against
+/// SC7 at M3]`.
+pub const TAU_CONF: f64 = 0.4;
 
 /// Trigger rule 2 — cold-start weighted-support floor (doc 08 §6.2, Q23:
 /// unchanged at 3). `[ASSUMPTION]`. Also the n-gram support floor; below this we

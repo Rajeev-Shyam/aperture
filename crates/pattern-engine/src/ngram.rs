@@ -64,6 +64,21 @@ pub fn parse_signature(signature: &str) -> Option<(String, Token)> {
     Some((format!("{antecedent} ⇒ *"), consequent))
 }
 
+/// Every token of a persisted signature — the antecedent tokens in order, then
+/// the consequent — or `None` if any part fails to decode. The hydrate runs
+/// [`crate::normalizer::is_minable`] over these so rows learned under an older
+/// token vocabulary (the `close`-noise table, 2026-09-06) are dropped rather
+/// than carried forever.
+pub fn signature_tokens(signature: &str) -> Option<Vec<Token>> {
+    let (antecedent, consequent) = signature.split_once(" ⇒ ")?;
+    let mut tokens = antecedent
+        .split(" | ")
+        .map(Token::decode)
+        .collect::<Option<Vec<_>>>()?;
+    tokens.push(Token::decode(consequent)?);
+    Some(tokens)
+}
+
 /// A session-local ring of recent tokens; produces the current matching tail and
 /// all closing n-grams as each new token arrives (doc 08 §4-§5).
 #[derive(Debug, Default)]

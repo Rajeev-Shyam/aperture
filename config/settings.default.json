@@ -50,7 +50,7 @@
 
   "pattern_engine": {
     "$comment": "Read by the pattern task at startup, on any set_settings write (decision #17's UI half — the Dashboard Advanced tab edits tau_conf / cold_start_support_floor / cooldown_min / cap_per_hour_default live), and on its daily maintenance tick as the backstop for edits made outside the app. Missing/invalid keys fall back to the crate constants in pattern-engine/src/config.rs — a typo can never weaken the engine.",
-    "tau_conf": 0.7,
+    "tau_conf": 0.4,
     "cold_start_support_floor": 3,
     "semantic_similarity_threshold": 0.75,
     "cooldown_min": 30,
@@ -78,7 +78,9 @@
     "max_glass_surfaces": 2,
     "$comment_glass": "ADR-039: at most 2 glass surfaces; the 3rd visible bubble renders in the opaque fallback class. Blur ceiling 12 px (doc 14 §2).",
     "$comment_freshness": "Decision #5 (2026-08-16): half-life of the freshness factor in the bubble slot-admission score (score = confidence x 0.5^(age/half_life)), so a stale-but-confident queued bubble cannot block a fresher one forever. Settings-only on purpose — it tunes queue ordering, not anything visible. Clamped to 10-86400 s.",
-    "bubble_freshness_half_life_sec": 600
+    "bubble_freshness_half_life_sec": 600,
+    "$comment_hud": "2026-09-06: the HUD orb. `hud_hidden` true hides it (gaming, presenting) — set by the orb's hide button, cleared by the tray's 'Show overlay controls'; both go through settings_changed. `hud_anchor` (one of the 8 corner/edge names) is written by dragging the orb and is absent until the first drag.",
+    "hud_hidden": false
   },
 
   "reasoning": {

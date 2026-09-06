@@ -258,7 +258,9 @@ pub fn emit_suggestion_rated(app: &AppHandle, id: &str, rating: &str) -> tauri::
 }
 
 /// The `settings_changed` wire payload (matches the UI's `SettingsChangedEvent`).
-#[derive(Debug, Clone, Serialize)]
+/// Deserialize: the tray listens on this channel too (`tray.rs`) so its "Show
+/// overlay controls" checkmark mirrors the stored `ui.hud_hidden`.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct SettingsChangedPayload {
     /// Top-level sections in the write, e.g. `["ui"]` / `["reasoning"]`.
     pub sections: Vec<String>,
@@ -298,9 +300,10 @@ pub fn emit_suggestion_lifecycle(
     app.emit(SUGGESTION_LIFECYCLE, payload)
 }
 
-// TODO(M3:) spawn the bus->WebView forwarder task in main.rs setup: subscribe to
-// the orchestration `gpu_busy` broadcast (doc 12) and to suggestion-generator
-// `BubbleSpec` output, fanning each onto the channels above.
+// There is no bus->WebView forwarder task and none is planned (a stale TODO(M3)
+// promising one was removed 2026-09-05): the pattern task in `pipeline.rs`
+// emits `bubble_spec` itself, the `gpu_busy` forwarder in `main.rs` reads
+// orchestration's own broadcast, and commands emit the rest directly.
 
 /// v2 agent task view (Doc 22 §9, decision #53) — broadcast on every change;
 /// `null` payload means no task exists (the surface unmounts).

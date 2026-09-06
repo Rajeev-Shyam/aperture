@@ -423,6 +423,66 @@ pub async fn dashboard_stats(state: State<'_, AppState>) -> Result<serde_json::V
     Ok(stats)
 }
 
+/// The Advanced tab's "why am I not seeing bubbles?" block (doc 11 §6
+/// diagnostics, 2026-09-06): the engine's gate counters since launch plus the
+/// last-24-hour facts the seven trigger rules depend on. Counts, thresholds
+/// and coarse class-token signatures only; nothing here is a title, URL or path.
+#[tauri::command]
+pub async fn get_diagnostics(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let engine = state
+        .engine_snapshot
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let extension_hosts = state.capture.nm_bridge().connected_hosts();
+    let capture_enabled = state.consent.lock().await.state().capture_enabled;
+    let now = crate::pipeline::epoch_ms();
+    let day_ago = now - 86_400_000;
+    let db = Arc::clone(&state.db);
+    let mut out = blocking(move || {
+        db.with_conn(|c| {
+            let count = |sql: &str, p: i64| -> rusqlite::Result<i64> {
+                c.query_row(sql, [p], |r| r.get(0))
+            };
+            Ok(serde_json::json!({
+                "events_24h": count(
+                    "SELECT COUNT(*) FROM events WHERE ts > ?1 AND type IN \
+                     ('window_focus','window_open','navigation','media_state','document_state','ide_state')",
+                    day_ago,
+                )?,
+                "navigation_24h": count(
+                    "SELECT COUNT(*) FROM events WHERE ts > ?1 AND type = 'navigation'",
+                    day_ago,
+                )?,
+                "document_ide_24h": count(
+                    "SELECT COUNT(*) FROM events WHERE ts > ?1 AND type IN ('document_state','ide_state')",
+                    day_ago,
+                )?,
+                "connector_states_fresh": count(
+                    "SELECT COUNT(*) FROM connector_state WHERE stale_after_ts IS NULL OR stale_after_ts > ?1",
+                    now,
+                )?,
+                "suggestions_24h": count(
+                    "SELECT COUNT(*) FROM suggestions WHERE COALESCE(created_ts, shown_ts, 0) > ?1",
+                    day_ago,
+                )?,
+                "last_suggestion_ts": c.query_row(
+                    "SELECT MAX(COALESCE(created_ts, shown_ts)) FROM suggestions",
+                    [],
+                    |r| r.get::<_, Option<i64>>(0),
+                )?,
+            }))
+        })
+        .map_err(|e| e.to_string())
+    })
+    .await?;
+    out["engine"] = serde_json::to_value(engine).map_err(|e| e.to_string())?;
+    out["extension_hosts_connected"] = serde_json::json!(extension_hosts);
+    out["capture_enabled"] = serde_json::json!(capture_enabled);
+    out["now_ms"] = serde_json::json!(now);
+    Ok(out)
+}
+
 /// The History tab: recent events joined with their screen context, optionally
 /// filtered by taxonomy type and a LIKE search over app/title/OCR text.
 #[tauri::command]
@@ -1467,12 +1527,49 @@ pub async fn preview_set_approved(
     Ok(response)
 }
 
+/// Push sends currently awaiting the gateway, keyed by payload id; the value
+/// flips to `true` when a cancel arrives while the send is in flight (08-22
+/// review). [`preview_send`] consumes the session and releases the preview lock
+/// BEFORE awaiting the transport, so without this marker a cancel landing in
+/// that window (panel Escape, another monitor claiming the preview) was a
+/// no-op — and the failure-restore path then resurrected an approved session
+/// nobody was displaying (doc 13 §3 zero residue). Process-global rather than
+/// a `PreviewStore` field: `AppState` is managed once per process and payload
+/// ids are unique, so entries cannot alias. Lock order: `state.previews`
+/// before this mutex, never the reverse; never held across an await.
+fn sends_in_flight() -> &'static std::sync::Mutex<std::collections::HashMap<Uuid, bool>> {
+    static SENDS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<Uuid, bool>>> =
+        std::sync::OnceLock::new();
+    SENDS.get_or_init(Default::default)
+}
+
+/// Retire this id's in-flight marker, reporting whether a cancel raced the
+/// send. Every exit from [`preview_send`] past registration must pass through
+/// here — a leaked marker would tombstone an unrelated future retry.
+fn take_send_cancelled(payload_id: &Uuid) -> bool {
+    sends_in_flight()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(payload_id)
+        .unwrap_or(false)
+}
+
 /// Cancel a preview: drop the in-process session — zero residue (doc 13 §3).
+/// A send already in flight for this id cannot be recalled, but the cancel is
+/// recorded so [`preview_send`]'s failure arm drops the backup instead of
+/// restoring an approved session nobody displays (08-22 review).
 #[tauri::command]
 pub async fn preview_cancel(payload_id: Uuid, state: State<'_, AppState>) -> Result<(), String> {
     let mut previews = state.previews.lock().await;
     previews.sessions.remove(&payload_id);
     previews.approved.remove(&payload_id);
+    if let Some(cancelled) = sends_in_flight()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_mut(&payload_id)
+    {
+        *cancelled = true;
+    }
     Ok(())
 }
 
@@ -1530,6 +1627,36 @@ pub async fn preview_retarget(
     Ok(payload)
 }
 
+/// What [`preview_send`]'s failure arm does with the backed-up session (08-22
+/// review). Restoring is only honest when nothing egressed AND someone is
+/// still displaying the preview.
+#[derive(Debug, PartialEq)]
+enum SendFailure {
+    /// Nothing left the machine and the panel is still up: restore the session
+    /// and the approval so Send can honestly be retried.
+    Restore,
+    /// The preview was cancelled while the send was in flight — the panel is
+    /// gone; a restored approved session would be residue nobody displays
+    /// (doc 13 §3 zero residue).
+    DropCancelled,
+    /// [`aperture_reasoning_gateway::GatewayError::Validation`] is raised AFTER
+    /// egress and AFTER the `cloud_send` audit row (gateway steps 3–5): the
+    /// payload is spent, and a restored approval would offer a "retry" that
+    /// re-sends the same bytes.
+    DropSent,
+}
+
+fn classify_send_failure(
+    err: &aperture_reasoning_gateway::GatewayError,
+    cancelled: bool,
+) -> SendFailure {
+    if matches!(err, aperture_reasoning_gateway::GatewayError::Validation(_)) {
+        // Post-egress trumps the cancel question: sent bytes are never retryable.
+        return SendFailure::DropSent;
+    }
+    if cancelled { SendFailure::DropCancelled } else { SendFailure::Restore }
+}
+
 /// The ONLY call that reaches the network (doc 15 §2(c), doc 13 §2) — via the
 /// gateway, SHA-256 audit-logged as `cloud_send`.
 ///
@@ -1537,7 +1664,10 @@ pub async fn preview_retarget(
 /// object whose hash was recorded at approval — a client cannot substitute
 /// content after the gate (preview == wire, doc 13 §3). On a transport failure
 /// the session and approval are RESTORED so Send can honestly be retried, and
-/// the error reaches the panel instead of dead-ending.
+/// the error reaches the panel instead of dead-ending — UNLESS the preview was
+/// cancelled while the send was in flight (nothing may resurrect, doc 13 §3)
+/// or the failure is post-egress validation (the payload is spent; the error
+/// says so and nothing is retryable) — see [`SendFailure`].
 ///
 /// The Send is bound to the transport the preview footer named (review finding
 /// 1): if that transport is not Ready the gateway refuses rather than falling
@@ -1562,23 +1692,46 @@ pub async fn preview_send(
             .sessions
             .remove(&payload_id)
             .ok_or_else(|| format!("preview_send: no session for payload {payload_id}"))?;
+        // Registered while the preview lock is still held: from the store's
+        // side the session just vanished, so a cancel racing the transport
+        // must find this marker rather than no-op (08-22 review).
+        sends_in_flight()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(payload_id, false);
         (session, hash)
     };
 
     // Content-bound approval: the session must still hash to what was approved.
-    let wire = serde_json::to_vec(session.payload()).map_err(|e| e.to_string())?;
+    // (Every return past this point retires the in-flight marker — a leaked
+    // entry would tombstone an unrelated future send of this id.)
+    let wire = match serde_json::to_vec(session.payload()) {
+        Ok(w) => w,
+        Err(e) => {
+            take_send_cancelled(&payload_id);
+            return Err(e.to_string());
+        }
+    };
     if aperture_privacy::audit_log::sha256_hex(&wire) != approved_hash {
+        take_send_cancelled(&payload_id);
         return Err("preview_send: payload changed after approval — re-approve (doc 13 §3)".into());
     }
 
     // Keep an unapproved copy so a failed transport leaves Send retryable.
     let backup = session.payload().clone();
-    let approved = session
-        .approve(aperture_reasoning_gateway::preview::PreviewDecision::Send)
-        .ok_or_else(|| "preview_send: session cancelled".to_string())?;
+    let approved = match session.approve(aperture_reasoning_gateway::preview::PreviewDecision::Send)
+    {
+        Some(a) => a,
+        None => {
+            take_send_cancelled(&payload_id);
+            return Err("preview_send: session cancelled".to_string());
+        }
+    };
 
-    match state.gateway().send_with_preview(&approved, true).await {
+    let sent = state.gateway().send_with_preview(&approved, true).await;
+    match sent {
         Ok(outcome) => {
+            take_send_cancelled(&payload_id);
             // Decision #41: an audit-write failure after a successful egress
             // must be VISIBLE — the audit log is the sole record of what left
             // this machine, and this send is now missing from it. The send
@@ -1600,15 +1753,49 @@ pub async fn preview_send(
             Ok(PreviewSendResult::Sent { suggestions: result })
         }
         Err(e) => {
-            // Nothing left the machine: restore the session AND the approval so
-            // the user can retry (transport failure) or retarget + re-approve
-            // (mismatch, finding 1) against the same reviewed content.
-            let mut previews = state.previews.lock().await;
-            previews.sessions.insert(
-                payload_id,
-                aperture_reasoning_gateway::preview::PreviewSession::new(backup),
-            );
-            previews.approved.insert(payload_id, approved_hash);
+            // The cancel marker is read and the restore decided UNDER the
+            // previews lock: preview_cancel takes previews before touching the
+            // marker, so holding previews here serializes against a cancel
+            // landing between the marker take and the restore insert — the
+            // last window through which an approved session could resurrect
+            // (08-22 review verify pass).
+            {
+                let mut previews = state.previews.lock().await;
+                let cancelled = take_send_cancelled(&payload_id);
+                match classify_send_failure(&e, cancelled) {
+                    // Post-egress validation failure: the bytes left and the
+                    // cloud_send row is written. The session stays dropped — a
+                    // restored approval would be a retry button on a second
+                    // egress of the same bytes — and the message must not read
+                    // like a pre-send failure (08-22 review).
+                    SendFailure::DropSent => {
+                        return Err(format!(
+                            "Claude replied but the answer could not be validated ({e}). \
+                             The payload was already sent and audited — there is nothing to retry."
+                        ));
+                    }
+                    // Cancelled while in flight: the panel is gone. Drop the
+                    // backup and the approval hash — nothing resurrects
+                    // (doc 13 §3).
+                    SendFailure::DropCancelled => {
+                        tracing::info!(
+                            %payload_id,
+                            "preview cancelled during send; dropping the session instead of restoring"
+                        );
+                    }
+                    // Nothing left the machine: restore the session AND the
+                    // approval so the user can retry (transport failure) or
+                    // retarget + re-approve (mismatch, finding 1) against the
+                    // same reviewed content.
+                    SendFailure::Restore => {
+                        previews.sessions.insert(
+                            payload_id,
+                            aperture_reasoning_gateway::preview::PreviewSession::new(backup),
+                        );
+                        previews.approved.insert(payload_id, approved_hash);
+                    }
+                }
+            }
             match e {
                 aperture_reasoning_gateway::GatewayError::TransportMismatch { named, available } => {
                     tracing::info!(
@@ -1880,9 +2067,21 @@ pub fn apply_autostart(app: &tauri::AppHandle, on: bool) -> Result<(), String> {
     }
 }
 
-/// Persist the user's start-at-login choice into the `ui` settings section
-/// (read-modify-write: the section also carries `hud_anchor` etc.).
+/// Persist the user's start-at-login choice into the `ui` settings section.
 pub fn persist_autostart(db: &aperture_db::Db, on: bool) -> Result<(), String> {
+    persist_ui_key(db, "autostart", serde_json::Value::Bool(on))
+}
+
+/// Write ONE key of the `ui` settings section from Rust (read-modify-write:
+/// the section also carries `hud_anchor`, `hud_hidden`, the bubble tunables —
+/// the UI's `set_settings` replaces the whole row, so this is the only safe way
+/// to touch a single key without a UI round-trip). Callers that want every
+/// window to notice follow it with `events::emit_settings_changed`.
+pub fn persist_ui_key(
+    db: &aperture_db::Db,
+    key: &str,
+    value: serde_json::Value,
+) -> Result<(), String> {
     use rusqlite::OptionalExtension;
     db.with_conn(|c| {
         let raw: Option<String> = c
@@ -1891,7 +2090,10 @@ pub fn persist_autostart(db: &aperture_db::Db, on: bool) -> Result<(), String> {
         let mut ui: serde_json::Value = raw
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_else(|| serde_json::json!({}));
-        ui["autostart"] = serde_json::Value::Bool(on);
+        if !ui.is_object() {
+            ui = serde_json::json!({});
+        }
+        ui[key] = value;
         c.execute(
             "INSERT INTO settings (key, value) VALUES ('ui', ?1) \
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -1900,6 +2102,29 @@ pub fn persist_autostart(db: &aperture_db::Db, on: bool) -> Result<(), String> {
         .map(|_| ())
     })
     .map_err(|e| e.to_string())
+}
+
+/// Read one key of the `ui` settings section (`None` when the section, the key
+/// or the row is missing / unreadable). The tray uses it for its check items.
+pub fn ui_value(db: &aperture_db::Db, key: &str) -> Option<serde_json::Value> {
+    use rusqlite::OptionalExtension;
+    db.with_conn(|c| {
+        c.query_row("SELECT value FROM settings WHERE key = 'ui'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()
+    })
+    .ok()
+    .flatten()
+    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+    .and_then(|ui| ui.get(key).cloned())
+}
+
+/// `ui.<key>` read as a flag: true only when the stored value is literally
+/// `true` (absent / malformed ⇒ false, the conservative default for every flag
+/// the section holds).
+pub fn ui_flag(db: &aperture_db::Db, key: &str) -> bool {
+    matches!(ui_value(db, key), Some(serde_json::Value::Bool(true)))
 }
 
 // ---------------------------------------------------------------------------
@@ -2314,5 +2539,67 @@ mod tests {
             ESCALATION_OCR_CHARS as usize,
             "snapshot capped at {ESCALATION_OCR_CHARS} chars"
         );
+    }
+
+    /// 08-22 review, the two preview_send failure-arm findings: a cancel that
+    /// raced an in-flight send must not be undone by the restore path, and
+    /// `GatewayError::Validation` — raised AFTER egress and the `cloud_send`
+    /// audit row — must never restore an approval a retry would re-send.
+    #[test]
+    fn send_failures_restore_only_pre_egress_and_uncancelled() {
+        use aperture_reasoning_gateway::suggestion_validator::ValidationError;
+        use aperture_reasoning_gateway::GatewayError;
+        let transport = || {
+            GatewayError::Transport(aperture_contracts::TransportError::Other("net down".into()))
+        };
+        let mismatch = || GatewayError::TransportMismatch {
+            named: TransportTarget::ClaudeCli,
+            available: Some(TransportTarget::MessagesApi),
+        };
+        let validation =
+            || GatewayError::Validation(ValidationError::SchemaMismatch("bad json".into()));
+
+        // Nothing egressed, panel still up: restore for an honest retry.
+        assert_eq!(classify_send_failure(&transport(), false), SendFailure::Restore);
+        assert_eq!(classify_send_failure(&mismatch(), false), SendFailure::Restore);
+        // A cancel raced the in-flight send: zero residue (doc 13 §3).
+        assert_eq!(classify_send_failure(&transport(), true), SendFailure::DropCancelled);
+        assert_eq!(classify_send_failure(&mismatch(), true), SendFailure::DropCancelled);
+        // Validation failed AFTER egress + audit: spent, cancelled or not.
+        assert_eq!(classify_send_failure(&validation(), false), SendFailure::DropSent);
+        assert_eq!(classify_send_failure(&validation(), true), SendFailure::DropSent);
+    }
+
+    // --- `ui` section single-key writes (the tray's HUD toggle, 2026-09-06) ---
+
+    #[test]
+    fn ui_key_round_trips_and_keeps_its_siblings() {
+        let db = aperture_db::Db::open_in_memory().expect("in-memory db");
+        // Nothing stored yet: reads are None / false, never an error.
+        assert_eq!(ui_value(&db, "hud_hidden"), None);
+        assert!(!ui_flag(&db, "hud_hidden"));
+
+        persist_ui_key(&db, "hud_anchor", serde_json::json!("bottom-left")).unwrap();
+        persist_ui_key(&db, "hud_hidden", serde_json::Value::Bool(true)).unwrap();
+        assert!(ui_flag(&db, "hud_hidden"));
+        assert_eq!(ui_value(&db, "hud_anchor"), Some(serde_json::json!("bottom-left")));
+
+        // Flipping one key leaves the other alone (read-modify-write, not replace).
+        persist_ui_key(&db, "hud_hidden", serde_json::Value::Bool(false)).unwrap();
+        assert!(!ui_flag(&db, "hud_hidden"));
+        assert_eq!(ui_value(&db, "hud_anchor"), Some(serde_json::json!("bottom-left")));
+        // The autostart wrapper shares the row.
+        persist_autostart(&db, true).unwrap();
+        assert!(ui_flag(&db, "autostart"));
+        assert!(!ui_flag(&db, "hud_hidden"));
+    }
+
+    #[test]
+    fn ui_flag_is_true_only_for_a_literal_true() {
+        let db = aperture_db::Db::open_in_memory().expect("in-memory db");
+        persist_ui_key(&db, "hud_hidden", serde_json::json!("true")).unwrap();
+        assert!(!ui_flag(&db, "hud_hidden"), "a string is not a flag");
+        persist_ui_key(&db, "hud_hidden", serde_json::json!(1)).unwrap();
+        assert!(!ui_flag(&db, "hud_hidden"), "a number is not a flag");
     }
 }

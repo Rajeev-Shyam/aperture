@@ -208,8 +208,10 @@ async fn agent_start(
 }
 
 /// `aperture_agent_step` (v2, Doc 22 §2). The reply carries the redacted
-/// payload as text and the redacted screenshot as an MCP image block; the
-/// decision-#42 cap applies to both together.
+/// payload as text and the redacted screenshot as an MCP image block. The
+/// decision-#42 cap on both together is enforced in
+/// `agent::observe_and_release`, on the exact wire bytes and BEFORE the
+/// `cloud_send` row (08-22 review) — this side forwards verbatim.
 async fn agent_step(
     app: &tauri::AppHandle,
     state: &AppState,
@@ -224,22 +226,19 @@ async fn agent_step(
         Ok(r) => r,
         Err(e) => return Ok(text_result(e, true)),
     };
-    let image_len = reply.image_jpeg.as_ref().map(|i| i.len()).unwrap_or(0);
-    if reply.text.len() + image_len > MCP_RESULT_MAX_BYTES {
-        return Ok(text_result(
-            format!(
-                "the screen payload is {} B — over Claude Desktop (MCP)'s hard cap of {MCP_RESULT_MAX_BYTES} B. Nothing was released (decision #42).",
-                reply.text.len() + image_len
-            ),
-            true,
-        ));
-    }
+    // Tripwire only — a release over the cap can no longer reach this point.
+    debug_assert!(
+        reply.text.len() + reply.image_b64.as_ref().map(|b| b.len()).unwrap_or(0)
+            <= MCP_RESULT_MAX_BYTES,
+        "agent step reply over the MCP cap escaped observe_and_release"
+    );
     let mut content = vec![serde_json::json!({ "type": "text", "text": reply.text })];
-    if let Some(jpeg) = reply.image_jpeg {
-        use base64::Engine as _;
+    if let Some(b64) = reply.image_b64 {
+        // Verbatim: this exact string is what the wire hash in the audit row
+        // was computed over.
         content.push(serde_json::json!({
             "type": "image",
-            "data": base64::engine::general_purpose::STANDARD.encode(jpeg),
+            "data": b64,
             "mimeType": "image/jpeg"
         }));
     }

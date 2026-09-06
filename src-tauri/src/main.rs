@@ -153,6 +153,11 @@ fn main() {
     // native-messaging hosts. Toggle-governed (FIX 2.1) — inert until capture ON.
     #[cfg(windows)]
     capture.spawn_nm_server();
+    // …and the host the browser spawns to reach that server: register its
+    // manifest on every launch so the extension works on an installed box
+    // with no per-machine step beyond "Load unpacked" (2026-09-06).
+    #[cfg(windows)]
+    register_nm_host();
 
     // The connector registry (doc 10 §1): bubble_click resolves through it;
     // the connector task captures through it (Path A step 4).
@@ -548,6 +553,47 @@ fn restore_capture(state: &AppState) {
     });
 }
 
+/// Register the native-messaging host for the Capture Bridge extension
+/// (ADR-027/028) on every launch — merge-only, best-effort, per-user: the host
+/// manifest under `%LOCALAPPDATA%\Aperture\nm\` and the Chrome (read by Opera,
+/// Opera GX and Brave too) + Edge HKCU keys. The extension's ID is pinned
+/// (`nm_bridge::EXTENSION_ID`, its manifest carries the matching `key`), so
+/// nothing here needs the browser's cooperation; the user's only step is
+/// "Load unpacked" from the install's `extension/` folder. Until 2026-09-06 the
+/// host was neither bundled nor registered on an installed box, so the
+/// extension path — the ONLY URL source for Opera, whose UIA tree is not
+/// exposed — was dead outside a dev checkout. No Chromium browser on the box
+/// just means an unused registry key.
+#[cfg(windows)]
+fn register_nm_host() {
+    use aperture_capture::nm_bridge::{install_host_manifest, BrowserHive, EXTENSION_ID};
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+    let mut candidates = Vec::new();
+    if let Some(dir) = &exe_dir {
+        // Installed (externalBin, triple stripped) and dev (same target dir).
+        candidates.push(dir.join("aperture-nm-host.exe"));
+    }
+    candidates.push(std::path::PathBuf::from(
+        "src-tauri/binaries/aperture-nm-host-x86_64-pc-windows-msvc.exe",
+    ));
+    let Some(host) = candidates.iter().find(|p| p.exists()) else {
+        tracing::warn!(
+            "aperture-nm-host.exe not found beside the app — browser-extension URL feed unavailable"
+        );
+        return;
+    };
+    match install_host_manifest(
+        host,
+        &[EXTENSION_ID.to_string()],
+        &[BrowserHive::Chrome, BrowserHive::Edge],
+    ) {
+        Ok(path) => tracing::info!(manifest = %path.display(), host = %host.display(), "native-messaging host registered (ADR-028)"),
+        Err(e) => tracing::warn!(%e, "native-messaging host registration failed — extension feed unavailable"),
+    }
+}
+
 /// Register Aperture's MCP server in Claude Desktop's config (doc 09 §3) with
 /// the RESOLVED `aperture-mcp.exe` path — installed (next to aperture.exe) or
 /// dev (same target dir). Merge-only and best-effort: no Claude Desktop on the
@@ -564,15 +610,53 @@ fn register_mcp_server() {
         tracing::warn!(path = %command.display(), "aperture-mcp.exe not found — MCP registration skipped");
         return;
     }
-    let config_path = std::env::var("APPDATA")
-        .map(|a| format!("{a}\\Claude\\claude_desktop_config.json"))
-        .unwrap_or_else(|_| "claude_desktop_config.json".to_string());
-    let transport =
-        aperture_reasoning_gateway::transports::mcp::McpTransport::new(config_path.clone());
-    match transport.register_with_command(&command.to_string_lossy()) {
-        Ok(()) => tracing::info!(config = %config_path, "MCP server registered with Claude Desktop"),
-        Err(e) => tracing::warn!(%e, "MCP registration failed (Claude Desktop absent?)"),
+    let appdata = std::env::var_os("APPDATA").map(std::path::PathBuf::from);
+    let packages = std::env::var_os("LOCALAPPDATA")
+        .map(|l| std::path::PathBuf::from(l).join("Packages"));
+    let paths = claude_desktop_config_paths(appdata.as_deref(), packages.as_deref());
+    if paths.is_empty() {
+        tracing::warn!("no Claude Desktop config location resolvable (APPDATA unset) — MCP registration skipped");
+        return;
     }
+    for config_path in paths {
+        let transport = aperture_reasoning_gateway::transports::mcp::McpTransport::new(
+            config_path.to_string_lossy().to_string(),
+        );
+        match transport.register_with_command(&command.to_string_lossy()) {
+            Ok(()) => tracing::info!(config = %config_path.display(), "MCP server registered with Claude Desktop"),
+            Err(e) => tracing::warn!(%e, config = %config_path.display(), "MCP registration failed (Claude Desktop absent?)"),
+        }
+    }
+}
+
+/// Every `claude_desktop_config.json` a Claude Desktop on this machine may read
+/// (2026-09-06): the classic `%APPDATA%\Claude\` file (created if absent — the
+/// direct-download build reads it), plus the AppData-virtualised copy of every
+/// installed **Microsoft Store** package — `%LOCALAPPDATA%\Packages\Claude_<publisher>\
+/// LocalCache\Roaming\Claude\claude_desktop_config.json` — but only where that
+/// directory already exists (the Store app has run; never fabricate a package).
+/// The Store build never reads `%APPDATA%`, which is why the owner's Claude
+/// Desktop showed no "aperture" server for three weeks. Pure over the two roots.
+fn claude_desktop_config_paths(
+    appdata: Option<&std::path::Path>,
+    packages: Option<&std::path::Path>,
+) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Some(a) = appdata {
+        out.push(a.join("Claude").join("claude_desktop_config.json"));
+    }
+    if let Some(entries) = packages.and_then(|p| std::fs::read_dir(p).ok()) {
+        let mut store: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("Claude_"))
+            .map(|e| e.path().join("LocalCache").join("Roaming").join("Claude"))
+            .filter(|dir| dir.is_dir())
+            .map(|dir| dir.join("claude_desktop_config.json"))
+            .collect();
+        store.sort();
+        out.extend(store);
+    }
+    out
 }
 
 /// Re-assert the stored start-at-login choice at every launch (doc 13 §8 spirit:
@@ -709,90 +793,19 @@ fn build_embedder() -> Arc<dyn aperture_embedding::Embedder> {
     embedder
 }
 
-/// Resolve the sidecar binaries + STT weights for both layouts (doc 12 §5):
-/// **installed** — everything sits next to `aperture.exe` (`stt-host.exe` from
-/// externalBin, `whisper\` + `models\` from resources) — and **dev** — the
-/// workspace target dir (cargo puts `aperture-stt-host.exe` beside
-/// `aperture.exe`) with `src-tauri\binaries\whisper` + `models\` under the
-/// repo-root CWD. First existing candidate wins; the crate default (bare name,
-/// PATH lookup) is the last resort — EXCEPT the VLM weights (decision #30):
-/// when absent, their paths resolve to the canonical download destination
-/// (`vlm_download_dir`) instead of the bare crate default, so the Dashboard
-/// fetch lands exactly where the next spawn reads and VLM comes up without a
-/// restart. Until then the spawn failure soft-degrades to OCR-only (doc 06 §6).
+/// Resolve the sidecar binaries + weights for both layouts (doc 12 §5) —
+/// **installed** (everything next to `aperture.exe`) and **dev** (the
+/// workspace target dir + the checkout's `src-tauri\binaries` and `models\`
+/// under the repo-root CWD). The candidate list and the decision #30 rule
+/// (absent VLM weights resolve to the Dashboard download destination) live in
+/// `SidecarConfig::resolve`, shared with the SC6 gate so the gate measures the
+/// same binaries the app spawns. `root = None` keeps the checkout-relative
+/// candidates CWD-relative, exactly as before the move (2026-09-05).
 fn sidecar_config() -> aperture_orchestration::model_lifecycle::SidecarConfig {
-    use std::path::PathBuf;
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
-    let pick = |cands: &[PathBuf], fallback: PathBuf| -> PathBuf {
-        cands.iter().find(|p| p.exists()).cloned().unwrap_or(fallback)
-    };
-
-    let mut config = aperture_orchestration::model_lifecycle::SidecarConfig::default();
-    let mut stt_bins = Vec::new();
-    let mut vlm_bins = Vec::new();
-    let mut whisper_bins = vec![PathBuf::from("src-tauri/binaries/whisper/whisper-server.exe")];
-    let mut llama_bins = vec![PathBuf::from("src-tauri/binaries/llama/llama-server.exe")];
-    let mut stt_models = vec![PathBuf::from("models/ggml-base.en.bin")];
-    let mut vlm_models = vec![config.vlm_model_gguf.clone()];
-    let mut vlm_mmprojs = vec![config.vlm_mmproj_gguf.clone()];
-    if let Some(dir) = &exe_dir {
-        stt_bins.push(dir.join("stt-host.exe")); // installed: triple stripped by the bundler
-        stt_bins.push(dir.join("aperture-stt-host.exe")); // dev: same target dir
-        vlm_bins.push(dir.join("vlm-host.exe"));
-        vlm_bins.push(dir.join("aperture-vlm-host.exe"));
-        whisper_bins.insert(0, dir.join("whisper").join("whisper-server.exe"));
-        llama_bins.insert(0, dir.join("llama").join("llama-server.exe"));
-        stt_models.push(dir.join("models").join("ggml-base.en.bin"));
-        // The VLM weights are ~3 GB — too big for the NSIS installer (2 GB
-        // cap), so installed layouts fetch them via the Dashboard (decision #30).
-        vlm_models.push(dir.join("models").join(vlm_fetch::VLM_MODEL_FILE));
-        vlm_mmprojs.push(dir.join("models").join(vlm_fetch::VLM_MMPROJ_FILE));
-    }
-    config.stt_host_bin = pick(&stt_bins, config.stt_host_bin);
-    config.vlm_host_bin = pick(&vlm_bins, config.vlm_host_bin);
-    config.whisper_bin = pick(&whisper_bins, config.whisper_bin);
-    config.llama_bin = pick(&llama_bins, config.llama_bin);
-    config.stt_model = pick(&stt_models, config.stt_model);
-    // Weights absent ⇒ resolve to where the Dashboard download will land, so
-    // the spawner's stored path becomes valid the moment the fetch finishes.
-    let dl_dir = vlm_download_dir(exe_dir.as_deref());
-    config.vlm_model_gguf = pick(&vlm_models, dl_dir.join(vlm_fetch::VLM_MODEL_FILE));
-    config.vlm_mmproj_gguf = pick(&vlm_mmprojs, dl_dir.join(vlm_fetch::VLM_MMPROJ_FILE));
-    if !config.vlm_model_gguf.exists() || !config.vlm_mmproj_gguf.exists() {
-        // Not silent (decision #30): the Dashboard mirrors this as the
-        // "OCR-only mode" notice with the download button.
-        tracing::warn!(
-            "VLM weights not installed — screen understanding runs OCR-only until the \
-             Dashboard download completes (decision #30)"
-        );
-    }
-    tracing::info!(
-        stt_host = %config.stt_host_bin.display(),
-        whisper = %config.whisper_bin.display(),
-        stt_model = %config.stt_model.display(),
-        vlm_host = %config.vlm_host_bin.display(),
-        llama = %config.llama_bin.display(),
-        vlm_model = %config.vlm_model_gguf.display(),
-        "sidecar paths resolved"
-    );
-    config
-}
-
-/// The canonical VLM weight destination (decision #30): the installed layout's
-/// `models\` next to the exe when it exists (absolute — correct regardless of
-/// how the app was launched: Start menu CWD = install dir, autostart CWD =
-/// system32), else the checkout's `models/` (the dev path — cargo runs from
-/// the repo root, and `target\debug\models` never exists).
-fn vlm_download_dir(exe_dir: Option<&std::path::Path>) -> std::path::PathBuf {
-    if let Some(dir) = exe_dir {
-        let installed = dir.join("models");
-        if installed.is_dir() {
-            return installed;
-        }
-    }
-    std::path::PathBuf::from("models")
+    aperture_orchestration::model_lifecycle::SidecarConfig::resolve(exe_dir.as_deref(), None)
 }
 
 /// Where the embedding weights live (doc 03 §5): the repo's `models/` when run
@@ -825,7 +838,9 @@ fn build_frame_sink(
     orchestration: Arc<tokio::sync::Mutex<aperture_orchestration::OrchestratedSystem>>,
     embedder: Arc<dyn aperture_embedding::Embedder>,
 ) -> Arc<dyn aperture_capture::sampler::FrameSink> {
-    match aperture_vision_ocr::windows_media_ocr::WindowsMediaOcr::new("en-US") {
+    match aperture_vision_ocr::windows_media_ocr::WindowsMediaOcr::new(
+        aperture_vision_ocr::windows_media_ocr::DEFAULT_OCR_LANGUAGE,
+    ) {
         Ok(engine) => Arc::new(pipeline::OcrStoreSink {
             db,
             processor: aperture_vision_ocr::FrameProcessor::new(Box::new(engine), embedder),
@@ -1023,6 +1038,7 @@ fn run_tauri(
             commands::set_autostart,
             // Dashboard — read-only views over the local history.
             commands::dashboard_stats,
+            commands::get_diagnostics,
             commands::list_events,
             commands::list_patterns,
             commands::list_suggestion_history,
@@ -1093,6 +1109,7 @@ fn run_tauri(
                     .unwrap_or_else(|| setup_state.settings_reload_tx.subscribe()),
                 Arc::clone(&setup_state.snooze_until),
                 Arc::clone(&current_session),
+                Arc::clone(&setup_state.engine_snapshot),
                 app.handle().clone(),
             );
             // Bubble hit-testing (doc 11 §2): the cursor poller that flips
@@ -1232,5 +1249,39 @@ mod tests {
                 "section `{key}` should need no backfill against itself"
             );
         }
+    }
+
+    /// 2026-09-06: the Store build of Claude Desktop reads a virtualised
+    /// config, so registration must reach every location that exists — and
+    /// never invent a Store package that has not run.
+    #[test]
+    fn claude_desktop_config_paths_cover_appdata_and_existing_store_packages() {
+        let root = std::env::temp_dir().join(format!("aperture-cdc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let appdata = root.join("Roaming");
+        let packages = root.join("Packages");
+        // A Store package that has run (its virtualised Claude dir exists)…
+        let ran = packages.join("Claude_pzs8sxrjxfjjc").join("LocalCache").join("Roaming").join("Claude");
+        std::fs::create_dir_all(&ran).unwrap();
+        // …one that never ran, and an unrelated package with the same layout.
+        std::fs::create_dir_all(packages.join("Claude_neverran")).unwrap();
+        std::fs::create_dir_all(packages.join("Other_x").join("LocalCache").join("Roaming").join("Claude")).unwrap();
+
+        let paths = claude_desktop_config_paths(Some(&appdata), Some(&packages));
+        assert_eq!(
+            paths,
+            vec![
+                appdata.join("Claude").join("claude_desktop_config.json"),
+                ran.join("claude_desktop_config.json"),
+            ],
+            "APPDATA first (created if absent), then only the Store package that has run"
+        );
+        assert!(claude_desktop_config_paths(None, None).is_empty());
+        assert_eq!(
+            claude_desktop_config_paths(None, Some(&packages)).len(),
+            1,
+            "no APPDATA still reaches the Store copy"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

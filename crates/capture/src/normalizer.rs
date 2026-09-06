@@ -192,8 +192,10 @@ impl Normalizer {
     /// **extension feed first** (ADR-027 — tabs-API URL relayed over native
     /// messaging), then the UIA read (the demoted RK4 fallback), then the
     /// last-known URL for this hwnd; no known URL ⇒ `None` (never fabricate).
-    /// Feeds both exclusion verdicts and the `navigation` event.
-    fn resolve_url(&self, hwnd: isize, process: &str) -> Option<String> {
+    /// Feeds both exclusion verdicts and the `navigation` event — and, via
+    /// [`crate::CaptureSubsystem::resolve_url_for`], the v2 executor's
+    /// exclusion probe (the same hierarchy, no separate resolver).
+    pub(crate) fn resolve_url(&self, hwnd: isize, process: &str) -> Option<String> {
         if let Some(ext) = self.extension.lock().expect("extension lock").as_ref() {
             if let Some(u) = ext.current_url(process) {
                 // Keep the hwnd cache warm so an extension outage degrades to
@@ -219,6 +221,12 @@ impl Normalizer {
                 self.last_urls.lock().expect("url cache lock").get(&hwnd).cloned()
             }
         }
+    }
+
+    /// Is `process` one of the browsers this normalizer reads URLs for (the
+    /// ONE browser list, `AddressBarHints::browser_processes`)?
+    pub(crate) fn is_browser_process(&self, process: &str) -> bool {
+        uia::is_browser_process(process, &self.hints)
     }
 
     /// Build a `navigation` event from the resolved URL (doc 05 §3). The URL

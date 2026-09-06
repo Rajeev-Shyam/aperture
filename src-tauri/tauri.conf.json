@@ -36,7 +36,12 @@
     "active": true,
     "targets": ["nsis"],
     "icon": ["icons/icon.ico"],
-    "externalBin": ["binaries/vlm-host", "binaries/stt-host", "binaries/aperture-mcp"],
+    "externalBin": [
+      "binaries/vlm-host",
+      "binaries/stt-host",
+      "binaries/aperture-mcp",
+      "binaries/aperture-nm-host"
+    ],
     "resources": {
       "../extension/": "extension/",
       "binaries/whisper/": "whisper/",

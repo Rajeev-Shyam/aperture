@@ -33,6 +33,11 @@ use crate::VisionError;
 /// [ASSUMPTION: OCR quality/speed balance].
 pub const OCR_MAX_LONG_EDGE_PX: u32 = 1600;
 
+/// The BCP-47 tag every shell call site asks [`WindowsMediaOcr::new`] for
+/// (the capture sink and the agent runtime used to disagree — `"en-US"` vs
+/// `"en"` — until 2026-09-05). The fallback chain in `new` still ends at `en`.
+pub const DEFAULT_OCR_LANGUAGE: &str = "en-US";
+
 /// Lines whose quality heuristic is below this are dropped before the text
 /// is concatenated (doc 06 §2; see the module note on confidence) [ASSUMPTION].
 pub const MIN_LINE_CONFIDENCE: f32 = 0.5;
@@ -80,20 +85,25 @@ pub fn aggregate_lines(lines: Vec<String>) -> OcrOutput {
 /// pattern signatures, so this must not drift).
 pub fn aggregate_ocr_lines(lines: Vec<OcrLine>) -> OcrOutput {
     let mut kept: Vec<OcrLine> = Vec::new();
+    // Dropped lines keep their geometry for the image gate (08-22 review):
+    // out of the text, still on the pixels.
+    let mut dropped_lines: Vec<OcrLine> = Vec::new();
     let mut quality_sum = 0.0f32;
     for line in lines {
         let q = line_quality(&line.text);
         if q >= MIN_LINE_CONFIDENCE {
             quality_sum += q;
             kept.push(line);
+        } else {
+            dropped_lines.push(line);
         }
     }
     if kept.is_empty() {
-        return OcrOutput { text: String::new(), mean_confidence: 0.0, lines: Vec::new() };
+        return OcrOutput { text: String::new(), mean_confidence: 0.0, lines: Vec::new(), dropped_lines };
     }
     let mean = quality_sum / kept.len() as f32;
     let text = kept.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
-    OcrOutput { text, mean_confidence: mean, lines: kept }
+    OcrOutput { text, mean_confidence: mean, lines: kept, dropped_lines }
 }
 
 /// Convert a WinRT `Foundation::Rect` (f32 `X/Y/Width/Height`, in the pixel
@@ -288,6 +298,27 @@ mod tests {
 
     fn word(text: &str, x: u32) -> OcrWord {
         OcrWord { text: text.to_string(), x, y: 10, w: 8 * text.len() as u32, h: 12 }
+    }
+
+    /// 08-22 review [low]: a quality-dropped line keeps its geometry in
+    /// `dropped_lines` so the image gate can still paint over it; it stays out
+    /// of `text` and `lines` exactly as before.
+    #[test]
+    fn aggregate_ocr_lines_keeps_dropped_lines_with_their_geometry() {
+        let out = aggregate_ocr_lines(vec![
+            OcrLine { text: "Total: 4,200".into(), words: vec![word("Total:", 0), word("4,200", 60)] },
+            OcrLine { text: "◊●¦¤§◊●¦¤§◊●".into(), words: vec![word("◊●¦¤§◊●¦¤§◊●", 0)] },
+        ]);
+        assert_eq!(out.lines.len(), 1);
+        assert_eq!(out.text, "Total: 4,200");
+        assert_eq!(out.dropped_lines.len(), 1);
+        assert_eq!(out.dropped_lines[0].words.len(), 1, "geometry intact");
+        assert_eq!(out.dropped_lines[0].words[0].x, 0);
+
+        let none = aggregate_ocr_lines(vec![OcrLine { text: "●●●●".into(), words: vec![word("●●●●", 0)] }]);
+        assert!(none.lines.is_empty());
+        assert_eq!(none.text, "");
+        assert_eq!(none.dropped_lines.len(), 1, "kept even when nothing survives");
     }
 
     #[test]

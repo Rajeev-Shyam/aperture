@@ -62,8 +62,26 @@ export function useModalSurface(
       void focusOverlay().catch(() => {});
     }
     const opener = document.activeElement as HTMLElement | null;
-    ref.current?.focus();
+    // A child that `autoFocus`ed during the mount commit already holds focus
+    // (the task composer's textarea, a pause card's answer input). Focusing
+    // the wrapper now would move focus OFF it and eat the user's first
+    // keystrokes (08-22 review) — so focus moves in only when nothing inside
+    // the surface has it yet.
+    const root = ref.current;
+    if (root && !root.contains(document.activeElement)) root.focus();
+    // The overlay window is `WS_EX_NOACTIVATE` (2026-09-06: a click on a
+    // bubble must never take the foreground from the user's video), so a
+    // click no longer activates it. For a panel that is fine right up until
+    // the user works in another app and comes back: their press inside the
+    // panel would be delivered, but their typing would still go to the other
+    // app. Re-take focus explicitly on such a press — panels only; bubbles
+    // and the HUD never need the keyboard.
+    const refocus = () => {
+      if (!document.hasFocus()) void focusOverlay().catch(() => {});
+    };
+    root?.addEventListener("pointerdown", refocus);
     return () => {
+      root?.removeEventListener("pointerdown", refocus);
       if (exclusive) {
         void setOverlayInteractive(false).catch(() => {
           /* going back to click-through is best-effort on teardown */

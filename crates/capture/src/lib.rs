@@ -366,13 +366,33 @@ impl CaptureSubsystem {
     /// (the serializer) instead of going to the OCR sink. The frame is still
     /// never persisted: the caller redacts, downscales, encodes and drops it.
     ///
-    /// The browser URL rides along only when the hook-tracked foreground is
-    /// the window actually in front right now (same TOCTOU rule as
-    /// `Sampler::sample_once`); otherwise `url` is `None` and only the
-    /// process/class/title rules gate the frame.
+    /// If the hook-tracked foreground is not the window actually in front
+    /// right now the observation fails closed with `CaptureUnavailable`
+    /// (same TOCTOU posture as `Sampler::sample_once`'s skip; 08-22 review) —
+    /// a dropped URL must never let a `url_pattern`-excluded page through.
+    /// The hook drain catches up on its own; the caller retries.
     pub fn observe_now(&self) -> Result<sampler::Observation, CaptureError> {
         let fg = self.foreground.lock().expect("identity lock").clone();
         self.sampler.observe_now(fg)
+    }
+
+    /// Is `process` a browser by the normalizer's own browser list (doc 05 §3
+    /// `AddressBarHints`)? The v2 executor's exclusion probe asks this before
+    /// [`Self::resolve_url_for`], so the agent and capture agree on what a
+    /// browser is.
+    pub fn is_browser_process(&self, process: &str) -> bool {
+        self.normalizer.is_browser_process(process)
+    }
+
+    /// The live URL for a browser window, by the normalizer's existing
+    /// hierarchy (extension feed → UIA address bar → last-known for that
+    /// hwnd; `None` = nothing known, never fabricated). Exposed for the v2
+    /// executor's exclusion probe (decision #49): a `url_pattern` rule must
+    /// stop the agent's hands, not just capture's frames. Read-only — no
+    /// event, no frame, no gate of capture's own is touched. Performs a UIA
+    /// read on the calling thread (COM is initialised per thread).
+    pub fn resolve_url_for(&self, hwnd: isize, process: &str) -> Option<String> {
+        self.normalizer.resolve_url(hwnd, process)
     }
 
     /// pHash-gate + delivery counters (M2 tuning telemetry).

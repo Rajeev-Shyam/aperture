@@ -26,6 +26,10 @@ node_modules
 *.db-shm
 /.aperture-local
 
+# --- Python bytecode (scripts/doccheck.py); a tracked .pyc carried local paths until 2026-09-06 ---
+__pycache__/
+*.pyc
+
 # --- editor / OS ---
 .vscode/*
 !.vscode/extensions.json

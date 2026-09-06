@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "description": "Forwards the active-tab URL and YouTube playback position to the local Aperture core. URLs and video position only - never page content (ADR-029).",
   "minimum_chrome_version": "116",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1kclMX3OG5sz03HXL2cCvwP6iqXIccBqrg96zhuC6ZcgZfogiJDUWG95/HnsCRP6qFyWmO7W2qP7l0357MyEuAQMWMwFHPeKyzo9p/vW+s9Kdi3hcFEIWyUkmNAdMaW7ZnxWleq14+ziwsYPgkYnScq1pKXUpLaXw//zrlp/d9Ny7E+n0MfTFfRFRi3Pv+BrJCD20vXpyeAmV8PwpTeapqdpTPkdSwEImzCnB6fXlC0vITr0dN94/l0Ibhtgk4++eseMD86WhgWGOPhftWeTzZDBjmImyzHSaR017GUxNRdHtSOon5N3EnfCDT0g7gqXv5fCs89HGz3D/KPiX1CnMQIDAQAB",
   "permissions": ["tabs", "nativeMessaging"],
   "background": { "service_worker": "background.js" },
   "content_scripts": [

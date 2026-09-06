@@ -64,13 +64,20 @@ pub struct OcrOutput {
     /// geometry; `#[serde(default)]` so older serialized rows still load.
     #[serde(default)]
     pub lines: Vec<OcrLine>,
+    /// The lines the quality filter DROPPED, geometry intact (08-22 review):
+    /// their text never reaches `text` or `lines` — so it never leaves the
+    /// machine — but their pixels are still in the frame, and the image gate
+    /// (`screen-serializer::observe_frame`) must paint over them too. Never
+    /// serialized; in-memory only.
+    #[serde(skip)]
+    pub dropped_lines: Vec<OcrLine>,
 }
 
 impl OcrOutput {
     /// A coarse "how much readable text is on screen" signal used by the wake
     /// gate's density branch (doc 06 §4, branch (b)). Word count is a cheap,
     /// engine-agnostic proxy; the actual `LOW` threshold lives in
-    /// [`vlm_gating`](crate::vlm_gating).
+    /// `aperture_orchestration::tier_router` (the operational wake gate).
     pub fn text_density(&self) -> usize {
         self.text.split_whitespace().count()
     }

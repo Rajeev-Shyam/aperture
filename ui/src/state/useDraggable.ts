@@ -5,14 +5,20 @@
 //  take pointer capture, which retargets the eventual click away from the
 //  pressed control (a drag never triggers the button it started on).
 //
-//  While dragging, the overlay holds the modal interactive override: the
-//  hit-test rect publisher (250 ms cadence) is too slow to follow a moving
-//  surface, and losing interactivity mid-drag would drop the gesture.
+//  A drag deliberately does NOT touch the overlay's modal-interactive override
+//  (2026-09-06). It used to: `set_overlay_interactive(true)` at drag start and
+//  `false` at drop — a per-window COUNT with no owner and no expiry, so any
+//  gesture that ended without its `false` (a surface unmounting mid-drag, a
+//  close broadcast from another monitor, a lost pointer) left the whole monitor
+//  swallowing every click until the app restarted — the owner's "I can't click
+//  on anything while Aperture runs". The hold was never needed: the browser
+//  takes OS mouse capture on the press, so mouse messages keep reaching the
+//  WebView for the whole gesture regardless of the window's click-through bit,
+//  and `useHitTestRects` republishes the moving rect on the next animation
+//  frame (style mutations are observed), so hover interactivity follows too.
 
 import { useRef, useState } from "react";
 import type { CSSProperties, PointerEvent as ReactPointerEvent, RefObject } from "react";
-
-import { setOverlayInteractive } from "../lib/ipc";
 
 const DRAG_THRESHOLD_PX = 6;
 
@@ -71,8 +77,6 @@ export function useDraggable(
       g.active = true;
       setDragging(true);
       e.currentTarget.setPointerCapture(e.pointerId);
-      // Hold the window interactive for the whole gesture (see module note).
-      void setOverlayInteractive(true).catch(() => {});
     }
     const el = ref.current;
     const w = el?.offsetWidth ?? 0;
@@ -88,7 +92,6 @@ export function useDraggable(
     gesture.current = null;
     if (!g?.active) return;
     setDragging(false);
-    void setOverlayInteractive(false).catch(() => {});
     opts?.onDrop?.(e.clientX, e.clientY);
     if (opts?.resetOnDrop) setPos(null);
   }

@@ -94,11 +94,32 @@ pub fn build_step_payload(
     prior_steps_summary: Option<String>,
     redactor: &Redactor,
 ) -> (StepPayload, String) {
-    // Redaction BEFORE assembly (Doc 22 §8: runs on every payload). Titles and
-    // window names are text surfaces too — a password manager's window title
-    // can carry the secret it guards.
+    // Redaction BEFORE assembly (Doc 22 §8: runs on every payload). Every
+    // text field is a surface (08-22 review): titles and window names can
+    // carry the secret a password manager guards; a browser URL can carry a
+    // reset token, JWT or email in its query string; `last_action` is
+    // executor text built from screen content; `prior_steps_summary` carries
+    // the user's clarification answer ("User answered: …"). `open_windows`
+    // is app names only since 08-22, but redacts anyway — defense in depth.
+    // Redaction is idempotent (placeholders match no rule), so a field that
+    // was already scrubbed upstream passes through unchanged.
     let (ocr_text, _) = redactor.redact_text(&observation.ocr_text);
     let (title, _) = redactor.redact_text(&observation.focused_window.title);
+    let url = observation
+        .focused_window
+        .url
+        .map(|u| redactor.redact_text(&u).0);
+    let last_action = last_action.map(|a| LastAction {
+        action_type: a.action_type,
+        target: redactor.redact_text(&a.target).0,
+        result: redactor.redact_text(&a.result).0,
+    });
+    let open_windows = observation
+        .open_windows
+        .iter()
+        .map(|w| redactor.redact_text(w).0)
+        .collect();
+    let prior_steps_summary = prior_steps_summary.map(|s| redactor.redact_text(&s).0);
     let payload = StepPayload {
         task: task.to_string(),
         step_number,
@@ -110,10 +131,10 @@ pub fn build_step_payload(
         focused_window: FocusedWindow {
             app: observation.focused_window.app,
             title,
-            url: observation.focused_window.url,
+            url,
         },
         last_action,
-        open_windows: observation.open_windows,
+        open_windows,
         prior_steps_summary,
     };
     let wire = serde_json::to_vec(&payload).unwrap_or_default();
@@ -179,6 +200,102 @@ mod tests {
         assert_eq!(h1, h2, "same observation ⇒ same audit hash");
         let (_, h3) = build_step_payload("task", 2, obs(), None, None, &redactor());
         assert_ne!(h1, h3, "any field change ⇒ different hash");
+    }
+
+    /// Every non-OCR text surface is redacted too (08-22 review): the URL's
+    /// query string, the executor-built `last_action`, `open_windows`, and
+    /// the prior-steps summary carrying the user's clarification answer.
+    #[test]
+    fn url_last_action_and_summary_are_redacted() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6y";
+        let (payload, _) = build_step_payload(
+            "reset my password",
+            2,
+            RawObservation {
+                ocr_text: "plain".into(),
+                focused_window: FocusedWindow {
+                    app: "Chrome".into(),
+                    title: "Reset".into(),
+                    url: Some(format!(
+                        "https://app.example.com/reset?token={jwt}&email=john.doe@corp.com"
+                    )),
+                },
+                open_windows: vec!["Chrome".into(), "Mail — jane.roe@corp.com".into()],
+                screenshot: None,
+            },
+            Some(LastAction {
+                action_type: "type".into(),
+                target: "Email field — john.doe@corp.com".into(),
+                result: "typed into field showing john.doe@corp.com".into(),
+            }),
+            Some("Asked which key to use. User answered: my key is sk-abcdefghijklmnop1234".into()),
+            &redactor(),
+        );
+        let url = payload.focused_window.url.as_deref().unwrap();
+        assert!(!url.contains(jwt), "JWT in query string redacted");
+        assert!(!url.contains("john.doe@corp.com"), "email in query string redacted");
+        let action = payload.last_action.as_ref().unwrap();
+        assert!(!action.target.contains("john.doe@corp.com"), "last_action.target redacted");
+        assert!(!action.result.contains("john.doe@corp.com"), "last_action.result redacted");
+        assert!(
+            !payload.open_windows.iter().any(|w| w.contains("jane.roe@corp.com")),
+            "open_windows entries redacted"
+        );
+        let summary = payload.prior_steps_summary.as_deref().unwrap();
+        assert!(
+            !summary.contains("sk-abcdefghijklmnop1234"),
+            "clarification answer in prior_steps_summary redacted"
+        );
+        assert!(summary.contains("User answered:"), "harmless summary text kept");
+    }
+
+    /// The audit hash is over the REDACTED serialization, deterministically:
+    /// two builds from the same raw input agree, and feeding the redacted
+    /// fields back through produces the identical payload (idempotence — a
+    /// placeholder matches no rule, so nothing double-scrubs).
+    #[test]
+    fn hash_covers_the_redacted_form_and_redaction_is_idempotent() {
+        let obs = || RawObservation {
+            ocr_text: "contact john.doe@corp.com".into(),
+            focused_window: FocusedWindow {
+                app: "Chrome".into(),
+                title: "Inbox".into(),
+                url: Some("https://mail.example.com/?email=john.doe@corp.com".into()),
+            },
+            open_windows: vec!["Chrome".into()],
+            screenshot: None,
+        };
+        let action = || Some(LastAction {
+            action_type: "click".into(),
+            target: "row john.doe@corp.com".into(),
+            result: "ok".into(),
+        });
+        let summary = || Some("User answered: use sk-abcdefghijklmnop1234".into());
+        let (p1, h1) = build_step_payload("t", 1, obs(), action(), summary(), &redactor());
+        let (_, h2) = build_step_payload("t", 1, obs(), action(), summary(), &redactor());
+        assert_eq!(h1, h2, "same raw input ⇒ same audit hash over the redacted form");
+
+        // Rebuild from the already-redacted payload: everything is a no-op.
+        let (p3, _) = build_step_payload(
+            "t",
+            1,
+            RawObservation {
+                ocr_text: p1.ocr_text.clone(),
+                focused_window: p1.focused_window.clone(),
+                open_windows: p1.open_windows.clone(),
+                screenshot: None,
+            },
+            p1.last_action.clone(),
+            p1.prior_steps_summary.clone(),
+            &redactor(),
+        );
+        assert_eq!(p3.ocr_text, p1.ocr_text);
+        assert_eq!(p3.focused_window.url, p1.focused_window.url);
+        assert_eq!(
+            p3.last_action.as_ref().unwrap().target,
+            p1.last_action.as_ref().unwrap().target
+        );
+        assert_eq!(p3.prior_steps_summary, p1.prior_steps_summary);
     }
 
     /// The Doc 22 §3.2 field names are the wire contract for the system prompt.

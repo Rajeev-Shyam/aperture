@@ -213,6 +213,19 @@ fn lint_emitters() -> Result<()> {
                     ));
                 }
             }
+            // Doc 24 F2: only the agent loop (and the executor's own tests)
+            // may mint an `ExecutorTicket`. The check existed and was
+            // unit-tested since 08-22 but was never called from here — the
+            // CLI was not enforcing it until 2026-09-04.
+            if ticket_minted_outside_loop(&crate_name, line) {
+                violations.push(format!(
+                    "{}:{}: `ExecutorTicket::for_task(` in crate `{}` — only agent-loop may mint \
+                     tickets (doc 24 F2)",
+                    rel(file),
+                    line_no,
+                    crate_name
+                ));
+            }
         })?;
     }
 

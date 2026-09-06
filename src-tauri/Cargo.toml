@@ -40,8 +40,6 @@ aperture-task-manager = { workspace = true }
 # --- shared third-party (versions resolved at the workspace root) ---
 serde = { workspace = true }
 serde_json = { workspace = true }
-# MCP image content blocks for the agent's redacted screenshots (already in the lockfile).
-base64 = "0.22"
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

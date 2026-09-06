@@ -484,16 +484,131 @@ impl Default for SidecarConfig {
     fn default() -> Self {
         Self {
             vlm_host_bin: std::path::PathBuf::from("aperture-vlm-host"),
-            vlm_model_gguf: std::path::PathBuf::from("models/qwen2.5-vl-3b-q4_k_m.gguf"),
-            vlm_mmproj_gguf: std::path::PathBuf::from("models/qwen2.5-vl-3b-mmproj-f16.gguf"),
+            vlm_model_gguf: std::path::PathBuf::from("models").join(VLM_MODEL_FILE),
+            vlm_mmproj_gguf: std::path::PathBuf::from("models").join(VLM_MMPROJ_FILE),
             llama_bin: std::path::PathBuf::from("llama-server"),
             stt_host_bin: std::path::PathBuf::from("aperture-stt-host"),
             whisper_bin: std::path::PathBuf::from("whisper-server"),
-            stt_model: std::path::PathBuf::from("models/ggml-base.en.bin"),
+            stt_model: std::path::PathBuf::from("models").join(STT_MODEL_FILE),
             stt_on_gpu: false,
             vlm_ctx: 4096,
             cold_load_timeout: Duration::from_secs(15),
         }
+    }
+}
+
+/// The VLM weight file names the sidecar spawns with (doc 04 §3 L1). The
+/// Dashboard download destination (decision #30, `model_fetch`) and the spawn
+/// path must agree on these by construction — the shell re-exports them.
+pub const VLM_MODEL_FILE: &str = "qwen2.5-vl-3b-q4_k_m.gguf";
+pub const VLM_MMPROJ_FILE: &str = "qwen2.5-vl-3b-mmproj-f16.gguf";
+/// Whisper weights (doc 07 §3, the base.en tier); bundled by the installer.
+pub const STT_MODEL_FILE: &str = "ggml-base.en.bin";
+
+/// The canonical VLM weight destination (decision #30): the installed layout's
+/// `models\` next to the exe when it exists (absolute — correct regardless of
+/// how the app was launched: Start menu CWD = install dir, autostart CWD =
+/// system32), else `models/` under `root` (the dev path — cargo runs from the
+/// repo root; `None` keeps it CWD-relative, exactly what the shell wants).
+pub fn vlm_download_dir(exe_dir: Option<&std::path::Path>, root: Option<&std::path::Path>) -> std::path::PathBuf {
+    if let Some(dir) = exe_dir {
+        let installed = dir.join("models");
+        if installed.is_dir() {
+            return installed;
+        }
+    }
+    rooted(root, "models")
+}
+
+/// `root.join(rel)`, or the bare relative path when there is no root.
+fn rooted(root: Option<&std::path::Path>, rel: &str) -> std::path::PathBuf {
+    match root {
+        Some(r) => r.join(rel),
+        None => std::path::PathBuf::from(rel),
+    }
+}
+
+impl SidecarConfig {
+    /// Resolve the sidecar layout from a candidate list — the ONE resolver the
+    /// shell (`src-tauri/src/main.rs::sidecar_config`) and the SC6 gate
+    /// (`crates/gates/tests/sc6_vram_release.rs`) share, so the gate measures
+    /// the same binaries the app would spawn.
+    ///
+    /// Candidates, first existing wins:
+    /// - hosts: `<exe_dir>/{stt-host,vlm-host}.exe` (installed — the bundler
+    ///   strips the target triple), `<exe_dir>/aperture-{stt,vlm}-host.exe`
+    ///   (dev: cargo puts them beside `aperture.exe`), then the checkout's
+    ///   `src-tauri/binaries/<name>-x86_64-pc-windows-msvc.exe` (the shipping
+    ///   copy), then the bare crate default (PATH lookup).
+    /// - `llama-server` / `whisper-server`: `<exe_dir>/{llama,whisper}/…`
+    ///   (installed) before `src-tauri/binaries/{llama,whisper}/…` (dev).
+    /// - STT weights: `models/ggml-base.en.bin` under `root`, then `<exe_dir>/models/`.
+    /// - VLM weights (decision #30): the crate default under `root`, then
+    ///   `<exe_dir>/models/`; when neither exists the path resolves to the
+    ///   canonical download destination ([`vlm_download_dir`]) so the Dashboard
+    ///   fetch lands exactly where the next spawn reads and VLM comes up without
+    ///   a restart. Until then the spawn failure soft-degrades to OCR-only (doc 06 §6).
+    ///
+    /// `root` anchors the checkout-relative candidates; `None` leaves them
+    /// CWD-relative (the shell's behaviour — byte-identical paths to before).
+    pub fn resolve(exe_dir: Option<&std::path::Path>, root: Option<&std::path::Path>) -> Self {
+        use std::path::PathBuf;
+        let pick = |cands: &[PathBuf], fallback: PathBuf| -> PathBuf {
+            cands.iter().find(|p| p.exists()).cloned().unwrap_or(fallback)
+        };
+        let shipping = |name: &str| rooted(root, "src-tauri/binaries").join(format!("{name}-x86_64-pc-windows-msvc.exe"));
+
+        let mut config = Self::default();
+        let mut stt_bins = Vec::new();
+        let mut vlm_bins = Vec::new();
+        let mut whisper_bins = vec![rooted(root, "src-tauri/binaries/whisper/whisper-server.exe")];
+        let mut llama_bins = vec![rooted(root, "src-tauri/binaries/llama/llama-server.exe")];
+        let mut stt_models = vec![rooted(root, "models").join(STT_MODEL_FILE)];
+        let mut vlm_models = vec![rooted(root, "models").join(VLM_MODEL_FILE)];
+        let mut vlm_mmprojs = vec![rooted(root, "models").join(VLM_MMPROJ_FILE)];
+        if let Some(dir) = exe_dir {
+            stt_bins.push(dir.join("stt-host.exe")); // installed: triple stripped by the bundler
+            stt_bins.push(dir.join("aperture-stt-host.exe")); // dev: same target dir
+            vlm_bins.push(dir.join("vlm-host.exe"));
+            vlm_bins.push(dir.join("aperture-vlm-host.exe"));
+            whisper_bins.insert(0, dir.join("whisper").join("whisper-server.exe"));
+            llama_bins.insert(0, dir.join("llama").join("llama-server.exe"));
+            stt_models.push(dir.join("models").join(STT_MODEL_FILE));
+            // The VLM weights are ~3 GB — too big for the NSIS installer (2 GB
+            // cap), so installed layouts fetch them via the Dashboard (decision #30).
+            vlm_models.push(dir.join("models").join(VLM_MODEL_FILE));
+            vlm_mmprojs.push(dir.join("models").join(VLM_MMPROJ_FILE));
+        }
+        stt_bins.push(shipping("stt-host"));
+        vlm_bins.push(shipping("vlm-host"));
+        config.stt_host_bin = pick(&stt_bins, config.stt_host_bin);
+        config.vlm_host_bin = pick(&vlm_bins, config.vlm_host_bin);
+        config.whisper_bin = pick(&whisper_bins, config.whisper_bin);
+        config.llama_bin = pick(&llama_bins, config.llama_bin);
+        config.stt_model = pick(&stt_models, config.stt_model);
+        // Weights absent ⇒ resolve to where the Dashboard download will land, so
+        // the spawner's stored path becomes valid the moment the fetch finishes.
+        let dl_dir = vlm_download_dir(exe_dir, root);
+        config.vlm_model_gguf = pick(&vlm_models, dl_dir.join(VLM_MODEL_FILE));
+        config.vlm_mmproj_gguf = pick(&vlm_mmprojs, dl_dir.join(VLM_MMPROJ_FILE));
+        if !config.vlm_model_gguf.exists() || !config.vlm_mmproj_gguf.exists() {
+            // Not silent (decision #30): the Dashboard mirrors this as the
+            // "OCR-only mode" notice with the download button.
+            tracing::warn!(
+                "VLM weights not installed — screen understanding runs OCR-only until the \
+                 Dashboard download completes (decision #30)"
+            );
+        }
+        tracing::info!(
+            stt_host = %config.stt_host_bin.display(),
+            whisper = %config.whisper_bin.display(),
+            stt_model = %config.stt_model.display(),
+            vlm_host = %config.vlm_host_bin.display(),
+            llama = %config.llama_bin.display(),
+            vlm_model = %config.vlm_model_gguf.display(),
+            "sidecar paths resolved"
+        );
+        config
     }
 }
 
@@ -990,5 +1105,116 @@ mod tests {
         async fn spawn(&self, model: ModelId) -> Result<Box<dyn SidecarProcess>, LifecycleError> {
             self.0.spawn(model).await
         }
+    }
+
+    // --- SidecarConfig::resolve — the candidate list shared with the SC6 gate ---
+
+    /// A unique scratch dir per test (no tempfile dep in this workspace).
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aperture-sidecar-resolve-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn touch(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"x").unwrap();
+    }
+
+    #[test]
+    fn resolve_prefers_installed_name_then_dev_name_then_shipping_copy_then_bare_default() {
+        let root = scratch("hosts");
+        let exe_dir = root.join("target").join("release");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+
+        // Nothing anywhere: the bare crate default (PATH lookup) survives.
+        let cfg = SidecarConfig::resolve(Some(&exe_dir), Some(&root));
+        assert_eq!(cfg.stt_host_bin, std::path::PathBuf::from("aperture-stt-host"));
+        assert_eq!(cfg.vlm_host_bin, std::path::PathBuf::from("aperture-vlm-host"));
+        assert_eq!(cfg.whisper_bin, std::path::PathBuf::from("whisper-server"));
+
+        // The checkout's shipping copy is found through `root`.
+        let shipping = root
+            .join("src-tauri")
+            .join("binaries")
+            .join("stt-host-x86_64-pc-windows-msvc.exe");
+        touch(&shipping);
+        let whisper = root
+            .join("src-tauri")
+            .join("binaries")
+            .join("whisper")
+            .join("whisper-server.exe");
+        touch(&whisper);
+        let cfg = SidecarConfig::resolve(Some(&exe_dir), Some(&root));
+        assert_eq!(cfg.stt_host_bin, shipping);
+        assert_eq!(cfg.whisper_bin, whisper);
+
+        // A dev build beside the exe beats the shipping copy …
+        let dev = exe_dir.join("aperture-stt-host.exe");
+        touch(&dev);
+        let cfg = SidecarConfig::resolve(Some(&exe_dir), Some(&root));
+        assert_eq!(cfg.stt_host_bin, dev);
+
+        // … and the installed (triple-stripped) name beats everything.
+        let installed = exe_dir.join("stt-host.exe");
+        touch(&installed);
+        let cfg = SidecarConfig::resolve(Some(&exe_dir), Some(&root));
+        assert_eq!(cfg.stt_host_bin, installed);
+        // The installed whisper dir also wins over the checkout's.
+        let installed_whisper = exe_dir.join("whisper").join("whisper-server.exe");
+        touch(&installed_whisper);
+        let cfg = SidecarConfig::resolve(Some(&exe_dir), Some(&root));
+        assert_eq!(cfg.whisper_bin, installed_whisper);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_points_absent_vlm_weights_at_the_download_destination() {
+        let root = scratch("weights");
+        let exe_dir = root.join("install");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+
+        // No `models\` next to the exe: the dev path under root.
+        let cfg = SidecarConfig::resolve(Some(&exe_dir), Some(&root));
+        assert_eq!(cfg.vlm_model_gguf, root.join("models").join(VLM_MODEL_FILE));
+        assert_eq!(cfg.vlm_mmproj_gguf, root.join("models").join(VLM_MMPROJ_FILE));
+        assert!(!cfg.vlm_model_gguf.exists(), "the path is a destination, not a file");
+
+        // An installed `models\` dir exists (weights still absent): the
+        // Dashboard download lands there, so the spawn path must point there.
+        std::fs::create_dir_all(exe_dir.join("models")).unwrap();
+        let cfg = SidecarConfig::resolve(Some(&exe_dir), Some(&root));
+        assert_eq!(cfg.vlm_model_gguf, exe_dir.join("models").join(VLM_MODEL_FILE));
+        assert_eq!(vlm_download_dir(Some(&exe_dir), Some(&root)), exe_dir.join("models"));
+
+        // Present weights are found wherever they are (root first).
+        let weights = root.join("models").join(VLM_MODEL_FILE);
+        touch(&weights);
+        let cfg = SidecarConfig::resolve(Some(&exe_dir), Some(&root));
+        assert_eq!(cfg.vlm_model_gguf, weights);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_without_a_root_keeps_checkout_candidates_cwd_relative() {
+        // The shell passes `None`: byte-identical to the pre-2026-09-05 strings.
+        let cfg = SidecarConfig::resolve(None, None);
+        assert_eq!(cfg.stt_model, std::path::PathBuf::from("models").join(STT_MODEL_FILE));
+        assert_eq!(cfg.vlm_model_gguf, std::path::PathBuf::from("models").join(VLM_MODEL_FILE));
+        assert_eq!(vlm_download_dir(None, None), std::path::PathBuf::from("models"));
+        assert_eq!(rooted(None, "src-tauri/binaries"), std::path::PathBuf::from("src-tauri/binaries"));
+        assert_eq!(
+            rooted(Some(std::path::Path::new("r")), "src-tauri/binaries"),
+            std::path::Path::new("r").join("src-tauri/binaries")
+        );
     }
 }

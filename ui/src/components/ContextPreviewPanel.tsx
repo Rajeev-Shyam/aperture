@@ -106,7 +106,12 @@ export function ContextPreviewPanel({ payload, onChange, onClose }: Props) {
   function onKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
     if (e.key === "Escape") {
       e.preventDefault();
-      onClose(); // Cancel — drop everything, zero residue (doc 13 §3).
+      // Cancel — drop everything, zero residue (doc 13 §3). Gated on `sending`
+      // exactly like the Cancel button (08-22 review): mid-send the session is
+      // already with the gateway, and closing here would cancel a payload that
+      // may be on the wire. The core tombstones a cancel that races a send
+      // anyway (preview_cancel), but the panel must not invite the race.
+      if (!sending) onClose();
       return;
     }
     trapKeys(e);
@@ -238,7 +243,13 @@ export function ContextPreviewPanel({ payload, onChange, onClose }: Props) {
     setRetargeting(true); // its own flag: the Send button must not read "Sending…"
     try {
       const updated = await previewRetarget(payload.payload_id, target);
-      onChange(updated);
+      // Merge ONLY the transport. The core re-stamps `transport_target` and
+      // drops the approval, nothing else — but its copy of the items is the
+      // last-APPROVED set, so swapping in the whole returned payload would
+      // silently resurrect any item the user removed after the mismatch
+      // (08-22 review). `preview_set_approved` re-syncs the panel's items
+      // from `payload` at the next Send anyway.
+      onChange({ ...payload, transport_target: updated.transport_target });
       setMismatch(null);
       setSendError(`Now set to ${TRANSPORT_LABELS[target]}. Review and press Send again.`);
     } catch (e) {

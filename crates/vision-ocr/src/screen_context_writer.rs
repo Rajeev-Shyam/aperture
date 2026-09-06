@@ -12,15 +12,14 @@
 //! currency (doc 06 §2).
 
 use crate::frame_processor::ProcessedFrame;
-use crate::vlm_layer::SceneJson;
 
 /// A `screen_context` row, mirroring the DDL in doc 03 §3:
 /// `(event_id, ocr_text, ocr_confidence, vlm_summary, thumb_phash)`.
 ///
 /// `id` is assigned by the DB on insert. `vlm_summary` is `None` unless Layer B
 /// actually ran (doc 06 §3) — and because the VLM never gates a bubble, it is
-/// typically filled by a later UPDATE once the async job returns, not on the
-/// initial INSERT.
+/// filled by a later UPDATE (`Db::attach_vlm_summary`, issued by the shell's
+/// VLM task once the async job returns), never on the initial INSERT.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ScreenContextRow {
     /// FK to `events.id` (`ON DELETE CASCADE`, doc 03 §3).
@@ -39,8 +38,9 @@ pub struct ScreenContextRow {
 
 impl ScreenContextRow {
     /// Build the initial row from a [`ProcessedFrame`] (Layer A; doc 06 §5).
-    /// `vlm_summary` is left `None` — Layer B, if it runs, lands later via
-    /// [`with_vlm_summary`](Self::with_vlm_summary).
+    /// `vlm_summary` is left `None` — Layer B, if it runs, lands later through
+    /// `Db::attach_vlm_summary` (the `todo!()` builder that used to live here was
+    /// removed 2026-09-05; the shell never went through this type for it).
     ///
     /// Empty OCR text is normalized to `None` so it neither embeds nor counts as
     /// content downstream.
@@ -50,18 +50,9 @@ impl ScreenContextRow {
             event_id: 0, // stamped by the store step once the event row exists
             ocr_text: (!text.is_empty()).then(|| frame.ocr.text.clone()),
             ocr_confidence: (!text.is_empty()).then_some(frame.ocr.mean_confidence),
-            vlm_summary: None, // Layer B lands later via with_vlm_summary (M5)
+            vlm_summary: None, // Layer B lands later via Db::attach_vlm_summary
             thumb_phash: frame.thumb_phash.clone(),
         }
-    }
-
-    /// Attach a VLM scene summary (doc 06 §3) — serialized to the
-    /// `vlm_summary` TEXT column. Called when the async Layer-B job returns; the
-    /// caller then issues the UPDATE through `aperture-db`.
-    #[allow(unused_mut)] // `mut` is the M5 body's shape (self.vlm_summary = ...)
-    pub fn with_vlm_summary(mut self, _scene: &SceneJson) -> Self {
-        // TODO(M5): self.vlm_summary = Some(serde_json::to_string(scene)?);
-        todo!("M5: serialize SceneJson into the vlm_summary column")
     }
 
     /// Debug-assert the no-raw-frames invariant (doc 03 §3, doc 13): a row may

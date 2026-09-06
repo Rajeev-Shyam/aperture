@@ -35,6 +35,25 @@ use aperture_contracts::{
 use crate::suggestion_validator::parse_response;
 use crate::transports::{check_hard_cap, extract_json, render_prompt, SYSTEM_FRAMING};
 
+/// Spawn the CLI without a console window (`CREATE_NO_WINDOW`, same flag the
+/// sidecar hosts use). Aperture is a GUI process, so every child console app —
+/// and `claude` on Windows is an npm `.cmd` shim running under `cmd.exe` —
+/// otherwise gets a brand-new console that flashes on screen. The health probe
+/// runs for every transport when the Dashboard's Advanced tab mounts and
+/// again after a transport pick, which the owner saw as windows "opening and
+/// closing quickly" (2026-09-06).
+fn hide_console(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
 /// Below this prompt length we pass via `-p`; at/above it, large-context spill to a
 /// temp file is the intended mechanism (~7k-char small-stdin caveat, doc 09 §3).
 /// // [VERIFY] the real threshold + spill flag for the installed CLI version.
@@ -89,7 +108,10 @@ impl ReasoningTransport for CliTransport {
     async fn health(&self) -> Health {
         // `--version` succeeding ⇒ installed + on PATH. It does NOT prove login;
         // a real send surfaces an auth failure. [VERIFY] a cheap auth check.
-        match Command::new(&self.exe_path).arg("--version").output().await {
+        let mut cmd = Command::new(&self.exe_path);
+        cmd.arg("--version");
+        hide_console(&mut cmd);
+        match cmd.output().await {
             Ok(o) if o.status.success() => Health::Ready,
             Ok(o) => Health::NeedsSetup(format!("`claude --version` exited {}", o.status)),
             Err(e) => Health::Unavailable(format!("claude CLI not found: {e}")),
@@ -128,11 +150,10 @@ impl ReasoningTransport for CliTransport {
             );
         }
 
-        let output = Command::new(&self.exe_path)
-            .arg("-p")
-            .arg(&prompt)
-            .arg("--output-format")
-            .arg("json")
+        let mut cmd = Command::new(&self.exe_path);
+        cmd.arg("-p").arg(&prompt).arg("--output-format").arg("json");
+        hide_console(&mut cmd);
+        let output = cmd
             .output()
             .await
             .map_err(|e| TransportError::Other(e.to_string()))?;

@@ -62,7 +62,7 @@ impl DocumentConnector {
     /// unit-testable without a real `%APPDATA%\..\Recent` directory.
     fn resolve_path_with(
         title: &str,
-        _app_hint: Option<&str>,
+        app_hint: Option<&str>,
         recent_lookup: impl Fn(&str) -> Option<String>,
     ) -> Option<String> {
         // Rung 1: a full path in the title, existence-checked.
@@ -79,10 +79,54 @@ impl DocumentConnector {
                 }
             }
         }
+        // Rung 2b (2026-09-06): Office titles carry NO extension ("Report - Word",
+        // "Budget  -  Compatibility Mode - Excel"), so rung 2 never matched a
+        // single Office document in three weeks of dogfooding. Try the app's own
+        // document extensions against Recent Items — still an exact-name match
+        // on a real shortcut whose target exists, never a guess.
+        if let Some(stem) = extract_title_stem(title) {
+            for ext in office_extensions(app_hint) {
+                if let Some(path) = recent_lookup(&format!("{stem}.{ext}")) {
+                    if Path::new(&path).is_file() {
+                        return Some(path);
+                    }
+                }
+            }
+        }
         // Rung 3 (per-app MRU registry) deferred — [VERIFY]/Q62, version-fragile.
         // Rung 4: the floor — never guess.
         None
     }
+}
+
+/// The document extensions an Office process hides from its title bar, most
+/// common first. Empty for anything else: rung 2b only ever fires for apps
+/// known to strip the extension.
+fn office_extensions(app_hint: Option<&str>) -> &'static [&'static str] {
+    let app = app_hint.unwrap_or("").to_ascii_lowercase();
+    let app = app.strip_suffix(".exe").unwrap_or(&app);
+    match app {
+        "winword" => &["docx", "doc", "docm", "dotx", "rtf", "odt"],
+        "excel" => &["xlsx", "xlsm", "xls", "csv", "xlsb"],
+        "powerpnt" => &["pptx", "pptm", "ppt"],
+        _ => &[],
+    }
+}
+
+/// The title's first ` - ` segment as a bare document name WITHOUT requiring
+/// an extension (Office strips it): `"Report  -  Protected View - Word"` →
+/// `Report`. Same hygiene as [`extract_title_filename`] — no path characters,
+/// dirty markers stripped — so the Recent Items probe is always a plain name.
+fn extract_title_stem(title: &str) -> Option<String> {
+    let first = title.split(" - ").next()?.trim();
+    let first = first.trim_start_matches(['*', '●', ' ']).trim_end();
+    if first.is_empty() || first.len() > 200 {
+        return None;
+    }
+    if first.contains(['\\', '/', ':', '"', '<', '>', '|', '?']) {
+        return None;
+    }
+    Some(first.to_string())
 }
 
 /// Extract a drive-letter path embedded in a window title, e.g.
@@ -378,6 +422,43 @@ mod tests {
             (name == "report.docx").then(|| target.clone())
         });
         assert_eq!(resolved, Some(target));
+    }
+
+    /// 2026-09-06 rung 2b: an Office title without an extension resolves
+    /// through the app's own extensions — and only for a known Office app.
+    #[test]
+    fn ladder_rung2b_office_titles_without_extension_probe_app_extensions() {
+        let dir = std::env::temp_dir().join("aperture-doc-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("Work_Placement_Summary_Form.docx");
+        std::fs::write(&file, b"x").unwrap();
+        let target = file.display().to_string();
+        let lookup = |name: &str| (name == "Work_Placement_Summary_Form.docx").then(|| target.clone());
+
+        for title in [
+            "Work_Placement_Summary_Form - Word",
+            "Work_Placement_Summary_Form  -  Protected View - Word",
+            "Work_Placement_Summary_Form  -  Compatibility Mode - Word",
+            "*Work_Placement_Summary_Form  -  Last saved by user - Word",
+        ] {
+            assert_eq!(
+                DocumentConnector::resolve_path_with(title, Some("winword.exe"), lookup),
+                Some(target.clone()),
+                "{title}"
+            );
+        }
+        // Excel would probe xlsx/…, never a Word extension — no cross-app guess.
+        assert_eq!(
+            DocumentConnector::resolve_path_with("Work_Placement_Summary_Form - Word", Some("excel.exe"), lookup),
+            None
+        );
+        // An unknown app never reaches rung 2b.
+        assert_eq!(
+            DocumentConnector::resolve_path_with("Work_Placement_Summary_Form - Word", None, lookup),
+            None
+        );
+        assert_eq!(extract_title_stem("Word"), Some("Word".into()));
+        assert_eq!(extract_title_stem(r"C:\x\y - Word"), None);
     }
 
     #[test]

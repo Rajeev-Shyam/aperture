@@ -519,10 +519,11 @@ mod tests {
     }
 
     // --- SC5 (doc 13 §2, doc 16 M7 "strict") — the CPU-checkable half ---------
-    // The byte-level monitor (ETW / mitmproxy) is the on-hardware companion
-    // (`gates/tests/sc5_network_monitor.rs`, `#[ignore]`). These prove the two
-    // properties that don't need a monitor: preview == wire by hash, and zero
-    // egress until an approved Send.
+    // The byte-level harness is `gates/tests/sc5_network_monitor.rs` (real since
+    // 2026-08-22, runs unignored on every workspace test: a loopback origin the
+    // test owns, SHA-256(body) == SHA-256(wire)). These prove the two properties
+    // that need no socket at all: preview == wire by hash, and zero egress until
+    // an approved Send.
 
     /// A transport that trips a flag the instant `send` is called — the in-process
     /// egress point. If it trips without approval, SC5 is violated.

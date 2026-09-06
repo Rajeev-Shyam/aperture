@@ -157,8 +157,11 @@ export interface UiSettings {
    *  (decision #5). Advanced/settings-only: it tunes queue ordering, not
    *  anything the user can see happen. */
   bubble_freshness_half_life_sec?: number;
-  /** Where the HUD cluster (indicator + buttons) is anchored — user-draggable. */
+  /** Where the HUD orb is anchored — user-draggable. */
   hud_anchor?: HudAnchor;
+  /** The HUD orb is hidden (gaming, presenting). Set by the orb's hide button
+   *  or the tray's "Show overlay controls"; the tray is the way back. */
+  hud_hidden?: boolean;
 }
 
 /** The 8 snap positions for the HUD cluster (4 corners + 4 edge midpoints). */
@@ -557,6 +560,61 @@ export function dashboardStats(): Promise<DashboardStats> {
   return invoke<DashboardStats>("dashboard_stats");
 }
 
+/** One trigger-gate decision (coarse class-token signature, never a title/URL). */
+export interface GateDecision {
+  signature: string;
+  score: number;
+  /** The rule that rejected it (`BelowScore`, `NotNovel`, …); `null` = admitted. */
+  reject: string | null;
+  at_ms: number;
+}
+
+/** One trigger rule's rejection count, in the words the block shows. */
+export interface RejectRow {
+  label: string;
+  hint: string;
+  count: number;
+}
+
+/** The pattern engine's diagnostics view (doc 11 §6, 2026-09-06). */
+export interface EngineSnapshot {
+  capture_on: boolean;
+  tau_conf: number;
+  support_floor: number;
+  cap_per_hour: number;
+  patterns_cached: number;
+  patterns_at_floor: number;
+  current_session: number | null;
+  gate: {
+    evaluated: number;
+    admitted: number;
+    rejected: number[];
+    last_admitted: GateDecision | null;
+    last_rejected: GateDecision | null;
+    closest_miss: GateDecision | null;
+  };
+  rejected_by_reason: RejectRow[];
+}
+
+/** `get_diagnostics`: the engine snapshot + the 24-hour facts the seven
+ *  trigger rules depend on. `engine` is `null` until the first event since launch. */
+export interface Diagnostics {
+  engine: EngineSnapshot | null;
+  capture_enabled: boolean;
+  extension_hosts_connected: number;
+  events_24h: number;
+  navigation_24h: number;
+  document_ide_24h: number;
+  connector_states_fresh: number;
+  suggestions_24h: number;
+  last_suggestion_ts: number | null;
+  now_ms: number;
+}
+
+export function getDiagnostics(): Promise<Diagnostics> {
+  return invoke<Diagnostics>("get_diagnostics");
+}
+
 /** One history row: an event joined with its screen context (OCR excerpt). */
 export interface HistoryEvent {
   id: number;
@@ -903,6 +961,9 @@ export interface AgentTaskView {
   stop_reason: string | null;
   undoable_windows: { hwnd: number; title: string }[];
   in_flight: boolean;
+  /** Stop pressed while an action is mid-flight: applied the moment the
+   *  action returns — the bar shows "Stopping…" until then. */
+  stopping: boolean;
 }
 
 export type AgentDecision = "approve" | "deny" | "confirm" | "skip" | "resume" | "stop";

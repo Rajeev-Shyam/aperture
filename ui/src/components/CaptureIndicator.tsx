@@ -1,82 +1,24 @@
-//! CaptureIndicator (doc 11, doc 12 §6, doc 13 §8). The always-visible master
-//  capture state + activity pulse, and the user's one-click toggle.
-//
-//  THIRD INVARIANT (capture toggle): turning capture OFF releases capture, kills
-//  the sidecars, and drives VRAM->~0 in <3s. The UI reflects this immediately —
-//  the toggle flips optimistically and the `capture_indicator` event confirms
-//  the real state + a "releasing…" detail so the user SEES the teardown happen.
-//
-//  Capture defaults OFF until the user opts in at first run (doc 13 §8); the
-//  initial state arrives via the first `capture_indicator` event.
+//! CaptureIndicator (doc 11, doc 12 §6, doc 13 §8). The capture state label +
+//  the user's one-click toggle, rendered inside the HUD's expanded row. The
+//  state itself lives in `useCaptureState` (2026-09-06) so the collapsed orb
+//  can show the same dot without a second subscription. Presentational only.
 
-import { useEffect, useState } from "react";
+import type { CaptureState } from "../state/useCaptureState";
 
-import {
-  onCaptureIndicator,
-  toggleCapture,
-  type CaptureIndicatorEvent,
-  type UnlistenFn,
-} from "../lib/ipc";
+interface Props extends Omit<CaptureState, "toggle"> {
+  onToggle: () => void;
+}
 
-export function CaptureIndicator() {
-  const [capturing, setCapturing] = useState(false);
-  const [detail, setDetail] = useState<string | null>(null);
-  // Brief pulse on activity events (frame captured / event written).
-  const [pulse, setPulse] = useState(false);
-  const [busy, setBusy] = useState(false);
-
-  useEffect(() => {
-    let unlisten: UnlistenFn | null = null;
-    let cancelled = false;
-    let pulseTimer: ReturnType<typeof setTimeout> | null = null;
-
-    void onCaptureIndicator((e: CaptureIndicatorEvent) => {
-      setCapturing(e.capturing);
-      setDetail(e.detail ?? null);
-      setBusy(false);
-      // Pulse on each indicator tick while capturing (activity heartbeat).
-      if (e.capturing) {
-        setPulse(true);
-        if (pulseTimer) clearTimeout(pulseTimer);
-        pulseTimer = setTimeout(() => setPulse(false), 240);
-      }
-    }).then((u) => {
-      if (cancelled) u();
-      else unlisten = u;
-    });
-
-    return () => {
-      cancelled = true;
-      if (pulseTimer) clearTimeout(pulseTimer);
-      unlisten?.();
-    };
-  }, []);
-
-  async function toggle() {
-    if (busy) return;
-    setBusy(true);
-    const next = !capturing;
-    // Optimistic flip; the indicator event confirms the real state. On OFF the
-    // detail will show the <3s teardown ("releasing… sidecars down").
-    setCapturing(next);
-    try {
-      const confirmed = await toggleCapture(next);
-      setCapturing(confirmed);
-    } catch {
-      setCapturing(!next); // revert on failure
-    } finally {
-      setBusy(false);
-    }
-  }
-
+export function CaptureIndicator({ capturing, detail, pulse, busy, onToggle }: Props) {
   return (
-    <div className="capture surface-glass surface-interactive">
+    <div className="capture">
       <button
         className="capture__toggle"
         role="switch"
         aria-checked={capturing}
         aria-label={capturing ? "Capture on — click to turn off" : "Capture off — click to turn on"}
-        onClick={() => void toggle()}
+        title={capturing ? "Capturing — click to turn off" : "Capture off — click to turn on"}
+        onClick={onToggle}
         disabled={busy}
       >
         <span

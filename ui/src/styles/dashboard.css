@@ -8,13 +8,22 @@
 /* --- Stacking: bubbles < HUD < panels ------------------------------------- *
  * Panels must sit ABOVE the HUD cluster: both gravitate to screen corners and
  * a HUD covering a panel's close button makes the panel unclosable. */
+/* --- The HUD orb (2026-09-06) --------------------------------------------- *
+ * Collapsed: one 36 px circle carrying the capture dot. Expanded: the same orb
+ * plus one row of controls beside it. The whole thing is the drag handle. */
 .hud {
   position: fixed;
   display: flex;
-  flex-direction: column;
-  gap: 6px;
+  align-items: center;
+  gap: 8px;
   z-index: 30;
   cursor: grab;
+  touch-action: none;
+}
+/* Right-anchored: the orb hugs the edge and the row unfolds leftward, so the
+ * orb never moves when it opens. Left / centre: the row unfolds rightward. */
+.hud--col-right {
+  flex-direction: row-reverse;
 }
 
 .privacy,
@@ -37,16 +46,76 @@
   touch-action: none;
 }
 
-/* Inside the cluster the members flow in the flex column instead of pinning
- * themselves to the viewport. */
+.hud__orb {
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--border-hairline);
+  border-radius: 50%;
+  background: var(--glass-2);
+  -webkit-backdrop-filter: blur(var(--blur-8)) saturate(var(--saturate));
+  backdrop-filter: blur(var(--blur-8)) saturate(var(--saturate));
+  box-shadow: var(--shadow-elev), var(--lens-lip);
+  cursor: pointer;
+  transition:
+    background-color var(--dur-120) var(--ease-chrome),
+    border-color var(--dur-120) var(--ease-chrome),
+    transform var(--dur-120) var(--ease-chrome);
+}
+.hud__orb:hover {
+  background: var(--glass-3);
+  border-color: var(--border-hairline-hover);
+}
+.hud__orb:active {
+  transform: scale(0.94);
+}
+.hud--expanded .hud__orb {
+  border-color: var(--accent);
+}
+.hud__orb:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+@supports not (backdrop-filter: blur(1px)) {
+  .hud__orb {
+    background: var(--fallback-opaque);
+  }
+}
+
+/* The expanded row: one opaque pill (`.surface-opaque` — transient chrome
+ * never counts against the ≤2 glass budget, ADR-039). */
+.hud__row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+  border: 1px solid var(--border-hairline);
+  border-radius: 999px;
+  box-shadow: var(--shadow-elev), var(--lens-lip);
+  animation: hud-unfold var(--dur-180) var(--ease-chrome);
+}
+@keyframes hud-unfold {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.hud__divider {
+  width: 1px;
+  height: 18px;
+  margin: 0 2px;
+  background: var(--border-hairline);
+}
+/* Inside the row the members flow inline instead of pinning to the viewport. */
 .hud .capture,
 .hud .privacy-open {
   position: static;
-}
-
-.hud__buttons {
-  display: flex;
-  gap: 6px;
 }
 
 /* Global snooze control (doc 11 §6, ADR-040) — button + popover menu. */
@@ -84,31 +153,16 @@
 .hud__snooze-menu button:hover {
   background: var(--lift-2);
 }
-
-.hud__grip {
-  align-self: center;
-  width: 34px;
-  height: 14px;
-  padding: 0;
-  border: 0;
-  border-radius: 999px;
-  background: transparent;
-  color: var(--ink-faint);
-  font-size: 10px;
-  line-height: 1;
-  cursor: grab;
-  touch-action: none;
+/* Bottom-anchored HUD: open the menu upward; left-anchored: align it to the
+ * left edge — either way it stays on screen (2026-09-06; it opened off-screen
+ * below a bottom anchor before). */
+.hud--row-bottom .hud__snooze-menu {
+  top: auto;
+  bottom: calc(100% + 10px);
 }
-
-.hud__grip:hover {
-  color: var(--ink-secondary);
-  /* Light tint — --fallback-opaque on an opaque panel was a zero-delta hover
-   * (2026-08-15 review). */
-  background: var(--lift-2);
-}
-
-.hud--dragging .hud__grip {
-  cursor: grabbing;
+.hud--col-left .hud__snooze-menu {
+  right: auto;
+  left: 0;
 }
 
 /* --- Dashboard window ------------------------------------------------------ */
@@ -361,8 +415,7 @@
 }
 
 .dash__search:focus-visible,
-.dash__navitem:focus-visible,
-.hud__grip:focus-visible {
+.dash__navitem:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
@@ -394,6 +447,23 @@
   color: var(--ink-faint);
   font-size: 0.72rem;
   white-space: nowrap;
+}
+
+/* The Agent tab's destructive control sits on the far side of the row from
+ * "Show steps" (08-22 review: a mis-click deleted a task's whole audit trail),
+ * and its armed state says what is about to go. */
+.dash__purge,
+.dash__purge-confirm {
+  margin-left: auto;
+}
+.dash__purge-confirm {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.dash__purge-warn {
+  color: var(--ink-faint);
+  font-size: 0.72rem;
 }
 
 .dash__row-type {
